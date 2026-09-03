@@ -1,0 +1,72 @@
+# ---- data & tokenizers (regenerate with prep_fineweb.py) ----
+*.pt
+fineweb_*.pt
+tinypython_*.pt
+fineweb_bpe16k-vocab.json
+fineweb_bpe16k-merges.txt
+data/
+*.bin
+*.arrow
+*.npy
+
+# ---- training artifacts ----
+runs/*.pt
+runs/**/*.pt
+runs/*.log
+checkpoints/
+ck_*.pt
+*.ckpt
+
+# NOTE: runs/*.jsonl IS tracked on purpose -- it is the measurement record
+# behind every claim in sca2/README.md. Drop the '!' lines to untrack.
+!runs/*.jsonl
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+.python-version
+
+# ---- torch / triton / inductor caches (these grow to many GB) ----
+.torchinductor_cache/
+torchinductor_*/
+.triton/
+*.cubin
+*.ptx
+.nv/
+compiled_cache/
+
+# ---- HF / datasets caches ----
+.cache/
+hf_cache/
+.huggingface/
+wandb/
+lightning_logs/
+tensorboard/
+events.out.tfevents.*
+
+# ---- editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# ---- scratch ----
+scratch/
+tmp/
+nohup.out
+*.tmp
+*.orig
+*.rej
