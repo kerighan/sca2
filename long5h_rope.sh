@@ -14,6 +14,6 @@ COMMON="--data pycode_long1024_xl.pt --block 1024 --batch 8 --d 128 --layers 4
         --samples 0 --only sca2 --log runs/long5h.jsonl --class-eval"
 cell () { local label=$1; shift; echo "##### $(date +%H:%M) $label :: $*"
           python -u pretrain.py --label "$label" $COMMON --save runs/ck_$label "$@"; }
-cell l5_Arope_s0    --seed 0 --variant cshort_damph_cc --Mc 190 --dv 56 --ff 448 --Ls 16 --theta-scale 0.02 --rope-base 1000
 cell l5_Aropew64_s0 --seed 0 --variant cshort_damph_cc --Mc 190 --dv 56 --ff 424 --Ls 64 --theta-scale 0.02 --rope-base 1000
+cell l5_Arope_s0    --seed 0 --variant cshort_damph_cc --Mc 190 --dv 56 --ff 448 --Ls 16 --theta-scale 0.02 --rope-base 1000
 echo "##### LONG5H ROPE DONE"
