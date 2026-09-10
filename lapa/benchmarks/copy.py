@@ -166,6 +166,10 @@ def run(a):
                 flush=True,
             )
     log.close()
+    if a.save:
+        torch.save({"model": m.state_dict(), "arm": a.arm, "kw": kw, "d": a.d, "layers": a.layers,
+                    "vocab": V, "label": label, "lengths": lengths, "symbols": S}, a.save)
+        print("saved", a.save, flush=True)
 
 
 def plot(a):
@@ -272,6 +276,7 @@ def main(argv=None):
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     r.add_argument("--log", default="runs/copy_lapa.jsonl")
+    r.add_argument("--save", default=None, help="save the final model state_dict here (for per-layer ablations)")
     pl = sub.add_parser("plot")
     pl.add_argument("log")
     pl.add_argument("--out", default="plot/copy.png", help="token-accuracy figure; the exact-string figure is written next to it as *_exact")

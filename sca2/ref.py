@@ -53,7 +53,7 @@ def _gated_out(head, u, z):
 # --------------------------------------------------------------------------- #
 #  C head positional frequency grids
 # --------------------------------------------------------------------------- #
-def freq_grid(name, M, max_len=128):
+def freq_grid(name, M, max_len=128, base=10000.0):
     """Positional angular frequencies for the C head.
 
     Not a free choice: this grid decides what the C head computes AT INIT.
@@ -111,7 +111,7 @@ def freq_grid(name, M, max_len=128):
     if name == "len":
         return 2 * math.pi * k / max_len
     if name == "rope":
-        return math.pi * (10000.0 ** (-k / max(M - 1, 1)))
+        return math.pi * (base ** (-k / max(M - 1, 1)))
     raise ValueError(f"unknown freq grid {name!r}")
 
 
@@ -122,7 +122,7 @@ class CHeadBase(nn.Module):
     """Parameter container. Shared by every variant so state_dicts are portable."""
 
     def __init__(self, d, M, freq="dft", theta_scale=0.0, max_len=128, dv=None,
-                 gated_read=False):
+                 gated_read=False, rope_base=10000.0):
         super().__init__()
         self.d, self.M, self.dv = d, M, (d // 2 if dv is None else dv)
         self.freq, self.theta_scale, self.max_len = freq, theta_scale, max_len
@@ -134,7 +134,7 @@ class CHeadBase(nn.Module):
         # non-zero init keeps the near-positional warm start and unblocks K.
         self.theta = nn.Parameter(
             torch.zeros(M) if theta_scale == 0.0 else theta_scale * torch.randn(M))
-        self.register_buffer("omega", freq_grid(freq, M, max_len))
+        self.register_buffer("omega", freq_grid(freq, M, max_len, rope_base))
         self.wr = nn.Parameter(torch.ones(M))
         self.wi = nn.Parameter(torch.zeros(M))
         self.gated_read = gated_read
@@ -302,6 +302,7 @@ class LayerCfg:
     # comparing it against SCA2 only means something at a MATCHED state size --
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
+    rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
     gdn_heads: int = 3
     gdn_head_k: int = 60
     gdn_expand_v: float = 1.0
@@ -331,7 +332,8 @@ class SCA2Layer(nn.Module):
         dv = cfg.dv if cfg.dv is not None else d // 2
         self.n = nn.LayerNorm(d)
         self.c = c_cls(d, cfg.Mc, freq=cfg.freq, theta_scale=cfg.theta_scale,
-                       max_len=cfg.max_len, dv=dv, gated_read=cfg.gated_read)
+                       max_len=cfg.max_len, dv=dv, gated_read=cfg.gated_read,
+                       rope_base=cfg.rope_base)
         self.dh = d_cls(d, cfg.Md, cfg.G, dv=dv, max_len=cfg.max_len,
                         delta_rule=cfg.delta_rule, gated_read=cfg.gated_read)
         self.mix = nn.Linear(4 * dv, d)      # each head emits 2*dv (re || im)
