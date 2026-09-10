@@ -468,6 +468,42 @@ unfolded O(T·L²) read; **rewritten as banded GEMMs** (`ShortHead._banded`: chu
 of C=L queries × C+L−1 extended keys, all chunks in one batched matmul, band mask),
 exact to 1e-15: L=64 now costs 1.1× L=16 (15.2 → 3.1 ms; unfolded vs banded 0.21).
 
+### Copy at d=128, final table (2026-09-10, 15:30) — the two knobs that mattered
+
+One M=190 arm per hypothesis, 2 layers, 4000 steps, token accuracy / exact-string:
+
+| arm | state/layer | tok/s* | L32 | L64 | L128 | L256 | L512 |
+|---|---|---|---|---|---|---|---|
+| attention (ceiling) | KV ~525k | | 1.00/1.00 | 1.00/1.00 | 1.00/1.00 | 1.00/0.99 | 1.00/0.99 |
+| **rope 1e3 + window 64** | 33k | | **1.00/1.00** | **1.00/1.00** | **1.00/0.99** | **1.00/0.97** | **1.00/0.14** |
+| window 64 | 33k | 108k (old read) | 1.00/1.00 | 1.00/0.99 | 1.00/0.96 | 1.00/0.91 | 0.99/0.00 |
+| rope 1e3 | 22.7k | 196k | 1.00/0.97 | 1.00/0.88 | 1.00/0.80 | 1.00/0.55 | 0.99/0.00 |
+| window 128 | 61k | 151k | 1.00/1.00 | 1.00/1.00 | 1.00/0.85 | 0.99/0.20 | 0.96/0.00 |
+| no delta rule | 22.7k | | 0.99/0.83 | 0.99/0.47 | 0.98/0.07 | 0.95 | 0.88 |
+| rope 1e5 | 22.7k | | 0.99/0.82 | 0.98/0.38 | 0.97/0.04 | 0.93 | 0.84 |
+| base (rope 1e4, w16) | 22.7k | 172k | 0.99/0.78 | 0.99/0.49 | 0.98/0.07 | 0.95 | 0.87 |
+| GDN 3×80 | 21.4k | 120k | 1.00/0.97 | 0.99/0.70 | 0.97/0.02 | 0.81 | 0.52 |
+
+*cumulative, sequential runs, ±15%.
+
+**The L=32 floor was the rope base.** At base 1e4 a quarter of the modes (47/190) have
+periods > 2T and are near-constant over a 1024-token sequence — dead for addressing —
+and a write 33 tokens away still overlaps the current code at κ[33]=0.43; at base 1e3
+no mode is wasted and κ[33]=0.24. Rule: unaliased range 2·base ≈ context. θ, damping,
+and the delta rule were each ruled out by a single-change arm (θ=0 and no-delta:
+identical; no damping: identical at L=32, +0.08 at L=512 — the damped half costs range
+in long copy, hence `learn_persist`). Zero-shot read SNR at lag 33 was ~0.14 for all
+of them: the floor was kernel breadth plus training, not a knob.
+
+**The short window composes across depth** (2 layers × (L−1)); a wider window delays
+the long head's engagement (nothing easy left to learn on) and the hand-over is a
+visible mode change — window 128 ended *behind* window 64 at 4000 steps. Together,
+rope 1e3 + window 64 match the attention ceiling on token accuracy at every length
+with 16× less memory, and emit exact 512-token strings (14%) — the first recurrent arm
+to do so. Every LM run of the campaign used base 1e4 at T=1024; tonight's XL runs
+(`long5h_rope.sh`: rope 1e3 + window 64 first, then rope 1e3 alone) test whether the
+same two knobs move the LM.
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short
