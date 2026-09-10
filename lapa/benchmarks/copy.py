@@ -191,10 +191,11 @@ def plot(a):
             xs = [r["step"] for r in rs if str(L) in r[metric]]
             ys = [r[metric][str(L)] for r in rs if str(L) in r[metric]]
             st = rs[0]["state"]
+            nl = rs[0]["layers"]
             tag = (
-                f"{lab}  ({rs[0]['params_layer'] / 1e6:.2f}M/layer, state {st / 1e3:.0f}k)"
+                f"{lab}  ({rs[0]['params_layer'] / 1e6:.2f}M params, {st / nl / 1e3:.1f}k state / layer)"
                 if st
-                else f"{lab}  ({rs[0]['params_layer'] / 1e6:.2f}M/layer, KV cache)"
+                else f"{lab}  ({rs[0]['params_layer'] / 1e6:.2f}M params / layer, KV cache)"
             )
             ax.plot(xs, ys, color=cmap(j % 10), lw=2, label=tag if i == 0 else None)
         ax.set_title(f"copy length L = {L}")
