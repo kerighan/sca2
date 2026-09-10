@@ -1,0 +1,29 @@
+{
+ "arm": "gdn_cc",
+ "extra": "gdn_head_k=71",
+ "Mc": 128,
+ "d": 128,
+ "steps": 15000,
+ "target": 0.98,
+ "ladder": [
+  128,
+  192,
+  256,
+  320,
+  384
+ ],
+ "depths": {
+  "2": {
+   "L_max": null,
+   "rungs": [
+    {
+     "L": 128,
+     "solved": null,
+     "exact": 0.93359375,
+     "state": 34080,
+     "s": 706.6
+    }
+   ]
+  }
+ }
+}

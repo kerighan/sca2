@@ -184,11 +184,15 @@ class GDNLayer(nn.Module):
 
 
 class GDNLayerMatched(GDNLayer):
-    """Registry adapter: (cfg, c_cls, d_cls) signature, head shape fixed to the
-    configuration that matches our layer budget (184,686 vs 185,984, -0.70%)."""
+    """Registry adapter: (cfg, c_cls, d_cls) signature. The head shape now comes
+    from cfg, whose DEFAULTS are the values this class used to hardcode -- the
+    configuration that matches our layer budget (184,686 vs 185,984, -0.70%).
+    Overriding them breaks that parameter match, which is the point when the
+    comparison being made is against state size rather than parameter count."""
 
     def __init__(self, cfg, c_cls=None, d_cls=None):
-        super().__init__(cfg, heads=3, head_k=60, expand_v=1.0)
+        super().__init__(cfg, heads=cfg.gdn_heads, head_k=cfg.gdn_head_k,
+                         expand_v=cfg.gdn_expand_v)
 
 
 register("gdn", CHeadQuad, None, arch=True, layer_cls=GDNLayerMatched,

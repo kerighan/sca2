@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from sca2.ref import LayerCfg
 from bench_tinypython import SCA2, Transformer, generate
 
+CLS_TAB = None      # set by --class-eval; see evaluate()
+
 
 def batches(data, B, T, device):
     """Sequential, non-repeating."""
@@ -38,15 +40,52 @@ def batches(data, B, T, device):
 
 
 @torch.no_grad()
-def evaluate(m, val, B, T, device, nb=25):
+def evaluate(m, val, B, T, device, nb=25, buckets=0, cls_tab=None):
+    """Mean val loss, and optionally its breakdown by POSITION in the window.
+
+    The aggregate loss cannot settle an architecture comparison here: its
+    standard deviation across evals is 0.039 nats at nb=25 (measured on the four
+    arms of runs/h4.jsonl in a window where the curve is nearly flat), which is
+    the size of every effect looked for so far. The per-position profile is a
+    WITHIN-MODEL relative measure -- loss late in the window against loss early
+    in it -- so a model's own noise largely cancels, and it answers the actual
+    question about long context: does the extra distance get used?
+
+    The last position is excluded: with a flat token stream its target is the
+    first token of the next window (see prep_longdoc.py).
+
+    cls_tab (sca2.tokclass.load_table) adds a breakdown by WHAT the target token
+    is -- word seen earlier in the window / new word / keyword / punctuation ...
+    -- the instrument for CATCHUP.md conjecture 1. Same forward, so it is free.
+    Returns (val, pos_profile, {class: loss} or None).
+    """
     m.eval()
-    ls = []
+    ls, bk, nb_seen = [], None, 0
+    cs = cn = None
+    w = 0 if not buckets else (T - 1) // buckets
     for k, (x, y) in enumerate(batches(val, B, T, device)):
         if k >= nb:
             break
-        ls.append(F.cross_entropy(m(x).flatten(0, 1), y.flatten()).item())
+        lo = F.cross_entropy(m(x).flatten(0, 1), y.flatten(),
+                             reduction="none").view(B, T)
+        ls.append(lo.mean().item())
+        if w:
+            b = lo[:, :buckets * w].view(B, buckets, w).mean((0, 2))
+            bk = b if bk is None else bk + b
+            nb_seen += 1
+        if cls_tab is not None:
+            from sca2 import tokclass as tc
+            s_, n_ = tc.class_means(lo, tc.split_repeat(x, y, cls_tab))
+            cs = s_ if cs is None else cs + s_
+            cn = n_ if cn is None else cn + n_
     m.train()
-    return sum(ls) / len(ls)
+    prof = None if bk is None else (bk / nb_seen).tolist()
+    cls = None
+    if cs is not None:
+        from sca2 import tokclass as tc
+        cls = {tc.NAMES[i]: round((cs[i] / cn[i].clamp(min=1)).item(), 5)
+               for i in range(len(tc.NAMES)) if cn[i] > 0}
+    return sum(ls) / len(ls), prof, cls
 
 
 def run(name, m, tr, va, a, device, log):
@@ -78,13 +117,22 @@ def run(name, m, tr, va, a, device, log):
         spent += time.perf_counter() - t0
         step += 1; seen += a.batch * a.block
         if spent >= nxt or spent >= a.seconds:
-            vl = evaluate(m, va, a.batch, a.block, device)
-            rec = {"model": name, "step": step, "train_s": round(spent, 1),
+            vl, prof, cls = evaluate(m, va, a.batch, a.block, device,
+                                     nb=a.eval_batches, buckets=a.pos_buckets,
+                                     cls_tab=CLS_TAB)
+            rec = {"model": name, "seed": a.seed, "step": step, "train_s": round(spent, 1),
                    "tokens": seen, "train": round(loss.item(), 5), "val": round(vl, 5),
                    "tok_s": round(seen / spent)}
+            if prof:
+                rec["pos"] = [round(v, 5) for v in prof]
+            if cls:
+                rec["cls"] = cls
             print(f"  {name} t={rec['train_s']:6.0f}s step {step:6d} "
                   f"{seen/1e6:6.1f}M tok  train {rec['train']:.4f}  val {rec['val']:.4f}  "
-                  f"{rec['tok_s']} tok/s", flush=True)
+                  f"{rec['tok_s']} tok/s"
+                  + (f"  pos {prof[0]:.3f}->{prof[-1]:.3f}" if prof else "")
+                  + (f"  new {cls['word_new']:.3f} rep {cls['word_rep']:.3f}" if cls else ""),
+                  flush=True)
             log.write(json.dumps(rec) + "\n"); log.flush()
             nxt = spent + a.eval_every
     return m
@@ -94,11 +142,25 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--seconds", type=float, default=900)
     p.add_argument("--eval-every", type=float, default=30, dest="eval_every")
+    # 25 batches gives sd(val) = 0.039 nats, the size of every effect chased so
+    # far; raise this whenever an architecture comparison is the point.
+    p.add_argument("--eval-batches", type=int, default=25, dest="eval_batches")
+    # loss by position in the window: the long-context instrument, see evaluate()
+    p.add_argument("--pos-buckets", type=int, default=0, dest="pos_buckets")
     p.add_argument("--warm", type=int, default=10)
     p.add_argument("--batch", type=int, default=16); p.add_argument("--block", type=int, default=256)
     p.add_argument("--d", type=int, default=128); p.add_argument("--layers", type=int, default=2)
     p.add_argument("--Mc", type=int, default=64); p.add_argument("--Md", type=int, default=8)
     p.add_argument("--G", type=int, default=8); p.add_argument("--ff", type=int, default=256)
+    # value width of BOTH heads' state; None -> d//2. Md costs 9280 params per
+    # unit at dv=64, so halving dv is the only way to fund a large Md without
+    # also crushing ff (see LayerCfg.dv).
+    p.add_argument("--dv", type=int, default=None)
+    # Scale of the CONTENT-dependent part of the C head phase, pw = K(h)*theta +
+    # p*omega. At 0 the head is a pure lag kernel (ref.freq_grid docstring) and
+    # dL/dK is identically 0, so the content path never starts learning. This was
+    # hardcoded to 0.0 in every run this file ever produced.
+    p.add_argument("--theta-scale", type=float, default=0.0, dest="theta_scale")
     p.add_argument("--trf-ff", type=int, default=367, dest="trf_ff")
     p.add_argument("--variant", default="v3polar_cc"); p.add_argument("--freq", default="rope")
     p.add_argument("--lr", type=float, default=1e-3)
@@ -107,9 +169,33 @@ def main(argv=None):
     p.add_argument("--samples", type=int, default=3)
     p.add_argument("--save", default=None)
     p.add_argument("--label", default=None, help="name this arm in the log")
+    # init seed. The batch ORDER is deterministic either way (batches() is
+    # sequential), so repeats vary only in initialisation -- which is what the
+    # eval-noise question needs, and it keeps the arms seeing identical data.
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--only", default=None)
     p.add_argument("--no-compile", action="store_true", dest="no_compile")
+    # gated C head knobs (sca2/arch_gatedc.py), used by --variant gc / gc_cc
+    p.add_argument("--c-heads", type=int, default=1, dest="c_heads")
+    p.add_argument("--c-decay", action="store_true", dest="c_decay")
+    p.add_argument("--c-decay-init", default="gdn", dest="c_decay_init")
+    p.add_argument("--c-sepq", action="store_true", dest="c_sepq")
+    p.add_argument("--conv", type=int, default=0)
+    p.add_argument("--gated-read", action="store_true", dest="gated_read")
+    # loss by TOKEN CLASS at every eval (sca2/tokclass.py); --bpe names the
+    # tokenizer files the corpus was built with
+    # GDN head shape, for --variant gdn* (whole mixer) and hyb* (D-head slot)
+    p.add_argument("--Ls", type=int, default=16, help="window of the short dft C head (--variant cshort*)")
+    p.add_argument("--gdn-heads", type=int, default=3, dest="gdn_heads")
+    p.add_argument("--gdn-head-k", type=int, default=60, dest="gdn_head_k")
+    p.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
+    p.add_argument("--class-eval", action="store_true", dest="class_eval")
+    p.add_argument("--bpe", default="pycode_bpe16k")
     a = p.parse_args(argv)
+    global CLS_TAB
+    if a.class_eval:
+        from sca2 import tokclass as tc
+        CLS_TAB = tc.load_table(a.bpe)
     device = "cuda"
 
     z = torch.load(a.data)
@@ -117,16 +203,23 @@ def main(argv=None):
     print(f"corpus {len(tr)/1e6:.1f}M train / {len(va)/1e6:.1f}M val tokens, vocab {V}")
     print(f"budget {a.seconds:.0f}s per arm, {a.layers} layers, B={a.batch} T={a.block}\n")
 
-    cfg = LayerCfg(a.d, a.Mc, a.Md, a.G, a.ff, freq=a.freq, theta_scale=0.0, max_len=a.block)
+    cfg = LayerCfg(a.d, a.Mc, a.Md, a.G, a.ff, freq=a.freq,
+                   theta_scale=a.theta_scale, max_len=a.block,
+                   dv=a.dv,
+                   c_heads=a.c_heads, c_decay=a.c_decay, c_decay_init=a.c_decay_init,
+                   c_sepq=a.c_sepq, conv=a.conv,
+                   gated_read=a.gated_read,
+                   Ls=a.Ls, gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
+                   gdn_expand_v=a.gdn_expand_v)
     log = open(a.log, "a")
     models = {}
     if a.only != "transformer":
-        torch.manual_seed(0)
+        torch.manual_seed(a.seed)
         nm = a.label or "SCA2"
         models[nm] = run(nm, SCA2(V, cfg, a.variant, device, a.layers),
                          tr, va, a, device, log)
     if a.only != "sca2":
-        torch.manual_seed(0)
+        torch.manual_seed(a.seed)
         trf = Transformer(V, a.d, 4, a.trf_ff, a.block, a.layers).to(device)
         # The SCA2 arm runs through a compiled variant, so the transformer must be
         # compiled too. It was not -- here and in bench_tinypython.py -- which

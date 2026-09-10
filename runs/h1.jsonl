@@ -1,0 +1,4 @@
+{"model": "SCA2", "step": 1, "train_s": 0.0, "tokens": 4096, "train": 8.59753, "val": 8.52343, "tok_s": 100743}
+{"model": "SCA2", "step": 2002, "train_s": 120.1, "tokens": 8200192, "train": 5.73289, "val": 5.84543, "tok_s": 68299}
+{"model": "SCA2", "step": 4122, "train_s": 240.1, "tokens": 16883712, "train": 5.5066, "val": 5.52548, "tok_s": 70313}
+{"model": "SCA2", "step": 6180, "train_s": 360.2, "tokens": 25313280, "train": 5.35254, "val": 5.40807, "tok_s": 70284}

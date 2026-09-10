@@ -17,6 +17,7 @@ decode.
 | `decode.py` | manual CUDA-graph decoder with static state buffers |
 | `bench.py`, `bench_heads.py`, `bench_vs_transformer.py` | measurement |
 | `DERIVATION.md` | what each optimization exploits, and why |
+| `arch_cdelta.py` | **error-correcting C write** — closes the gap to GDN. Not iso: it changes what the layer computes |
 
 ## The gate
 
@@ -151,6 +152,83 @@ parameters, i.e. a different architecture.
 
 TF32/bf16 matmuls are left off: they would break the fp32 iso tolerance, which
 is a precision decision, not a free win.
+
+## The one semantic change that closed the gap to GDN
+
+Everything above preserves the function. This does not, and it is the only
+change so far that removed the 0.119-nat deficit against Gated DeltaNet
+(`arch_cdelta.py`, pycode, 1024-token blocks, 4 layers, one 177M-token epoch,
+params matched to 0.07%):
+
+| arm | val | seed sd | n |
+|---|---|---|---|
+| **delta write, θ init 0.02** | **2.7480** | 0.0147 | 3 |
+| Gated DeltaNet | 2.7869 | 0.0733 | 3 |
+| delta write, θ init 0 | 2.7879 | 0.0198 | 3 |
+| additive write (`v3polarflat`) | 2.9058 | 0.0356 | 3 |
+
+Two estimators, and a claim counts only if both agree: interpolation to a common
+168.7M tokens, and a seed-**paired** mean over the last 30M
+(`dump_cdelta.paired`). "Resolved" means |t| beats the true two-sided 95% t
+critical value at its dof — **2.9 to 4.3 at n=3, not 2**.
+
+| comparison | endpoint | paired | resolved |
+|---|---|---|---|
+| delta(θ.02) − additive(θ0) | −0.1577 | −0.1865 | yes, but spans two changes |
+| **delta(θ.02) − additive(θ.02)** | **−0.1111** | **−0.1463** | **yes** — mechanism |
+| **delta(θ0) − additive(θ0)** | **−0.1179** | **−0.1366** | **yes** — mechanism |
+| delta(θ.02) − delta(θ0) | −0.0398 | −0.0501 | no, p=0.053 |
+| additive(θ.02) − additive(θ0) | −0.0467 | −0.0369 | no, p=0.140 |
+| delta(θ.02) − GDN | −0.0388 | −0.0832 | no, p=0.456 |
+| additive − GDN | +0.1189 | +0.0994 | no, p=0.088 |
+
+**Attribution.** `--theta-scale` defaults to 0.0 and the additive arm's runs never
+override it, so the −0.1577 row spans the delta rule *and* a θ init change.
+`theta_ctrl.sh` supplied the missing cell (additive write at θ init 0.02, 2.8591 ±
+0.0233, n=3), so the mechanism is now measured at **both** matched inits: −0.1111
+and −0.1179. The init is worth −0.037..−0.047 under the additive write, all three
+seeds negative but not resolved — consistent with the two effects being roughly
+additive, and showing the earlier n=1 reading of +0.012 to be noise.
+
+**Two retractions.** `additive − GDN = +0.1189` was quoted as "the gap, confirmed
+real"; it is **not resolved** (p=0.088). An earlier `dump_cdelta.py` thresholded
+at `|t|>2.5`, wrong at dof≈3. So SCA2 was never *resolvedly* behind GDN at n=3 —
+only suggestively. The θ init is likewise not a resolved effect (p=0.053).
+
+Against GDN the delta arm has the better mean but nothing resolves, and that is
+not evidence of equivalence either — no claim of parity, none of superiority.
+What is established is the mechanism against its own baseline.
+
+The write becomes `S += φ_t (v_t − β_t·v̂_t)ᴴ` with `v̂ᴴ = Re(φᴴS)/M`, which is
+exact because the codes have constant amplitude (`‖φ‖² = M`). That same constant
+amplitude makes this *exactly* a real unit-norm delta rule: with
+`u = [cos pʷ ; sin pʷ]/√M` and `H = [Sᴿ ; Sᴵ]/√M`, one has `‖u‖ = 1` and
+`H_t = (I − β_t u uᵀ) H_{t−1} + u v_tᵀ` identically (checked to 8.9e-16). So the
+phase parameterises normalised keys, and the difference from GDN is exact: same
+algebraic form, different key manifold — GDN's key ranges over the unit sphere of
+`R^dk`, ours over the Clifford torus in `R^2M`. Over a chunk this
+is unit lower triangular, so it costs **one triangular solve** and nothing else:
+the read and the state carry are the additive layer's with `v ← E`. `β = 0`
+reproduces the additive layer bit-for-bit (1.1e-15), so the baseline is nested
+and the gate can switch the mechanism off — it does the opposite, training to
+`|w| = 0.80..1.75`, i.e. genuinely data-dependent erasure.
+
+Two things worth carrying forward:
+
+* The gain **grows with position** (−0.046 at tokens 0-127 to −0.238 at
+  896-1023) whereas GDN's advantage is flat. The two mechanisms are
+  complementary, not two approximations of one.
+* It costs **1.19x** in throughput (68.4k vs 81.4k tok/s), so SCA2 no longer
+  beats GDN's speed. The gain survives the change of axis (at equal wall clock:
+  2.7979 / 2.8750 / 2.9114), and all of the 1.19x is one term — the Gram matrix
+  of the write codes, `2·C²·M` against the kernel's `4·C²·M`, with the solve
+  itself only 4% of that. `CHeadDeltaWPos` makes that Gram a cached Toeplitz
+  matrix by freezing the write phase; whether the gain survives is being
+  measured.
+
+`python -m sca2.arch_cdelta` checks the closed form against the sequential
+recurrence (2.7e-15), `β = 0` against `CHeadQuad` (1.1e-15), and the cached
+Toeplitz against the explicit Gram (3.3e-16).
 
 ## Against the Transformer at matched parameters
 

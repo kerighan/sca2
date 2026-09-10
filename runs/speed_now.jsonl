@@ -1,0 +1,15 @@
+{"model": "GDN", "step": 1, "train_s": 0.0, "tokens": 4096, "train": 9.1963, "val": 9.11676, "tok_s": 114027}
+{"model": "GDN", "step": 462, "train_s": 20.1, "tokens": 1892352, "train": 6.86933, "val": 6.62041, "tok_s": 94266}
+{"model": "GDN", "step": 905, "train_s": 40.0, "tokens": 3706880, "train": 6.12581, "val": 6.27172, "tok_s": 92622}
+{"model": "Transformer", "step": 1, "train_s": 0.0, "tokens": 4096, "train": 8.85204, "val": 8.75099, "tok_s": 174247}
+{"model": "Transformer", "step": 673, "train_s": 20.0, "tokens": 2756608, "train": 7.04554, "val": 6.74601, "tok_s": 137515}
+{"model": "Transformer", "step": 1315, "train_s": 40.0, "tokens": 5386240, "train": 6.37192, "val": 6.4131, "tok_s": 134655}
+{"model": "SCA2", "step": 1, "train_s": 0.0, "tokens": 4096, "train": 8.59753, "val": 8.52343, "tok_s": 97367}
+{"model": "SCA2", "step": 410, "train_s": 20.1, "tokens": 1679360, "train": 6.78042, "val": 6.61171, "tok_s": 83622}
+{"model": "SCA2", "step": 808, "train_s": 40.0, "tokens": 3309568, "train": 6.44202, "val": 6.31321, "tok_s": 82722}
+{"model": "GDN", "step": 1, "train_s": 0.0, "tokens": 4096, "train": 9.1963, "val": 9.11676, "tok_s": 113755}
+{"model": "GDN", "step": 464, "train_s": 20.0, "tokens": 1900544, "train": 6.62711, "val": 6.61413, "tok_s": 94797}
+{"model": "GDN", "step": 918, "train_s": 40.0, "tokens": 3760128, "train": 6.20472, "val": 6.25345, "tok_s": 93907}
+{"model": "Transformer", "step": 1, "train_s": 0.0, "tokens": 4096, "train": 8.85204, "val": 8.75099, "tok_s": 150887}
+{"model": "Transformer", "step": 689, "train_s": 20.0, "tokens": 2822144, "train": 6.66598, "val": 6.73383, "tok_s": 140786}
+{"model": "Transformer", "step": 1354, "train_s": 40.0, "tokens": 5545984, "train": 6.23312, "val": 6.39282, "tok_s": 138556}

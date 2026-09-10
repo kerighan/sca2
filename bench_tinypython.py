@@ -291,6 +291,8 @@ def show_samples(name, m, va, a, device, detok):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--examples", type=int, default=20000); p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--epochs", type=float, default=0,
+                   help="derive --steps from the corpus size; overrides --steps")
     p.add_argument("--block", type=int, default=128); p.add_argument("--batch", type=int, default=16)
     p.add_argument("--d", type=int, default=128); p.add_argument("--Mc", type=int, default=64)
     p.add_argument("--Md", type=int, default=16); p.add_argument("--G", type=int, default=8)
@@ -316,6 +318,15 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     variant = a.variant
     tr, va, V, detok = prepare(a)
+    # One pass over the data is a property of the corpus, not something to
+    # hand-compute from an assumed tokens-per-example -- and getting it wrong is
+    # expensive: at 132 epochs this benchmark measures memorisation, with val
+    # loss rising well past its minimum, so the arms are ranked on how well they
+    # overfit rather than on how well they model.
+    if a.epochs:
+        a.steps = max(1, round(a.epochs * len(tr) / (a.batch * a.block)))
+        print(f"--epochs {a.epochs} over {len(tr)} train tokens "
+              f"-> {a.steps} steps of {a.batch * a.block} tokens")
     cfg = LayerCfg(a.d, a.Mc, a.Md, a.G, a.ff, freq=a.freq,
                    theta_scale=a.theta_scale, max_len=a.block)
     print(f"sca2 {variant or ('version ' + active_version())} freq={a.freq} "
@@ -329,7 +340,12 @@ def main():
 
     if a.only not in ("transformer", "original"):
         torch.manual_seed(a.seed)
-        finish("SCA2", train("SCA2", SCA2(V, cfg, variant, device, a.layers), tr, va, a, device))
+        # Name the arm after the variant. `--variant gdn_cc` goes through this
+        # same wrapper (the registry returns a GDN layer, which has prefill/step
+        # like any other), so logging it as "SCA2" made the two arms of a
+        # SCA2-vs-GDN comparison indistinguishable in the JSONL.
+        label = variant.upper() if variant else "SCA2"
+        finish(label, train(label, SCA2(V, cfg, variant, device, a.layers), tr, va, a, device))
     if a.only == "original":
         torch.manual_seed(a.seed)
         finish("OriginalSCA",

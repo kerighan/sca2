@@ -32,6 +32,28 @@ class CompiledLayer(nn.Module):
 
     def __init__(self, layer, prefill_mode="default", step_mode="default",
                  dynamic=False):
+        """prefill_mode="reduce-overhead" turns cudagraphs ON for prefill.
+
+        MEASURED: this does not work as a drop-in. The guess was that the
+        objection above is specific to `step` -- that only the RETURNED STATE fed
+        back as the next call's input collides with cudagraph trees' buffer
+        ownership, and that a training prefill (one call per batch, state
+        discarded, static shapes) would be safe. It is not:
+
+            RuntimeError: accessing tensor output of CUDAGraphs that has been
+            overwritten by a subsequent run.
+
+        The prefill's outputs are graph-owned too, and they outlive the call --
+        they are held for the backward, and pretrain.py interleaves eval forwards
+        with training steps. The documented remedy, torch.compiler.
+        cudagraph_mark_step_begin() before every invocation, is CALLER-side: it
+        changes this layer's contract rather than being free.
+
+        Kept registered (`v3polar_cg`, `v3polarflat_cg`) so the experiment is
+        reproducible, but the launch-overhead problem it was meant to solve is
+        better addressed inside the layer -- see sca2/fast_dhead.py, which
+        removes the chunk loop outright for +8.8% and no contract change.
+        """
         super().__init__()
         self.layer = layer
         self.cfg = layer.cfg

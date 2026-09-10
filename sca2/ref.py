@@ -38,7 +38,15 @@ def _gated_out(head, u, z):
     mixer's contribution token by token -- useful exactly when the state holds
     nothing relevant for the current position.
     """
-    u = _rms(u)
+    if getattr(head, "rms_read", True):
+        u = _rms(u)
+    else:
+        # RAW read: keep the magnitude. The RMS above erases the one signal that
+        # says whether anything matched -- a hash read on a key new to the window
+        # is a small random mixture, an exact repeat is a full-size value -- and
+        # the layer downstream is linear (mix), so nothing can recover it. A
+        # learned per-feature scale replaces the normalisation (arch_cdelta.CHeadDeltaRaw).
+        u = u * head.rscale
     return u * F.silu(head.rgate(z)) if getattr(head, "gated_read", False) else u
 
 
@@ -282,6 +290,21 @@ class LayerCfg:
     # state size, the decay einsum's inner width and the read at once -- and
     # unlike Mc it shrinks the VALUE dimension, not the addressing capacity.
     dv: int = None
+    # --- gated C head knobs (arch_gatedc.py); all off == CHeadQuad exactly ---
+    c_heads: int = 1        # split Mc (and dv) into this many heads
+    c_decay: bool = False   # data-dependent scalar forget gate per head
+    c_decay_init: str = "gdn"   # "gdn" (A~U(1,16), dt~logU) | "soft" (A=1, dt=0.01)
+    c_sepq: bool = False    # separate read-key projection Kq (else K is shared)
+    conv: int = 0           # causal depthwise conv width on z before the heads (0 = none)
+    # --- GDN baseline head shape (arch_gdn.GDNLayerMatched) ------------------
+    # Defaults are exactly what that class used to hardcode, so nothing moves.
+    # Exposed because the state GDN carries is gdn_heads.head_k^2.expand_v, and
+    # comparing it against SCA2 only means something at a MATCHED state size --
+    # raising Mc grows SCA2's state fast, so GDN needs the same lever.
+    Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
+    gdn_heads: int = 3
+    gdn_head_k: int = 60
+    gdn_expand_v: float = 1.0
 
     @classmethod
     def legacy(cls, **kw):

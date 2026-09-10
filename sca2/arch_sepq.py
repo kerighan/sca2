@@ -33,6 +33,7 @@ Cost at d=128, Md=16: 20k parameters instead of 262k and 21M MACs instead of
 268M, both 12.8x down.
 """
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,7 +44,11 @@ from .versions.v1_quad_scan import CHeadQuad
 
 
 class DHeadSepQ(DHeadBase):
-    CHUNK = 8
+    # The chunk is an occupancy knob, not a semantic one: the einsum below is
+    # M.G separate c x c x gs matmuls, so a bigger c means fewer, larger kernels
+    # at the cost of FLOPs growing as c. Measured end to end (sweep_dhead.py),
+    # the optimum moves with Md: 8 at Md=16, 16 at Md=4. Default unchanged.
+    CHUNK = int(os.environ.get("SCA2_D_CHUNK", 8))
 
     def __init__(self, d, M=16, G=8, dv=None, max_len=None, delta_rule=False,
                  gated_read=False):

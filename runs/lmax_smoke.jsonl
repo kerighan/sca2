@@ -1,0 +1,11 @@
+{"arm": "v3polarflat_cc/layers=1", "step": 200, "s": 12.5, "train": 0.7464, "state": 17025, "acc": {"16": 0.8354}, "exact": {"16": 0.0664}}
+{"arm": "v3polarflat_cc/layers=1", "step": 400, "s": 18.9, "train": 0.1118, "state": 17025, "acc": {"16": 0.9539}, "exact": {"16": 0.4648}}
+{"arm": "v3polarflat_cc/layers=1", "step": 600, "s": 19.9, "train": 0.008, "state": 17025, "acc": {"16": 0.999}, "exact": {"16": 0.9844}}
+{"arm": "v3polarflat_cc/layers=1", "step": 200, "s": 1.8, "train": 0.7464, "state": 17025, "acc": {"16": 0.8354}, "exact": {"16": 0.0664}}
+{"arm": "v3polarflat_cc/layers=1", "step": 400, "s": 3.5, "train": 0.1118, "state": 17025, "acc": {"16": 0.9539}, "exact": {"16": 0.4648}}
+{"arm": "v3polarflat_cc/layers=1", "step": 600, "s": 4.6, "train": 0.008, "state": 17025, "acc": {"16": 0.999}, "exact": {"16": 0.9844}}
+{"arm": "v3polarflat_cc/layers=1", "step": 800, "s": 5.6, "train": 0.0032, "state": 17025, "acc": {"16": 0.9998}, "exact": {"16": 0.9961}}
+{"arm": "v3polarflat_cc/layers=1", "step": 200, "s": 1.9, "train": 0.945, "state": 17025, "acc": {"32": 0.7599}, "exact": {"32": 0.0}}
+{"arm": "v3polarflat_cc/layers=1", "step": 400, "s": 3.8, "train": 0.0668, "state": 17025, "acc": {"32": 0.9821}, "exact": {"32": 0.5547}}
+{"arm": "v3polarflat_cc/layers=1", "step": 600, "s": 4.9, "train": 0.0107, "state": 17025, "acc": {"32": 0.9988}, "exact": {"32": 0.9648}}
+{"arm": "v3polarflat_cc/layers=1", "step": 800, "s": 6.1, "train": 0.0037, "state": 17025, "acc": {"32": 0.9996}, "exact": {"32": 0.9883}}

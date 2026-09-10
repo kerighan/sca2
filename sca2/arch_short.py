@@ -1,0 +1,220 @@
+r"""SHORT C HEAD: the characteristic-function form of a short causal conv, in the
+D-head slot.  Math and numpy walkthrough: chead_numpy.py.  Motivation: CATCHUP.md.
+
+A C head is a windowed Fourier sum,  o_t = sum_{s in window(t)} kappa(t,s) e_s,
+
+    kappa(t,s) = (1/L) sum_m w_m exp( i[ theta_m (K(h_s) - K(z_t))_m + (s - t) omega_m ] )
+
+The long head (cdelta) takes window = everything so far, a rope grid so the comb
+never aliases, and keeps the sum as an accumulator S.  THIS head takes the DFT grid
+omega_m = 2 pi m / L, whose kernel is EXACTLY delta((s - t) mod L) -- an exact tap
+at every lag, but periodic -- so the window must be the last L tokens and the
+state is a ring buffer of the L-1 previous writes (codes + values).  Nothing
+accumulates, so the write is additive (no delta rule) and there is nothing to
+forget.  With theta = 0 and w chosen, the head IS a learned L-tap causal filter
+over the values; theta != 0 makes the taps depend on content(z_t) - content(h_s).
+
+Same conventions as the long head: write key from h (previous token), value from
+z (current token), read with z -- the one-step induction association.  Positions
+enter only through t mod L, so the phase argument stays small at any context
+length (float32-safe where t * omega would not be).
+
+Cost: O(T . L . (L + dv)) per sequence -- no T x T kernel, no sequential scan.
+Measured against the polar D head it replaces: see CATCHUP.md.
+
+Interface = D head: prefill(z, h, state) -> (u (B,T,2dv), state), step(z_t, h_t,
+state) -> (u (B,2dv), state), init_state(B, device, dtype).  ShortLayer swaps it
+into SCA2Layer's D slot; LayerCfg.Ls sets L.  Self-test: python -m sca2.arch_short
+"""
+import math
+
+import torch
+import torch.nn as nn
+
+from .arch_cdelta import CHeadDelta, CHeadDeltaKV, CHeadDeltaRaw
+from .compiled import wrap as _cw
+from .fast_dhead import DHeadSepQPolarFlat
+from .ref import SCA2Layer, _gated_out
+from .registry import register
+
+
+class CHeadShort(nn.Module):
+    def __init__(self, d, L, dv, theta_scale=0.02):
+        super().__init__()
+        self.d, self.L, self.dv = d, L, dv
+        self.K = nn.Linear(d, L, False)
+        self.V = nn.Linear(d, dv, False)
+        self.theta = nn.Parameter(theta_scale * torch.randn(L))
+        # w = 1: kernel = delta at lag 0 at init (o_t = V(z_t)); the taps are learned
+        self.wr = nn.Parameter(torch.ones(L))
+        self.wi = nn.Parameter(torch.zeros(L))
+        # built in float64 then cast: 2*pi/L rounded in float32 breaks the exact
+        # cancellation of the Dirichlet comb at the 1e-7 level (harmless in float32
+        # training, visible in the float64 self-test below)
+        self.register_buffer("omega", (torch.arange(L, dtype=torch.float64) * (2 * math.pi / L))
+                             .to(torch.get_default_dtype()))                  # (L,)
+
+    # ---- state: the L-1 previous writes ----------------------------------- #
+    def init_state(self, B, device, dtype):
+        n = self.L - 1
+        return {"c": torch.ones(B, n, self.L, device=device, dtype=dtype),   # cos(phi) of past writes
+                "s": torch.zeros(B, n, self.L, device=device, dtype=dtype),  # sin(phi)
+                "e": torch.zeros(B, n, self.dv, device=device, dtype=dtype), # their values (0 = no write)
+                "pos": torch.zeros((), device=device, dtype=torch.long)}
+
+    def _phase(self, x, p):
+        """x (..., d), p (...) integer positions -> phase (..., L); positions mod L."""
+        return self.K(x) * self.theta + (p % self.L).to(x.dtype)[..., None] * self.omega
+
+    def _read(self, cq, sq, cw, sw, e):
+        """cq,sq (B,T,L) read codes; cw,sw (B,T,W,L) write codes of the W window
+        slots of each t (unfold views); e (B,T,W,dv).  Returns (B,T,2dv) = [Re | Im].
+
+        Re kappa = sum_l cw.(wr cq + wi sq) + sw.(wr sq - wi cq)   (expand cos(phi-psi))
+        Im kappa = sum_l sw.(wr cq + wi sq) - cw.(wr sq - wi cq)
+        so the read-side weights are folded into two (B,T,L) vectors and the window
+        tensors enter only through contractions -- no (B,T,W,L) intermediate."""
+        c1 = self.wr * cq + self.wi * sq                        # (B,T,L)
+        c2 = self.wr * sq - self.wi * cq
+        k_re = (torch.einsum("btwl,btl->btw", cw, c1) + torch.einsum("btwl,btl->btw", sw, c2)) / self.L
+        k_im = (torch.einsum("btwl,btl->btw", sw, c1) - torch.einsum("btwl,btl->btw", cw, c2)) / self.L
+        return torch.cat([torch.einsum("btw,btwj->btj", k_re, e),
+                          torch.einsum("btw,btwj->btj", k_im, e)], -1)
+
+    # ---- prefill ---------------------------------------------------------- #
+    def prefill(self, z, h, state=None):
+        B, T, _ = z.shape
+        st = state if state is not None else self.init_state(B, z.device, z.dtype)
+        L, n = self.L, self.L - 1
+        p = torch.arange(T, device=z.device) + st["pos"]                     # (T,)
+        phi = self._phase(h, p[None].expand(B, T))                           # write phases (B,T,L)
+        cw_new, sw_new, e_new = phi.cos(), phi.sin(), self.V(z)              # (B,T,L) (B,T,L) (B,T,dv)
+        # extended sequence: the L-1 buffered writes, then this chunk
+        cw = torch.cat([st["c"], cw_new], 1)                                 # (B, n+T, L)
+        sw = torch.cat([st["s"], sw_new], 1)
+        e = torch.cat([st["e"], e_new], 1)                                   # (B, n+T, dv)
+        # window slots: query t reads extended indices t .. t+n  (lags L-1 .. 0)
+        win = lambda x: x.unfold(1, L, 1).movedim(-1, 2)                     # (B, T, L, C)
+        psi = self._phase(z, p[None].expand(B, T))                           # read phases (B,T,L)
+        u = self._read(psi.cos(), psi.sin(), win(cw), win(sw), win(e))
+        new = {"c": cw[:, -n:], "s": sw[:, -n:], "e": e[:, -n:], "pos": st["pos"] + T}
+        return _gated_out(self, u, z), new
+
+    # ---- decode ----------------------------------------------------------- #
+    def step(self, z_t, h_t, state):
+        B = z_t.size(0)
+        p = state["pos"].expand(B)
+        phi = self._phase(h_t, p)                                            # (B,L)
+        cw = torch.cat([state["c"], phi.cos()[:, None]], 1)                  # (B,L,L)  window incl. this token
+        sw = torch.cat([state["s"], phi.sin()[:, None]], 1)
+        e = torch.cat([state["e"], self.V(z_t)[:, None]], 1)                 # (B,L,dv)
+        psi = self._phase(z_t, p)                                            # (B,L)
+        u = self._read(psi.cos()[:, None], psi.sin()[:, None],
+                       cw[:, None], sw[:, None], e[:, None])[:, 0]           # (B,2dv)
+        new = {"c": cw[:, 1:], "s": sw[:, 1:], "e": e[:, 1:], "pos": state["pos"] + 1}
+        return _gated_out(self, u, z_t), new
+
+
+class ShortLayer(SCA2Layer):
+    """cdelta C head + short dft C head in the D slot."""
+    C_CLS = CHeadDelta
+
+    def __init__(self, cfg, c_cls=None, d_cls=None):
+        super().__init__(cfg, self.C_CLS, DHeadSepQPolarFlat)                # built, then replaced
+        dv = cfg.dv if cfg.dv is not None else cfg.d // 2
+        self.dh = CHeadShort(cfg.d, cfg.Ls, dv, theta_scale=cfg.theta_scale or 0.02)
+
+
+class ShortLayerRaw(ShortLayer):
+    """same, with the long head's read unnormalised (cdelta_raw)."""
+    C_CLS = CHeadDeltaRaw
+
+
+class ShortLayerKV(ShortLayer):
+    """short dft head in the D slot + key-verified long head: the two fixes together."""
+    C_CLS = CHeadDeltaKV
+
+
+register("cshort_kv", CHeadDeltaKV, None, arch=True, layer_cls=ShortLayerKV,
+         note="cdelta_kv long head + short dft head")
+register("cshort_kv_cc", CHeadDeltaKV, None, arch=True, layer_cls=ShortLayerKV, wrap=_cw,
+         note="cshort_kv + compile")
+from .arch_damp import CHeadDeltaDampHalf, CHeadDeltaDampHalfFast, CHeadDeltaDampHalfKV   # noqa: E402  (after ShortLayer)
+
+
+class ShortLayerDampH(ShortLayer):
+    """short dft head in the D slot + half-persistent DAMPED long head, no verification."""
+    C_CLS = CHeadDeltaDampHalf
+
+
+class ShortLayerDampHKV(ShortLayer):
+    """... plus key verification: does the gate still earn its keep once the noise is damped?"""
+    C_CLS = CHeadDeltaDampHalfKV
+
+
+class ShortLayerDampHF(ShortLayer):
+    C_CLS = CHeadDeltaDampHalfFast
+
+
+register("cshort_damphf", CHeadDeltaDampHalfFast, None, arch=True, layer_cls=ShortLayerDampHF,
+         note="cshort_damph with the decay cap lifted (lambda <= 2)")
+register("cshort_damphf_cc", CHeadDeltaDampHalfFast, None, arch=True, layer_cls=ShortLayerDampHF, wrap=_cw,
+         note="cshort_damphf + compile")
+register("cshort_damph", CHeadDeltaDampHalf, None, arch=True, layer_cls=ShortLayerDampH,
+         note="damped (half-persistent) long head + short dft head")
+register("cshort_damph_cc", CHeadDeltaDampHalf, None, arch=True, layer_cls=ShortLayerDampH, wrap=_cw,
+         note="cshort_damph + compile")
+register("cshort_damphkv", CHeadDeltaDampHalfKV, None, arch=True, layer_cls=ShortLayerDampHKV,
+         note="damped (half-persistent) long head + key verification + short dft head")
+register("cshort_damphkv_cc", CHeadDeltaDampHalfKV, None, arch=True, layer_cls=ShortLayerDampHKV, wrap=_cw,
+         note="cshort_damphkv + compile")
+register("cshort", CHeadDelta, None, arch=True, layer_cls=ShortLayer,
+         note="cdelta + short dft C head (L-tap characteristic-function conv) in the D slot")
+register("cshort_cc", CHeadDelta, None, arch=True, layer_cls=ShortLayer, wrap=_cw,
+         note="cshort + compile")
+register("cshort_raw", CHeadDeltaRaw, None, arch=True, layer_cls=ShortLayerRaw,
+         note="cshort with the long head's read unnormalised")
+register("cshort_raw_cc", CHeadDeltaRaw, None, arch=True, layer_cls=ShortLayerRaw, wrap=_cw,
+         note="cshort_raw + compile")
+
+
+if __name__ == "__main__":
+    # Semantic checks in float64, against the closed form -- the iso gate cannot
+    # catch a kernel that is wrong the same way on both paths.
+    torch.manual_seed(0); torch.set_default_dtype(torch.float64)
+    d, L, dv, B, T = 8, 8, 4, 2, 40
+    hd = CHeadShort(d, L, dv, theta_scale=0.3).double()
+    hd.rms_read = False; hd.rscale = torch.ones(2 * dv, dtype=torch.float64)   # raw read for the check
+    z = torch.randn(B, T, d, dtype=torch.float64); h = torch.roll(z, 1, 1); h[:, 0] = 0
+    u, _ = hd.prefill(z, h)
+    # closed form: o_t = sum_{s=t-L+1..t} kappa(t,s) e_s
+    with torch.no_grad():
+        p = torch.arange(T)
+        phi = hd.K(h) * hd.theta + (p % L).double()[:, None] * hd.omega        # (B,T,L)
+        psi = hd.K(z) * hd.theta + (p % L).double()[:, None] * hd.omega
+        e = hd.V(z); w = hd.wr + 1j * hd.wi
+        ref = torch.zeros(B, T, dv, dtype=torch.complex128)
+        for t in range(T):
+            for s in range(max(0, t - L + 1), t + 1):
+                kap = (w * torch.exp(1j * (phi[:, s] - psi[:, t]))).sum(-1) / L  # (B,)
+                ref[:, t] += kap[:, None] * e[:, s]
+        err = (u - torch.cat([ref.real, ref.imag], -1)).abs().max().item()
+    print(f"prefill vs closed form (window sum): {err:.2e}")
+    assert err < 1e-12
+    # theta = 0, w = 1  ->  o_t = V(z_t) exactly (Dirichlet delta at lag 0)
+    with torch.no_grad():
+        hd.theta.zero_(); u0, _ = hd.prefill(z, h)
+        err0 = (u0[..., :dv] - hd.V(z)).abs().max().item(); print(f"theta=0, w=1: o_t - V(z_t) = {err0:.2e}")
+        assert err0 < 1e-12 and u0[..., dv:].abs().max() < 1e-12
+    # prefill == token-by-token, across a chunk boundary
+    with torch.no_grad():
+        hd.theta.normal_(); u, _ = hd.prefill(z, h)
+        st = hd.init_state(B, z.device, z.dtype); outs = []
+        for t in range(T):
+            o, st = hd.step(z[:, t], h[:, t], st); outs.append(o)
+        err1 = (u - torch.stack(outs, 1)).abs().max().item(); print(f"prefill vs step: {err1:.2e}")
+        assert err1 < 1e-12
+        u1, st1 = hd.prefill(z[:, :13], h[:, :13]); u2, _ = hd.prefill(z[:, 13:], h[:, 13:], st1)
+        err2 = (u - torch.cat([u1, u2], 1)).abs().max().item(); print(f"prefill vs split 13|27: {err2:.2e}")
+        assert err2 < 1e-12
+    n = sum(p.numel() for p in hd.parameters()); print(f"params (d={d}, L={L}, dv={dv}): {n}; ALL OK")

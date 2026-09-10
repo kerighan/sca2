@@ -55,10 +55,18 @@ def _load_variants():
     from . import arch_cumsum   # noqa: F401  original SeqCond temporal form
     from . import arch_gdn      # noqa: F401  Gated DeltaNet baseline
     from . import arch_keyed    # noqa: F401  key-addressed delta rule
+    from . import arch_gatedc   # noqa: F401  gated multi-head C head
+    from . import arch_wgroup   # noqa: F401  per-value-group spectral weights
+    from . import arch_cdelta   # noqa: F401  complex error-correcting C write
+    from . import arch_hybrid   # noqa: F401  cdelta C head + GDN D head
+    from . import arch_short    # noqa: F401  cdelta C head + short dft C head
+    from . import arch_damp     # noqa: F401  cdelta with per-mode decay (Laplace)
+    from . import fast_dhead    # noqa: F401  loop-free D head (iso with sepq/polar)
     try:
         from . import triton_dhead  # noqa: F401  fused kernel (needs triton)
     except Exception as e:  # triton missing or unsupported GPU
-        import warnings; warnings.warn(f"triton D-head unavailable: {e}")
+        import warnings
+        warnings.warn(f"triton D-head unavailable: {e}")
 
 
 _register_versions()
