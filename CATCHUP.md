@@ -433,6 +433,41 @@ head fp32). Its self-test loads the repo's `cshort_damph` weights and matches it
 9e-16 in float64 on both paths and in decode; float32 decode vs prefill 3e-7. Not yet
 in WINNERS.md: that file's bar is n=3, and A is n=1 (at 1.4B tokens).
 
+### Copy capacity at d=128, and the short head as a banded GEMM (2026-09-10 afternoon)
+
+`lapa/benchmarks/copy.py`, 2 layers, lengths 32–512, 4000 steps, token accuracy /
+exact-string at the end (`plot/copy_d128*.png`, `runs/copy_d128.jsonl`):
+
+| arm | state/layer | L32 | L64 | L128 | L256 | L512 |
+|---|---|---|---|---|---|---|
+| attention (ceiling) | KV ~525k | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| LapA M=380 | 44k | .996/.85 | .996 | .991/.20 | .981 | **.956** |
+| LapA M=190 | 22.7k | .992/.78 | .989 | .979/.07 | .948 | .870 |
+| GDN 3×80 | 21.4k | .999/.97 | .994 | .965/.02 | .813 | .515 |
+| GDN 3×60 | 12.4k | .999/.97 | .995 | .963 | .792 | .482 |
+| LapA M=95 | 12.1k | .981/.54 | .978 | .940 | .861 | .707 |
+
+Two error regimes: GDN is near-exact until its state saturates, then falls off a
+cliff; LapA has a small per-token floor (0.5–1.9%, ∝ 1/M — the superposition read's
+interference) and no cliff. Crossover in exact-string rate at L=64. Throughput
+scales linearly in M (243k / 172k / 114k tok/s for M = 95/190/380; GDN 3×80 120k).
+
+Controls on the L=32 floor, one M=190 arm each: **θ=0: no change** (content phase
+neither helps nor hurts copy); **no damping: no change at L=32, +0.08 at L=512**
+(0.95 vs 0.87 — the damped half costs range in long copy; the persistent fraction
+should be learned, not fixed at 0.5); zero-shot read SNR at lag 33 is ~0.14 with or
+without the delta rule and with or without damping — the floor is the rope kernel's
+breadth plus training length, not a knob. Delta-rule and rope-base arms pending.
+
+**Short-head window 64**: exact copy at L=32 in 250 steps and at L=64 in 500 (the
+Dirichlet comb; nothing to learn but one phase per mode), then — via composition
+across the two layers (receptive field 2×63) — L=128 exact 0.96 and L=256 0.36 at
+2250 steps where the base had 0.02 / 0.00. The long head starts ~500 steps later
+(no easy lengths left to bootstrap on) and catches up. Cost was −40% tok/s with the
+unfolded O(T·L²) read; **rewritten as banded GEMMs** (`ShortHead._banded`: chunks
+of C=L queries × C+L−1 extended keys, all chunks in one batched matmul, band mask),
+exact to 1e-15: L=64 now costs 1.1× L=16 (15.2 → 3.1 ms; unfolded vs banded 0.21).
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short

@@ -39,7 +39,7 @@ do, so a model can mix layer types.
 | `d` | 128 | model width |
 | `M` | 190 | long-head modes = frequency resolution. **Not tied to d**; set by copy capacity (see benchmarks) |
 | `dv` | 56 | value width; each head emits 2·dv |
-| `L` | 16 | short-head window, tokens |
+| `L` | 16 | short-head window, tokens; the read is a banded GEMM, so 64 costs ~1.1× 16 (copy up to L−2 tokens is exact by construction) |
 | `ff` | 448 | FFN width (GELU) |
 | `persist` | 0.5 | fraction of long-head modes with λ = 0 (infinite memory), lowest frequencies |
 | `chunk` | 128 | prefill chunk; `lam_max · chunk ≲ 60` keeps float32 safe |
