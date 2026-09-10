@@ -504,6 +504,26 @@ to do so. Every LM run of the campaign used base 1e4 at T=1024; tonight's XL run
 (`long5h_rope.sh`: rope 1e3 + window 64 first, then rope 1e3 alone) test whether the
 same two knobs move the LM.
 
+### The copy wins do not transfer as-is to the LM — and why (2026-09-10, 18:30)
+
+`l5_Aropew64_s0` (rope 1e3 + window 64) on XL: at 840M tokens it sits **+0.02..+0.10
+above A** (median ~+0.04), no longer closing since 300M, at parity with GDN instead of
+ahead. The deficit is uniform across token classes and positions — the layer learns a
+little worse everywhere, not one memory mechanism failing.
+
+Cause, measured on A's checkpoint (`ck_l5_A_s0`, rope 1e4): the 47 modes with period
+> 2T — "dead weight" for copying — carry **55–85% of the long head's state energy** in
+every layer, all persistent. They are near-constant over a sequence: integrators, the
+document/topic memory. Rope 1e3 removes them to sharpen addressing; the LM loses its
+global accumulator. Copy and LM want different grids.
+
+Fix inside the framework: a **mixed grid** (`slow_frac`; `rope_grid` in lapa,
+`freq_grid` in sca2, identical): a fraction of modes as slow integrators (periods
+2T..20T) plus a dense geometric grid at `rope_base` for the rest. `slow_frac=0.25,
+rope_base=1e3` keeps the 47 slow modes A used and densifies the other 143 into the
+addressing range. Queued as `l5_Amixed_s0` (window 16, single change vs A) behind
+tonight's rope-only arm (`l5_Arope_s0`), which separates the window-64 effect.
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short
