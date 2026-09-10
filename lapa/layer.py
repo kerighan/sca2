@@ -92,6 +92,8 @@ class LaplaceConfig:
     persist: float = (
         0.5  # fraction of long-head modes pinned at lambda = 0 (lowest freqs)
     )
+    learn_persist: bool = False  # no hard pin: lambda_m = lam_max*sigmoid(a_m); the `persist`
+    #                              fraction merely starts persistent (a=-8), the gradient decides
     mem_range: Tuple[float, float] = (
         64.0,
         4096.0,
@@ -159,14 +161,23 @@ class LongHead(nn.Module):
         nn.init.constant_(self.bproj.bias, cfg.beta_init)
         lo, hi = cfg.mem_range
         mem = torch.exp(torch.empty(M).uniform_(math.log(lo), math.log(hi)))
-        self.lam_raw = nn.Parameter(
-            torch.log(torch.expm1(1.0 / mem))
-        )  # softplus^{-1}(lambda)
-        mask = torch.ones(M)
         n_pin = int(round(cfg.persist * M))
-        if n_pin:
-            mask[self.omega.abs().argsort()[:n_pin]] = 0.0  # lowest frequencies persist
-        self.register_buffer("lam_mask", mask)
+        low = self.omega.abs().argsort()[:n_pin]  # lowest frequencies persist
+        if cfg.learn_persist:
+            # lambda_m = lam_max * sigmoid(a_m): reaches ~0 (a=-8 -> memory > 20k tokens) or the
+            # cap within a few hundred steps either way; nothing pinned, the task decides the split.
+            a = torch.logit((1.0 / mem / cfg.lam_max).clamp(1e-4, 1 - 1e-4))
+            a[low] = -8.0
+            self.lam_raw = nn.Parameter(a)
+            self.register_buffer("lam_mask", torch.ones(M))
+        else:
+            self.lam_raw = nn.Parameter(
+                torch.log(torch.expm1(1.0 / mem))
+            )  # softplus^{-1}(lambda)
+            mask = torch.ones(M)
+            if n_pin:
+                mask[low] = 0.0
+            self.register_buffer("lam_mask", mask)
 
     # ---- pieces ----------------------------------------------------------- #
     @property
@@ -174,6 +185,8 @@ class LongHead(nn.Module):
         return _wd(self.wr)
 
     def lam(self) -> torch.Tensor:
+        if self.cfg.learn_persist:
+            return self.cfg.lam_max * torch.sigmoid(self.lam_raw.to(self.wd))
         return (
             F.softplus(self.lam_raw.to(self.wd)).clamp(max=self.cfg.lam_max)
             * self.lam_mask
