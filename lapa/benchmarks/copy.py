@@ -171,11 +171,12 @@ def plot(a):
     import os
 
     stem, ext = os.path.splitext(a.out)
+    hide = [h.strip() for h in a.hide.split(",") if h.strip()]
     for metric, out in (("acc", a.out), ("exact", f"{stem}_exact{ext}")):
-        _plot_one(a.log, metric, out)
+        _plot_one(a.log, metric, out, hide)
 
 
-def _plot_one(log, metric, out):
+def _plot_one(log, metric, out, hide=()):
     import collections
     import matplotlib
 
@@ -183,6 +184,7 @@ def _plot_one(log, metric, out):
     import matplotlib.pyplot as plt
 
     recs = [json.loads(l) for l in open(log)]
+    recs = [r for r in recs if not any(h in r["label"] for h in hide)]
     lengths = sorted({int(k) for r in recs for k in r["acc"]})
     arms = collections.OrderedDict()
     for r in recs:
@@ -266,6 +268,7 @@ def main(argv=None):
     pl.add_argument("log")
     pl.add_argument("--out", default="plot/copy.png", help="token-accuracy figure; the exact-string figure is written next to it as *_exact")
     pl.add_argument("--exact", action="store_true", help="no-op, kept so older scripts still run (both figures are always written)")
+    pl.add_argument("--hide", default="", help="comma-separated label substrings to leave out of the figures")
     a = p.parse_args(argv)
     (run if a.cmd == "run" else plot)(a)
     return 0
