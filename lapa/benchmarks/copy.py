@@ -82,6 +82,7 @@ def layer_kwargs(a):
             persist=a.persist,
             chunk=a.chunk,
             beta_init=a.beta_init,
+            rope_base=a.rope_base,
         )
         return kw
     if a.arm == "gdn":
@@ -246,6 +247,7 @@ def main(argv=None):
     r.add_argument("--persist", type=float, default=0.5)
     r.add_argument("--chunk", type=int, default=128)
     r.add_argument("--beta-init", type=float, default=-2.0, dest="beta_init", help="erase-gate bias; -1000 switches the delta rule off")
+    r.add_argument("--rope-base", type=float, default=10000.0, dest="rope_base", help="long-head grid omega_m = pi * base^(-m/(M-1))")
     r.add_argument("--gdn-heads", type=int, default=3, dest="gdn_heads")
     r.add_argument("--gdn-head-k", type=int, default=60, dest="gdn_head_k")
     r.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
