@@ -86,7 +86,7 @@ def layer_kwargs(a):
             learn_persist=a.learn_persist,
         )
         return kw
-    if a.arm == "gdn":
+    if a.arm in ("gdn", "gdn2"):
         return dict(
             heads=a.gdn_heads, head_k=a.gdn_head_k, expand_v=a.gdn_expand_v, ff=a.ff
         )
@@ -244,7 +244,7 @@ def main(argv=None):
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("--arm", default="lapa", choices=["lapa", "gdn", "attn"])
+    r.add_argument("--arm", default="lapa", choices=["lapa", "gdn", "gdn2", "attn"])
     r.add_argument("--label", default=None)
     r.add_argument("--d", type=int, default=128)
     r.add_argument("--layers", type=int, default=2)
