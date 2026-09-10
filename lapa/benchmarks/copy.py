@@ -167,18 +167,26 @@ def run(a):
 
 
 def plot(a):
+    """Writes <out> (token accuracy) and <out stem>_exact.<ext> (exact-string rate)."""
+    import os
+
+    stem, ext = os.path.splitext(a.out)
+    for metric, out in (("acc", a.out), ("exact", f"{stem}_exact{ext}")):
+        _plot_one(a.log, metric, out)
+
+
+def _plot_one(log, metric, out):
     import collections
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    recs = [json.loads(l) for l in open(a.log)]
+    recs = [json.loads(l) for l in open(log)]
     lengths = sorted({int(k) for r in recs for k in r["acc"]})
     arms = collections.OrderedDict()
     for r in recs:
         arms.setdefault(r["label"], []).append(r)
-    metric = "exact" if a.exact else "acc"
     n = len(lengths)
     cols = min(n, 3)
     rows = -(-n // cols)
@@ -204,7 +212,7 @@ def plot(a):
         ax.grid(alpha=0.3)
         ax.set_xlabel("training step")
         if i % cols == 0:
-            ax.set_ylabel("exact-string rate" if a.exact else "token accuracy")
+            ax.set_ylabel("exact-string rate" if metric == "exact" else "token accuracy")
     for k in range(n, rows * cols):
         axes[k // cols][k % cols].axis("off")
     d = recs[0]["d"]
@@ -214,8 +222,8 @@ def plot(a):
     )
     axes[0][0].legend(fontsize=8, loc="lower right")
     plt.tight_layout()
-    plt.savefig(a.out, dpi=130)
-    print("saved", a.out)
+    plt.savefig(out, dpi=130)
+    print("saved", out)
 
 
 def main(argv=None):
@@ -256,8 +264,8 @@ def main(argv=None):
     r.add_argument("--log", default="runs/copy_lapa.jsonl")
     pl = sub.add_parser("plot")
     pl.add_argument("log")
-    pl.add_argument("--out", default="plot/copy.png")
-    pl.add_argument("--exact", action="store_true")
+    pl.add_argument("--out", default="plot/copy.png", help="token-accuracy figure; the exact-string figure is written next to it as *_exact")
+    pl.add_argument("--exact", action="store_true", help="no-op, kept so older scripts still run (both figures are always written)")
     a = p.parse_args(argv)
     (run if a.cmd == "run" else plot)(a)
     return 0
