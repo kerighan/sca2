@@ -174,6 +174,10 @@ def plot(a):
 
     stem, ext = os.path.splitext(a.out)
     hide = [h.strip() for h in a.hide.split(",") if h.strip()]
+    # a sidecar <log>.hide (one label substring per line) hides arms by default, so the
+    # plain `plot <log>` command stays clean once arms have been discarded
+    if os.path.exists(a.log + ".hide"):
+        hide += [l.strip() for l in open(a.log + ".hide") if l.strip() and not l.startswith("#")]
     for metric, out in (("acc", a.out), ("exact", f"{stem}_exact{ext}")):
         _plot_one(a.log, metric, out, hide)
 
@@ -272,7 +276,7 @@ def main(argv=None):
     pl.add_argument("log")
     pl.add_argument("--out", default="plot/copy.png", help="token-accuracy figure; the exact-string figure is written next to it as *_exact")
     pl.add_argument("--exact", action="store_true", help="no-op, kept so older scripts still run (both figures are always written)")
-    pl.add_argument("--hide", default="", help="comma-separated label substrings to leave out of the figures")
+    pl.add_argument("--hide", default="", help="comma-separated label substrings to leave out of the figures (also read from <log>.hide, one per line)")
     a = p.parse_args(argv)
     (run if a.cmd == "run" else plot)(a)
     return 0
