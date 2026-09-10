@@ -419,6 +419,20 @@ extrapolated from the 537M run (0.6–1.1B) did not happen.** At equal wall-cloc
 
 B (`l5_B_s0`) started 06:40, ends ~11:45.
 
+### B at 1.4B, and the standalone file (2026-09-10, 11:45)
+
+`l5_B_s0` final: 1272M tokens, val 2.3180, 73.1k tok/s. Medians over 300M–1.27B:
+B − GDN −0.062, A − GDN −0.044, **B − A −0.021**; over the last 270M, B − A −0.024.
+The gate's ~0.02 holds to 1.3B tokens, at 7% lower throughput and +13% decode cost:
+still an option, not the default. Plot: `plot/long5h.png`.
+
+**`laplace_attention.py`** — the self-contained, dependency-free layer (config
+dataclass, `prefill` / `step` / `init_state`, both long-head paths, working-dtype
+policy: state and codes/Gram/solve in fp32, the two big GEMMs follow autocast, short
+head fp32). Its self-test loads the repo's `cshort_damph` weights and matches it to
+9e-16 in float64 on both paths and in decode; float32 decode vs prefill 3e-7. Not yet
+in WINNERS.md: that file's bar is n=3, and A is n=1 (at 1.4B tokens).
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short
@@ -442,10 +456,21 @@ exercised (`SCA2_CTX_CHUNK=32`):
    setting for the GPU at hand — every number below the shared-GPU line must be
    redone with it once the GPU is idle.
 
-Measured so far only on a GPU shared with the B run (ratios, ±10%): long head
-25.7 → 22.6 ms, layer 37.2 → 33.2 ms. Chunk sweep still favours 128. **bf16
-autocast is 2.7× slower on the RTX 2070** (Turing: no bf16 tensor cores) — that
-lever is for the Spark (Blackwell), not here.
+**Clean numbers, idle GPU, blocked design** (`python -m sca2.autotune`, 5 rounds,
+round sd 0.3–3%), long head fwd+bwd B=8 T=1024:
+
+| path | CTX 64 | CTX 128 | CTX 256 |
+|---|---|---|---|
+| chunk (old) | 25.7 ms | 12.4 | 11.4 |
+| **batched** | 10.2 | **8.9** | 11.8 |
+
+Batched at 128 is **1.39× faster** than the old path at its own best (12.4 → 8.9 ms).
+Recommended `SCA2_LONG_PATH=batched SCA2_CTX_CHUNK=128` on the RTX 2070. Four-layer
+stacks, fwd+bwd, blocked: GDN 88.3 ms, gen3 71.2 (0.81), LapA old path 68.4 (0.77),
+**LapA batched 62.6 (0.71)** — the layer stack is now 1.41× faster than GDN's (was
+1.29× for gen3). **bf16 autocast is 2.7× slower on this GPU** (Turing has no bf16
+tensor cores): that lever is for the Spark. The standalone file's bf16 path
+deviates from fp32 by 2.6e-3 relative (big GEMMs in bf16, everything else fp32).
 
 ## Conjectures, ranked by belief (written before the results)
 
