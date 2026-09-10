@@ -441,11 +441,46 @@ class ShortHead(nn.Module):
             cw = torch.cat([st["c"], phi.cos()], 1)
             sw = torch.cat([st["s"], phi.sin()], 1)
             e = torch.cat([st["e"], self.V(z).to(self.wd)], 1)
-            win = lambda x: x.unfold(1, L, 1).movedim(-1, 2)  # (B,T,L,.)
             psi = self._phase(z, p[None].expand(B, T))
-            u = self._read(psi.cos(), psi.sin(), win(cw), win(sw), win(e))
+            u = self._banded(psi.cos(), psi.sin(), cw, sw, e, T)
         new = {"c": cw[:, -n:], "s": sw[:, -n:], "e": e[:, -n:], "pos": st["pos"] + T}
         return _rms(u).to(z.dtype), new
+
+    def _banded(self, cq, sq, cw, sw, e, T):
+        """The window read as BANDED GEMMs, all chunks at once (no sequential dependency).
+
+        kappa(t,s) = Fq_t . Fk_s / L  with  Fk_s = [cw_s ; sw_s]  (2L)  and, for the real /
+        imaginary parts,  Fq1_t = [c1 ; c2],  Fq2_t = [-c2 ; c1],  c1 = wr cq + wi sq,
+        c2 = wr sq - wi cq.  Queries are cut into chunks of C = L; the chunk with queries
+        [t0, t0+C) reads extended keys [t0, t0+C+L-1) (the L-1 buffered writes come first
+        in the extended arrays, so query t reads extended indices t .. t+L-1 = lags L-1 .. 0).
+        S = Fq (B,K,2C,2L) @ Fk_ext (B,K,2L,C+L-1), band mask 0 <= j - i <= L-1, o = S @ e_ext.
+        Same numbers as the unfolded contraction (checked against the repo path in __main__),
+        dense GEMMs instead of an O(T.L.L) einsum on strided views."""
+        B = cq.size(0)
+        L = self.L
+        C = L
+        K = -(-T // C)
+        pad = K * C - T
+        if pad:                                                   # ragged tail: pad queries and keys
+            cq, sq = F.pad(cq, (0, 0, 0, pad)), F.pad(sq, (0, 0, 0, pad))
+            cw, sw, e = F.pad(cw, (0, 0, 0, pad)), F.pad(sw, (0, 0, 0, pad)), F.pad(e, (0, 0, 0, pad))
+        c1 = self.wr * cq + self.wi * sq                          # (B,KC,L)
+        c2 = self.wr * sq - self.wi * cq
+        Fq = torch.cat([torch.cat([c1, c2], -1).view(B, K, C, 2 * L),
+                        torch.cat([-c2, c1], -1).view(B, K, C, 2 * L)], 2)          # (B,K,2C,2L)
+        Fk = torch.cat([cw, sw], -1)                                                # (B,KC+L-1,2L)
+        N = C + L - 1
+        Fk = Fk.unfold(1, N, C).movedim(-1, 2)                                      # (B,K,N,2L)
+        ek = e.unfold(1, N, C).movedim(-1, 2)                                       # (B,K,N,dv)
+        S = Fq @ Fk.transpose(-1, -2) / L                                           # (B,K,2C,N)
+        i = torch.arange(C, device=cq.device)[:, None]
+        j = torch.arange(N, device=cq.device)[None]
+        band = ((j - i) >= 0) & ((j - i) <= L - 1)                                  # (C,N)
+        S = S.masked_fill(~torch.cat([band, band], 0)[None, None], 0)
+        o = S @ ek                                                                  # (B,K,2C,dv)
+        o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * self.dv)
+        return o[:, :T]
 
     def step(self, z_t, h_t, state: State):
         with _NoAutocast(z_t.device):
