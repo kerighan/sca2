@@ -187,6 +187,7 @@ def main(argv=None):
     # GDN head shape, for --variant gdn* (whole mixer) and hyb* (D-head slot)
     p.add_argument("--Ls", type=int, default=16, help="window of the short dft C head (--variant cshort*)")
     p.add_argument("--rope-base", type=float, default=10000.0, dest="rope_base", help="long-head rope grid base (unaliased range 2*base)")
+    p.add_argument("--slow-frac", type=float, default=0.0, dest="slow_frac", help="fraction of long-head modes kept as slow integrators (periods 2..20 x block)")
     p.add_argument("--gdn-heads", type=int, default=3, dest="gdn_heads")
     p.add_argument("--gdn-head-k", type=int, default=60, dest="gdn_head_k")
     p.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
@@ -210,7 +211,7 @@ def main(argv=None):
                    c_heads=a.c_heads, c_decay=a.c_decay, c_decay_init=a.c_decay_init,
                    c_sepq=a.c_sepq, conv=a.conv,
                    gated_read=a.gated_read,
-                   Ls=a.Ls, rope_base=a.rope_base, gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
+                   Ls=a.Ls, rope_base=a.rope_base, slow_frac=a.slow_frac, gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)
     log = open(a.log, "a")
     models = {}

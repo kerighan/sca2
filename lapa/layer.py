@@ -101,6 +101,11 @@ class LaplaceConfig:
     lam_max: float = 0.125  # decay cap; keep lam_max * chunk <~ 60 for float32
     chunk: int = 128  # prefill chunk (also decides lam_max's safety)
     rope_base: float = 10000.0
+    slow_frac: float = 0.0  # fraction of long-head modes reserved as SLOW integrators (periods
+    #                          2T..20T at max_len T, i.e. rope base 10*max_len over that slice);
+    #                          the rest is the geometric rope grid of `rope_base`. The LM keeps
+    #                          55-85% of its state energy in such modes (document memory); copy wants 0.
+    max_len: int = 1024     # context the slow slice is sized for
     long_path: str = (
         "batched"  # "batched" (intra-chunk work for all chunks at once) | "chunk"
     )
@@ -117,6 +122,22 @@ def _rms(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def _wd(p: torch.Tensor) -> torch.dtype:
     """Working dtype of the fp32 sections: float64 if the module is float64 (tests), else float32."""
     return torch.float64 if p.dtype == torch.float64 else torch.float32
+
+
+def rope_grid(M: int, base: float, slow_frac: float = 0.0, max_len: int = 1024) -> torch.Tensor:
+    """omega_m for the long head. slow_frac = 0: pi * base^(-m/(M-1)) (geometric, unaliased over
+    2*base). slow_frac > 0: the last n_slow = round(slow_frac*M) frequencies are replaced by a
+    geometric slice over periods [2*max_len, 20*max_len] -- integrators, near-constant over a
+    sequence -- and the other M - n_slow keep the base grid. Sorted decreasing, as before."""
+    n_slow = int(round(slow_frac * M))
+    n_fast = M - n_slow
+    k = torch.arange(n_fast, dtype=torch.float32)
+    fast = math.pi * base ** (-k / max(n_fast - 1, 1))
+    if n_slow == 0:
+        return fast
+    p = torch.logspace(math.log10(2 * max_len), math.log10(20 * max_len), n_slow)
+    slow = 2 * math.pi / p
+    return torch.cat([fast, slow])
 
 
 def _causal_mask(T: int, device) -> torch.Tensor:
@@ -154,8 +175,7 @@ class LongHead(nn.Module):
         )
         self.wr = nn.Parameter(torch.ones(M))  # spectral read weights, w = wr + i wi
         self.wi = nn.Parameter(torch.zeros(M))
-        k = torch.arange(M, dtype=torch.float32)
-        self.register_buffer("omega", math.pi * cfg.rope_base ** (-k / max(M - 1, 1)))
+        self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len))
         self.bproj = nn.Linear(d, 1, True)  # erase gate beta = sigmoid(bproj(z))
         nn.init.zeros_(self.bproj.weight)
         nn.init.constant_(self.bproj.bias, cfg.beta_init)

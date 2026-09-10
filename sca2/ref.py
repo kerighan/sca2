@@ -53,7 +53,7 @@ def _gated_out(head, u, z):
 # --------------------------------------------------------------------------- #
 #  C head positional frequency grids
 # --------------------------------------------------------------------------- #
-def freq_grid(name, M, max_len=128, base=10000.0):
+def freq_grid(name, M, max_len=128, base=10000.0, slow_frac=0.0):
     """Positional angular frequencies for the C head.
 
     Not a free choice: this grid decides what the C head computes AT INIT.
@@ -111,7 +111,16 @@ def freq_grid(name, M, max_len=128, base=10000.0):
     if name == "len":
         return 2 * math.pi * k / max_len
     if name == "rope":
-        return math.pi * (base ** (-k / max(M - 1, 1)))
+        n_slow = int(round(slow_frac * M))
+        n_fast = M - n_slow
+        kf = torch.arange(n_fast, dtype=torch.float32)
+        fast = math.pi * (base ** (-kf / max(n_fast - 1, 1)))
+        if n_slow == 0:
+            return fast
+        # slow integrators: periods 2*max_len .. 20*max_len (what a base-1e4 grid gave at T=1024:
+        # 47/190 modes carrying 55-85% of the trained LM's state energy)
+        p = torch.logspace(math.log10(2 * max_len), math.log10(20 * max_len), n_slow)
+        return torch.cat([fast, 2 * math.pi / p])
     raise ValueError(f"unknown freq grid {name!r}")
 
 
@@ -122,7 +131,7 @@ class CHeadBase(nn.Module):
     """Parameter container. Shared by every variant so state_dicts are portable."""
 
     def __init__(self, d, M, freq="dft", theta_scale=0.0, max_len=128, dv=None,
-                 gated_read=False, rope_base=10000.0):
+                 gated_read=False, rope_base=10000.0, slow_frac=0.0):
         super().__init__()
         self.d, self.M, self.dv = d, M, (d // 2 if dv is None else dv)
         self.freq, self.theta_scale, self.max_len = freq, theta_scale, max_len
@@ -134,7 +143,7 @@ class CHeadBase(nn.Module):
         # non-zero init keeps the near-positional warm start and unblocks K.
         self.theta = nn.Parameter(
             torch.zeros(M) if theta_scale == 0.0 else theta_scale * torch.randn(M))
-        self.register_buffer("omega", freq_grid(freq, M, max_len, rope_base))
+        self.register_buffer("omega", freq_grid(freq, M, max_len, rope_base, slow_frac))
         self.wr = nn.Parameter(torch.ones(M))
         self.wi = nn.Parameter(torch.zeros(M))
         self.gated_read = gated_read
@@ -303,6 +312,7 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    slow_frac: float = 0.0       # fraction of modes kept as slow integrators (periods 2..20 x max_len); LM used ~1/4 of a base-1e4 grid that way
     gdn_heads: int = 3
     gdn_head_k: int = 60
     gdn_expand_v: float = 1.0
@@ -333,7 +343,7 @@ class SCA2Layer(nn.Module):
         self.n = nn.LayerNorm(d)
         self.c = c_cls(d, cfg.Mc, freq=cfg.freq, theta_scale=cfg.theta_scale,
                        max_len=cfg.max_len, dv=dv, gated_read=cfg.gated_read,
-                       rope_base=cfg.rope_base)
+                       rope_base=cfg.rope_base, slow_frac=cfg.slow_frac)
         self.dh = d_cls(d, cfg.Md, cfg.G, dv=dv, max_len=cfg.max_len,
                         delta_rule=cfg.delta_rule, gated_read=cfg.gated_read)
         self.mix = nn.Linear(4 * dv, d)      # each head emits 2*dv (re || im)
