@@ -228,3 +228,97 @@ python -u pretrain.py --label <name> --seed 0 --variant cshort_damph_cc \
 
 Everything else (learn_persist, the key-verification gate, seeds, hybrids) is documented in
 `CATCHUP.md` and can wait.
+
+---
+
+## 9. Answers so far (spark branch, GB10, 2026-09-11)
+
+### The machine, because it reframes everything above
+
+| | RTX 2070 | GB10 |
+|---|---|---|
+| bf16 matmul (4096³) | ~28 TFLOP/s | **56.6 TFLOP/s** |
+| memory bandwidth (measured) | 448 GB/s | **194 GB/s** |
+| **FLOP per byte** | ~62 | **~292** |
+
+The Spark is ~5x more compute-rich *relative to memory* than the machine this layer
+was tuned on. A materialised intermediate costs ~5x more relative to a GEMM, and an
+fp32 GEMM costs 3.4x its bf16 equivalent (tf32 is off by default: 16.8 / 37.9 / 56.6
+TFLOP/s for fp32 / tf32 / bf16). Optimisation targets here are traffic and dtype, not
+FLOPs — the long head's GEMMs ran at ~8% of roofline before this work and still do.
+
+### (b) Is GDN's Triton kernel much faster than fla's reference? **Yes, 1.66x.** Settled.
+
+`fla` 0.5.2 installs and its Triton kernels run on Blackwell (`chunk_gated_delta_rule`
+agrees with fla's own naive reference to 4.7e-3, i.e. bf16 level). This is the first
+time anything in this repo has been measured against them. One layer, B=8, T=1024,
+d=1024, fwd+bwd, all four arms in one blocked design, all compiled, all bf16:
+
+| arm | ms | vs GDN-Triton | tok/s |
+|---|---|---|---|
+| GDN 8x128, fla **Triton** | 42.52 | 1.000x | 193k |
+| GDN 8x128, fla naive ref | 70.61 | 1.661x | 116k |
+| LapA M=256 dv=256, **before** this branch | 56.56 | **1.330x — behind** | 145k |
+| LapA M=256 dv=256, **after** | **29.43** | **0.692x** | **278k** |
+
+Read the third row before quoting the fourth. Against GDN's *real* kernel the layer
+as it stood was **1.33x slower** at d=1024; the 0.75x at d=128 was measured against
+the naive reference and does not survive the move. After the work on this branch LapA
+is 1.44x faster than the Triton kernel. **Every speed claim in CATCHUP.md, WINNERS.md
+and `lapa/README.md` that predates this compares against the naive reference and is
+worth 1.66x less than it reads.** `--gdn-kernel naive` reproduces the old comparison.
+
+Parameters and state at that shape, since no single axis is matched (§4): LapA 10.30M
+total / 1.90M mixer / 156k state, GDN 13.67M / 5.27M / 140k. LapA is faster *and* 25%
+smaller with a 2.8x smaller mixer, at 1.11x the state.
+
+### (d) bf16 in anger. **Fine, and it is now the default under autocast.**
+
+The policy is now "the state and the phases are fp32, everything else follows
+autocast" (`lapa/layer.py` docstring). Widening it from "the two big GEMMs" to the
+codes, the Gram, the state reads/writes and the short head left the deviation vs fp32
+at ~3e-3, the figure this repo already documented. Still fp32 and staying so: the
+recurrent state, the delta-rule solve that writes into it, and the phase sum (`p.omega`
+reaches ~1e3 radians). Set `gemm_dtype=torch.float32` to restore the old behaviour.
+
+The short head was fp32 on the grounds that its Dirichlet comb needs exact
+cancellation. Measured rather than assumed: the cancellation is carried by the fp32
+accumulator *inside* the tensor-core GEMM, not by the operands, and bf16 codes leave
+the exact tap at cosine similarity 0.999998 (min 0.999996). The caution was over-strict.
+
+### Speed protocol on this machine (replaces §5.1 for GB10)
+
+- **Chunk size is flat here**: 128 / 256 / 512 land within 5%, `batched` slightly ahead
+  of `chunk`. The 2070's 1.39x for batched/128 does not reproduce; that axis is not a
+  lever on GB10 and the default `chunk=128` is fine. (`python -m lapa.benchmarks.speed
+  --chunks 64,128,256,512 --paths batched,chunk`)
+- **`torch.compile` is worth 1.8x and is not optional.** Eager 53.1 ms vs compiled
+  29.2. Also: fp32 autocast-off costs 2.2x (65.6 ms) — never benchmark without bf16.
+- `mode="reduce-overhead"` (CUDA graphs) trips on parameter-gradient accumulation.
+- CUPTI does not work here: `torch.profiler` returns an empty table. Use ablation
+  ladders and the blocked timer in `lapa/benchmarks/speed.py` instead.
+- The FFN is now ~half the layer's time and is within ~1.5x of its own GEMM roofline
+  (its two GEMMs measure 51-57 TFLOP/s, i.e. at peak). Further layer-level speedup has
+  to come from the mixer or from the FFN shape, not from tuning.
+
+### What is NOT answered
+
+**(a) Does M have to grow with d?** Untouched — still the most important question, and
+the copy sweep in §3 is still the thing to run first. Nothing here bears on it.
+
+**(c) The FFN/mixer split**, beyond the three columns reported above at one shape.
+
+Also untouched: any LM run at d=1024. The numbers above are one layer, fwd+bwd,
+synthetic input. They say the layer is fast; they say nothing about whether it learns
+at this width.
+
+### Traps found here, to add to §7
+
+- `sca2/arch_gdn.py` hardcoded one machine's site-packages path to fla's naive
+  reference, and `registry._load_variants()` swallows `ImportError`. With `fla` absent
+  the registry silently held 45 variants instead of 105 — `cshort_damph` and `gdn`
+  among the missing — so **every gate in §1 raised KeyError and the whole variant
+  system was a no-op**, quietly. Fixed via importlib, with `$SCA2_FLA_NAIVE` to
+  override. If a gate in §1 fails with `KeyError`, suspect this before the layer.
+- torch 2.9.1+cu130 warns that sm_121 is outside its supported range (max 12.0) on
+  every import. It is noise; everything works, including Triton 3.5.1.

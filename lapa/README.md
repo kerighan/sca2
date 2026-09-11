@@ -63,8 +63,27 @@ python -m lapa.layer        # == repo fast path in float64 (9e-16); decode == pr
 ## Numbers (seed 0, 4 layers, d=128, ~186k params/layer, pycode, matched to Gated DeltaNet)
 
 - val loss −0.03..−0.05 nats below GDN from 300M to 1.4B tokens (GDN had overtaken the previous generation at 300M)
-- 4-layer stack fwd+bwd: 0.71× GDN's time (blocked timing, RTX 2070)
+- 4-layer stack fwd+bwd: 0.71× GDN's time (blocked timing, RTX 2070, vs fla's *naive* reference)
 - decode: ~2.7× faster than GDN's Triton path, 0.09 MB state per layer
+
+## Speed at d=1024 (DGX Spark / GB10, one layer, fwd+bwd, blocked, both compiled, bf16)
+
+B=8, T=1024, LapA M=256 dv=256 L=64 ff=4096 vs GDN 8×128 ff=4096:
+
+| arm | ms | vs GDN | tok/s | params | mixer | state |
+|---|---|---|---|---|---|---|
+| GDN, fla **Triton** kernel | 41.7 | 1.00× | 196k | 13.67M | 5.27M | 140k |
+| **LapA** | **29.4** | **0.71×** | **279k** | 10.30M | 1.90M | 156k |
+| GDN, fla naive reference | 71.2 | 1.70× | 115k | 13.67M | 5.27M | 140k |
+
+Two things to read carefully. First, the bottom row is the comparison every speed
+number in this repo used before the Spark, because fla's Triton kernels do not build
+on sm_75 — they are worth 1.70× and no claim should rest on the naive reference.
+LapA holds 0.71× against the *real* kernel. Second, the three right-hand columns are
+not matched and cannot all be: LapA is 25% smaller in total parameters with a 2.8×
+smaller mixer, and pays 1.11× the decode state. See `../SPARK.md` §4.
+
+Reproduce: `python -m lapa.benchmarks.vs_gdn`, `python -m lapa.benchmarks.speed`.
 
 The benchmarks that produced these, and the ones to run at scale: `benchmarks/README.md`.
 Scaling to d = 1024–2048 (what is known, what is not, shapes, speed protocol, traps):

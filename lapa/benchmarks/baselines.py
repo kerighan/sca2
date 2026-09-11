@@ -39,6 +39,22 @@ def _load_fla_naive():
     return m
 
 
+def _load_fla_triton():
+    """fla's own fused Triton kernels, or None where they cannot run.
+
+    Every speed number in this repo up to the Spark compared our inductor path against
+    the NAIVE PyTorch reference above, because fla's Triton kernels do not build on
+    sm_75. They do on Blackwell. Timing against the naive reference is not a fair
+    comparison and no speed claim should be made from it; `kernel="auto"` therefore
+    prefers these whenever they import, and falls back silently when they do not."""
+    try:
+        from fla.ops.gated_delta_rule import (chunk_gated_delta_rule,
+                                              fused_recurrent_gated_delta_rule)
+        return chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+    except Exception:
+        return None
+
+
 class _ShortConv(nn.Module):
     def __init__(self, dim, k=4):
         super().__init__()
@@ -55,9 +71,15 @@ class _ShortConv(nn.Module):
 
 
 class GatedDeltaNet(nn.Module):
-    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, conv_k=4):
+    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, conv_k=4, kernel="auto"):
         super().__init__()
         self._ref = _load_fla_naive()
+        # "auto" = fla's Triton kernels when they import, else their naive reference.
+        # "naive" forces the reference (equivalence checks, CPU); "triton" demands the
+        # kernels and fails loudly if they are unavailable.
+        self._tri = None if kernel == "naive" else _load_fla_triton()
+        if kernel == "triton" and self._tri is None:
+            raise ImportError("fla Triton kernels unavailable")
         self.d, self.H, self.dk = d, heads, head_k
         self.dv = int(head_k * expand_v)
         self.key_dim, self.value_dim = heads * self.dk, heads * self.dv
@@ -108,16 +130,26 @@ class GatedDeltaNet(nn.Module):
         k = F.normalize(self.ck(self.k(x)).view(B, T, self.H, self.dk), dim=-1)
         v = self.cv(self.v(x)).view(B, T, self.H, self.dv)
         g, beta = self._gates(x)
-        o, h = self._ref.naive_chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            chunk_size=64,
-            initial_state=st["h"] if state is not None else None,
-            output_final_state=True,
-        )
+        h0 = st["h"] if state is not None else None
+        if self._tri is not None:
+            # The kernels want bf16 activations and fp32 gates; the state stays fp32.
+            dt = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else torch.bfloat16
+            o, h = self._tri[0](
+                q.to(dt), k.to(dt), v.to(dt), g.float(), beta.to(dt),
+                initial_state=None if h0 is None else h0.float(),
+                output_final_state=True,
+            )
+        else:
+            o, h = self._ref.naive_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                chunk_size=64,
+                initial_state=h0,
+                output_final_state=True,
+            )
         tail = (
             lambda z_: z_[:, -(self.conv_k - 1) :]
             if T >= self.conv_k - 1
@@ -153,10 +185,10 @@ class GatedDeltaNet(nn.Module):
 class GDNLayer(nn.Module):
     """norm -> GatedDeltaNet -> residual -> norm -> FFN -> residual (LapA's wrapper)."""
 
-    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, ff=256):
+    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, ff=256, kernel="auto"):
         super().__init__()
         self.n = nn.LayerNorm(d)
-        self.mix = GatedDeltaNet(d, heads, head_k, expand_v)
+        self.mix = GatedDeltaNet(d, heads, head_k, expand_v, kernel=kernel)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
 

@@ -33,10 +33,27 @@ python -m lapa.benchmarks.copy plot runs/copy_d1024.jsonl --out plot/copy_d1024.
 Params are reported, not matched: GDN's q/k/v/gate projections scale with d²
 (9.5M/layer at d=1024 vs LapA's 6.1M); the honest axis is accuracy vs state.
 
+## Speed (`speed.py`, `vs_gdn.py`)
+
+```bash
+python -m lapa.benchmarks.speed                                  # compiled/eager x bf16/fp32
+python -m lapa.benchmarks.speed --sections                       # long / short / FFN split
+python -m lapa.benchmarks.speed --chunks 64,128,256,512 --paths batched,chunk
+python -m lapa.benchmarks.vs_gdn                                 # LapA vs GDN, 3 columns
+python -m lapa.benchmarks.vs_gdn --gdn-kernel naive              # the pre-Spark comparison
+```
+
+Both use a blocked design (every arm inside every round, only within-round ratios
+kept). `vs_gdn` defaults to fla's **Triton** kernels, which run on Blackwell but not
+on sm_75 — they are worth 1.66x over fla's naive reference, so every speed number in
+this repo taken before the Spark is measured against an arm that is 1.66x too slow.
+`--gdn-kernel naive` reproduces it for comparison. See `../../SPARK.md` §9.
+
 ## Rules that carried over from the campaign (see `../../WINNERS.md`)
 
-- Time only in blocked designs (`python -m sca2.autotune`); a tok/s printed while
-  another job shares the GPU is not a measurement.
+- Time only in blocked designs (`python -m lapa.benchmarks.speed`, `python -m
+  sca2.autotune`); a tok/s printed while another job shares the GPU is not a
+  measurement.
 - A seed changes a run's level far more than its shape; convergence runs (one seed,
   long) beat extra seeds at short budget for reading whether a gap closes.
 - Nothing is a verdict before ~90% of the budget; eval spikes come from duplicated
