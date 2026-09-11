@@ -141,8 +141,21 @@ def run(name, m, tr, va, a, device, log):
             lg = m(x)
         loss = F.cross_entropy(lg.float().flatten(0, 1), y.flatten())
         loss.backward()
-        if a.clip:
-            torch.nn.utils.clip_grad_norm_(m.parameters(), a.clip)
+        gn = torch.nn.utils.clip_grad_norm_(m.parameters(), a.clip if a.clip else float("inf"))
+        # Guard the GRADIENT, not the loss. The failure mode this is here for -- a chunked
+        # decay kernel that exponentiates the full BT x BT matrix and masks the upper half
+        # afterwards -- leaves the FORWARD clean (the masked half is selected away) and
+        # blows up only in the backward, where inf x 0 = NaN. The loss stays finite while
+        # the gradients are already NaN, so checking loss.item() would see nothing and the
+        # arm would burn its remaining hours writing meaningless evals.
+        if not (torch.isfinite(loss) and torch.isfinite(gn)):
+            rec = {"model": name, "seed": a.seed, "step": step + 1, "train_s": round(spent, 1),
+                   "tokens": seen, "nonfinite": {"loss": loss.item(), "grad_norm": gn.item()}}
+            print(f"!!!! {name}: NON-FINITE at step {step+1} "
+                  f"(loss {loss.item()}, grad norm {gn.item()}) -- ABORTING THIS ARM",
+                  flush=True)
+            log.write(json.dumps(rec) + "\n"); log.flush()
+            return m
         opt.step()
         torch.cuda.synchronize()
         spent += time.perf_counter() - t0
