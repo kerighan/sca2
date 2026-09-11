@@ -552,6 +552,15 @@ load-bearing for long copy, not noise (layer 0 gives them the largest read weigh
 Candidate layer: **mixed grid + window 64**. Queued: copy at 8000 steps, then its 5 h LM
 run (`l5_Amixedw64_s0`, ff 424).
 
+### The candidate in copy at 8000 steps (2026-09-11, 07:40)
+
+Mixed grid + window 64, M=190, 33k state/layer: **1.00/1.00 · 1.00/0.99 · 1.00/1.00 ·
+1.00/0.98 · 1.00/0.69** (token / exact at L = 32, 64, 128, 256, 512). Sixty-nine percent of
+512-token strings reproduced without a single error by a 33k-float state; the 4000-step
+champion (rope 1e3 + w64) had 0.14. The 4000-step dip was one of several single-eval
+spikes (constant lr 1e-3); the trend between them is monotone. The 5 h LM run of the same
+layer (`l5_Amixedw64_s0`) started 07:39.
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short
