@@ -1,5 +1,20 @@
-# arms hidden from plot/copy_d128*.png (label substrings, one per line)
+# Arms hidden from plot/copy_d128*.png -- one label substring per line.
+# Kept visible: the headline comparison (attention ceiling, GDN 12k, LapA v1 12k / M=256 / smooth,
+# and the M=190 baseline that shows where we started). Everything below is a settled single-change
+# control: its conclusion lives in CATCHUP.md, and it stays in the log.
 theta=0
 no damping
-M=64
+no delta rule
+rope 1e5
+rope 1e3 + window 64
+LapA M=190 rope 1e3
+LapA M=190 window 64
+LapA M=190 window 128
+LapA M=190 mixed grid + window 64
+LapA M=190 mixed grid + window 32
 LapA M=190 12k steps
+LapA M=64
+LapA M=95
+LapA M=380
+GDN 3x60
+GDN 3x80 (21.6k)
