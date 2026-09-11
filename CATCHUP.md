@@ -561,6 +561,25 @@ champion (rope 1e3 + w64) had 0.14. The 4000-step dip was one of several single-
 spikes (constant lr 1e-3); the trend between them is monotone. The 5 h LM run of the same
 layer (`l5_Amixedw64_s0`) started 07:39.
 
+### The candidate in the LM (2026-09-11, 12:45) — no regression
+
+`l5_Amixedw64_s0` (mixed grid + window 64, ff 424, 186,337 params/layer), XL 5 h, 1415M
+tokens, val 2.3526. Gap to GDN, median of the last 25%: **−0.031** (A −0.037, mixed grid
+−0.036). Against A at matched tokens: −0.021 (300–600M), +0.004 (600–900M), +0.004
+(900–1200M) — parity within a single eval's noise, slightly ahead early. One corpus spike
+at 892M (train 0.31, val +0.30 for one eval), recovered at the next. Perplexity from the
+median of the last three evals: A 10.24, mixed 10.37, candidate 10.49, GDN 10.56 — the
+3-eval median is noisier than the last-quarter gap; the latter is the number to quote.
+
+So the layer that copies 512-token strings exactly 69% of the time (33k floats of state)
+is, in language modelling, A: ~0.03 nats below Gated DeltaNet at 1.4B tokens, 1.33× its
+stack speed (blocked), same decode. Eval-spike census across the XL arms: GDN 0, every
+LapA arm 1–2 (each recovered within one eval; a persistent memory takes a duplicated file
+harder than a forgetting one — cosine/clipping territory, not architecture).
+
+**Laplace Attention v1 = mixed grid (slow_frac 0.25, base 1e3) + window 64, M=190.**
+Queued: copy with window 32 on the same grid (does the window halve for free?).
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short
