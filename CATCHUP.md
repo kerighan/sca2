@@ -524,6 +524,34 @@ rope_base=1e3` keeps the 47 slow modes A used and densifies the other 143 into t
 addressing range. Queued as `l5_Amixed_s0` (window 16, single change vs A) behind
 tonight's rope-only arm (`l5_Arope_s0`), which separates the window-64 effect.
 
+### Night of 2026-09-10 → 11: the mixed grid recovers the LM, window 64 is neutral there
+
+XL, 5 h, seed 0, gaps to `l5_gdn_s0` at matched tokens (medians):
+
+| arm | change vs A | 300–600M | 600–900M | 900–1200M | last 25% |
+|---|---|---|---|---|---|
+| A | — | −0.052 | −0.052 | −0.032 | −0.037 |
+| rope 1e3 | grid | −0.004 | −0.015 | +0.023 | **+0.008** |
+| rope 1e3 + window 64 | grid + window | −0.001 | −0.007 | +0.040 | −0.010 |
+| **mixed grid** (0.25 slow + 1e3) | grid | **−0.037** | **−0.044** | **−0.037** | **−0.036** |
+
+Rope 1e3 alone costs ~0.04 vs A (it removes the 47 slow integrators that carry 55–85%
+of A's state energy); window 64 on top is ±0.015, noise — **neutral in the LM**. The
+mixed grid is A's LM to the third decimal (−0.036 vs −0.037), slightly ahead late
+(−0.015 vs A at 900M+, within noise). Blocked speed: grid changes cost nothing
+(1.00 / 1.02 / 1.04 for A / rope 1e3 / mixed); the cumulative tok/s differences between
+the night's arms (73k–90k) were machine variance.
+
+Copy, mixed grid + window 64 (M=190, 4000 steps): 0.94 / 0.86 / **1.00** / 0.66 / 0.98
+(exact at L32/64/128/256, token acc at 512). At 3500 steps it was 1.00 / 0.98 / 0.99 /
+0.89 / 0.99 — the champion's numbers (rope 1e3 + w64: 1.00 / 1.00 / 0.99 / 0.97 / 1.00) —
+and the 4000 eval dipped; an 8000-step re-run is queued. Silencing the slow modes at
+inference destroys copy at L ≥ 64 (0.28 / 0.03 / ...): in this model they are
+load-bearing for long copy, not noise (layer 0 gives them the largest read weight).
+
+Candidate layer: **mixed grid + window 64**. Queued: copy at 8000 steps, then its 5 h LM
+run (`l5_Amixedw64_s0`, ff 424).
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short
