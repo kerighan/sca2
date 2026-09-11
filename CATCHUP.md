@@ -600,6 +600,19 @@ still leads at 256 and 512. LapA v1 at 12k queued for the equal-budget row. Less
 Spark protocol: copy curves must be read at equal steps AND to saturation — GDN's
 saturation point is beyond 12k here.
 
+### Equal budget, 12k steps (2026-09-11, 14:50)
+
+| arm, 12000 steps | L32 | L64 | L128 | L256 | L512 |
+|---|---|---|---|---|---|
+| GDN 3×80 (21.4k state) | 1.00 | 1.00 | 0.94 | 0.61 | 0 (0.99 token) |
+| **LapA v1** (33k state) | 1.00 | 1.00 | **1.00** | **0.98** | **0.85** |
+
+Exact-string rates. At the same budget LapA v1 reproduces 85% of 512-token strings
+without error; GDN none. Both are at 0.99–1.00 per token at 512, so the difference is
+entirely in the tail of the per-token error distribution — the exact-string rate is the
+metric that separates a superposition memory with an exact window from a matrix memory
+at this state size.
+
 ### Smoothing the hand-over (2026-09-11, 14:40)
 
 The instability seen in copy has a shape: an exact mechanism that stops dead at lag L−1
