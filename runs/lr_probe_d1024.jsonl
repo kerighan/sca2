@@ -3,3 +3,10 @@
 {"model": "lr1e-3", "seed": 0, "step": 947, "train_s": 280.8, "tokens": 7757824, "train": 5.40304, "val": 5.34055, "tok_s": 27632}
 {"model": "lr1e-3", "seed": 0, "step": 1429, "train_s": 420.2, "tokens": 11706368, "train": 4.26949, "val": 5.02893, "tok_s": 27859}
 {"model": "lr5e-4", "seed": 0, "step": 1, "train_s": 0.3, "tokens": 8192, "train": 4.94845, "val": 8.10522, "tok_s": 26301}
+{"model": "lr5e-4", "seed": 0, "step": 455, "train_s": 140.6, "tokens": 3727360, "train": 5.51484, "val": 5.79953, "tok_s": 26508}
+{"model": "lr5e-4", "seed": 0, "step": 916, "train_s": 280.7, "tokens": 7503872, "train": 5.32315, "val": 5.35843, "tok_s": 26732}
+{"model": "lr5e-4", "seed": 0, "step": 1395, "train_s": 420.2, "tokens": 11427840, "train": 4.23789, "val": 4.93465, "tok_s": 27196}
+{"model": "lr3e-4", "seed": 0, "step": 1, "train_s": 0.3, "tokens": 8192, "train": 5.06252, "val": 8.00985, "tok_s": 25785}
+{"model": "lr3e-4", "seed": 0, "step": 481, "train_s": 140.6, "tokens": 3940352, "train": 4.36413, "val": 5.83065, "tok_s": 28033}
+{"model": "lr3e-4", "seed": 0, "step": 970, "train_s": 280.7, "tokens": 7946240, "train": 5.06594, "val": 5.2619, "tok_s": 28305}
+{"model": "lr3e-4", "seed": 0, "step": 1456, "train_s": 420.0, "tokens": 11927552, "train": 5.37595, "val": 5.00563, "tok_s": 28398}
