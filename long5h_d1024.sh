@@ -21,6 +21,10 @@
 #                arms DIFFERENT learning rates at the same step -- a confound straight
 #                through the middle of the comparison. Constant lr has none.
 #  --warmup 100: cheap insurance at this width; the campaign used none.
+#  --clip 1.0  : the campaign had NO gradient clipping. Observed grad norm at init
+#                here is 0.6-0.8 on all three arms, so a clip at 1.0 is inactive in
+#                normal operation and only catches a spike -- which is the failure
+#                that would cost an unattended 5 h arm. Applied to every arm alike.
 #  --Ls 64     : SPARK.md §1 defines v1 with L=64. long5h.sh used 16.
 #  GDN kernel  : fla's TRITON path now (SCA2_GDN_KERNEL=naive forces the old
 #                reference). Racing the naive reference is what made the d=128 speed
@@ -51,7 +55,7 @@ echo "##### $(date +%H:%M) chosen lr=$LR (from runs/lr_probe_d1024.jsonl)"
 
 LOG=runs/long5h_d1024.jsonl
 COMMON="--data pycode_long1024_xl.pt --block 1024 --batch 8 --d 1024 --layers 8
-        --ff 4096 --Md 4 --G 8 --freq rope --amp bf16 --lr $LR --warmup 100
+        --ff 4096 --Md 4 --G 8 --freq rope --amp bf16 --lr $LR --warmup 100 --clip 1.0
         --seconds 18000 --eval-batches 60 --eval-every 600 --pos-buckets 8
         --samples 0 --only sca2 --log $LOG --class-eval"
 

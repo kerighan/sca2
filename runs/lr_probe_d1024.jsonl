@@ -1,0 +1,5 @@
+{"model": "lr1e-3", "seed": 0, "step": 1, "train_s": 0.3, "tokens": 8192, "train": 5.03413, "val": 8.27463, "tok_s": 26775}
+{"model": "lr1e-3", "seed": 0, "step": 473, "train_s": 140.5, "tokens": 3874816, "train": 4.9928, "val": 5.74102, "tok_s": 27587}
+{"model": "lr1e-3", "seed": 0, "step": 947, "train_s": 280.8, "tokens": 7757824, "train": 5.40304, "val": 5.34055, "tok_s": 27632}
+{"model": "lr1e-3", "seed": 0, "step": 1429, "train_s": 420.2, "tokens": 11706368, "train": 4.26949, "val": 5.02893, "tok_s": 27859}
+{"model": "lr5e-4", "seed": 0, "step": 1, "train_s": 0.3, "tokens": 8192, "train": 4.94845, "val": 8.10522, "tok_s": 26301}

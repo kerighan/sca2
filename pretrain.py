@@ -140,7 +140,10 @@ def run(name, m, tr, va, a, device, log):
         with amp_ctx():
             lg = m(x)
         loss = F.cross_entropy(lg.float().flatten(0, 1), y.flatten())
-        loss.backward(); opt.step()
+        loss.backward()
+        if a.clip:
+            torch.nn.utils.clip_grad_norm_(m.parameters(), a.clip)
+        opt.step()
         torch.cuda.synchronize()
         spent += time.perf_counter() - t0
         step += 1; seen += a.batch * a.block
@@ -225,6 +228,11 @@ def main(argv=None):
     p.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
     p.add_argument("--class-eval", action="store_true", dest="class_eval")
     p.add_argument("--bpe", default="pycode_bpe16k")
+    p.add_argument("--clip", type=float, default=0.0,
+                   help="global grad-norm clip (0 = off, the d=128 campaign's setting). "
+                        "At d=1024 the observed norm at init is 0.6-0.8, so --clip 1.0 is "
+                        "inactive in normal operation and only catches a spike -- cheap "
+                        "insurance for a long unattended run, applied to every arm alike.")
     p.add_argument("--amp", default="fp32", choices=("fp32", "bf16"),
                    help="autocast dtype of the forward pass, applied to EVERY arm. "
                         "fp32 (default) is the d=128 campaign's setting; bf16 is what "
