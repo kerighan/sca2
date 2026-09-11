@@ -600,6 +600,24 @@ still leads at 256 and 512. LapA v1 at 12k queued for the equal-budget row. Less
 Spark protocol: copy curves must be read at equal steps AND to saturation — GDN's
 saturation point is beyond 12k here.
 
+### Smoothing the hand-over (2026-09-11, 14:40)
+
+The instability seen in copy has a shape: an exact mechanism that stops dead at lag L−1
+and a tailed one that must take over at lag L, plus lr 1e-3 constant with no warmup.
+Two changes, both acting on training itself (EMA-for-eval was considered and rejected
+as cosmetic):
+1. **Window-aligned damping** (new default in `lapa` and `sca2`): the damped modes' cap is
+   `lam_max = 1/L` (they never forget faster than the window remembers) and their init
+   memories span `[L, 32L]`, so the damped half starts just beyond the exact window and
+   the two heads overlap instead of meeting at an edge. Pre-2026-09-11 behaviour
+   (`lam_max=0.125`, memories 64–4096) stays available as flags (`--lam-max 0.125
+   --damp-mem 64,4096`) and is what every run before this point used.
+2. **Warmup + cosine** (`--warmup N --cosine`) in both benchmarks; cosine runs over the
+   copy step budget, or over one pass of the corpus in `pretrain.py`.
+
+Queued: copy v1 M=256 (old damping, isolates M), copy v1 "smooth" (aligned damping +
+warmup 500 + cosine, vs the plain v1 8k run), then LM v1 M=256 (ff 388, old damping).
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short

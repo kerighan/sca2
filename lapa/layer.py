@@ -94,11 +94,10 @@ class LaplaceConfig:
     )
     learn_persist: bool = False  # no hard pin: lambda_m = lam_max*sigmoid(a_m); the `persist`
     #                              fraction merely starts persistent (a=-8), the gradient decides
-    mem_range: Tuple[float, float] = (
-        64.0,
-        4096.0,
-    )  # init memories 1/lambda of the damped modes
-    lam_max: float = 0.125  # decay cap; keep lam_max * chunk <~ 60 for float32
+    mem_range: Optional[Tuple[float, float]] = None  # init memories 1/lambda of the damped modes;
+    #   None -> (L, 32*L): the damped half starts just beyond the exact window and takes over from it
+    lam_max: Optional[float] = None  # decay cap; None -> 1/L (a damped mode never forgets faster than
+    #   the window remembers, so the two heads overlap instead of meeting at a hard edge); lam_max*chunk <~ 60
     chunk: int = 128  # prefill chunk (also decides lam_max's safety)
     rope_base: float = 10000.0
     slow_frac: float = 0.0  # fraction of long-head modes reserved as SLOW integrators (periods
@@ -161,6 +160,13 @@ class _NoAutocast:
 # =============================================================================
 #  LONG HEAD: rope grid, damped accumulator, delta-rule write
 # =============================================================================
+def _damp_params(cfg: "LaplaceConfig"):
+    """(mem_lo, mem_hi, lam_max) with the window-aligned defaults resolved."""
+    lam_max = cfg.lam_max if cfg.lam_max is not None else 1.0 / cfg.L
+    lo, hi = cfg.mem_range if cfg.mem_range is not None else (float(cfg.L), 32.0 * cfg.L)
+    return lo, hi, lam_max
+
+
 class LongHead(nn.Module):
     def __init__(self, cfg: LaplaceConfig):
         super().__init__()
@@ -179,14 +185,14 @@ class LongHead(nn.Module):
         self.bproj = nn.Linear(d, 1, True)  # erase gate beta = sigmoid(bproj(z))
         nn.init.zeros_(self.bproj.weight)
         nn.init.constant_(self.bproj.bias, cfg.beta_init)
-        lo, hi = cfg.mem_range
+        lo, hi, self.lam_max = _damp_params(cfg)
         mem = torch.exp(torch.empty(M).uniform_(math.log(lo), math.log(hi)))
         n_pin = int(round(cfg.persist * M))
         low = self.omega.abs().argsort()[:n_pin]  # lowest frequencies persist
         if cfg.learn_persist:
             # lambda_m = lam_max * sigmoid(a_m): reaches ~0 (a=-8 -> memory > 20k tokens) or the
             # cap within a few hundred steps either way; nothing pinned, the task decides the split.
-            a = torch.logit((1.0 / mem / cfg.lam_max).clamp(1e-4, 1 - 1e-4))
+            a = torch.logit((1.0 / mem / self.lam_max).clamp(1e-4, 1 - 1e-4))
             a[low] = -8.0
             self.lam_raw = nn.Parameter(a)
             self.register_buffer("lam_mask", torch.ones(M))
@@ -206,9 +212,9 @@ class LongHead(nn.Module):
 
     def lam(self) -> torch.Tensor:
         if self.cfg.learn_persist:
-            return self.cfg.lam_max * torch.sigmoid(self.lam_raw.to(self.wd))
+            return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd))
         return (
-            F.softplus(self.lam_raw.to(self.wd)).clamp(max=self.cfg.lam_max)
+            F.softplus(self.lam_raw.to(self.wd)).clamp(max=self.lam_max)
             * self.lam_mask
         )
 

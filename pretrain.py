@@ -16,7 +16,7 @@ Both arms see identical data in identical order.
     python prep_fineweb.py            # once
     python pretrain.py --seconds 900
 """
-import argparse, json, sys, time
+import argparse, json, math, sys, time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,6 +91,14 @@ def evaluate(m, val, B, T, device, nb=25, buckets=0, cls_tab=None):
 def run(name, m, tr, va, a, device, log):
     m.to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr)
+    n_train = len(tr)
+
+    def lr_at(step, seen):  # warmup in steps; cosine on the fraction of the corpus seen
+        w = a.lr * min(1.0, step / max(a.warmup, 1)) if a.warmup else a.lr
+        if a.cosine:
+            w *= 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, seen / n_train)))
+        return w
+
     npar = sum(p.numel() for p in m.parameters())
     core = m.core_params() if hasattr(m, "core_params") else 0
     print(f"{name}: {npar} params ({core} in layers)", flush=True)
@@ -110,6 +118,8 @@ def run(name, m, tr, va, a, device, log):
         except StopIteration:
             print(f"{name}: corpus exhausted at step {step}", flush=True); break
         torch.cuda.synchronize(); t0 = time.perf_counter()
+        for gr in opt.param_groups:
+            gr["lr"] = lr_at(step + 1, seen)
         opt.zero_grad(set_to_none=True)
         loss = F.cross_entropy(m(x).flatten(0, 1), y.flatten())
         loss.backward(); opt.step()
@@ -188,6 +198,10 @@ def main(argv=None):
     p.add_argument("--Ls", type=int, default=16, help="window of the short dft C head (--variant cshort*)")
     p.add_argument("--rope-base", type=float, default=10000.0, dest="rope_base", help="long-head rope grid base (unaliased range 2*base)")
     p.add_argument("--slow-frac", type=float, default=0.0, dest="slow_frac", help="fraction of long-head modes kept as slow integrators (periods 2..20 x block)")
+    p.add_argument("--lam-max", type=float, default=None, dest="lam_max", help="decay cap of the damped modes; default 1/Ls (window-aligned). Runs before 2026-09-11: 0.125")
+    p.add_argument("--damp-mem", default=None, dest="damp_mem", help="init memories lo,hi of the damped modes; default Ls,32*Ls. Runs before 2026-09-11: 64,4096")
+    p.add_argument("--warmup", type=int, default=0, help="linear lr warmup steps (0 = none, the campaign's setting)")
+    p.add_argument("--cosine", action="store_true", help="cosine lr decay to 10%% of the peak over ONE PASS of the corpus (progress = tokens seen / train tokens)")
     p.add_argument("--gdn-heads", type=int, default=3, dest="gdn_heads")
     p.add_argument("--gdn-head-k", type=int, default=60, dest="gdn_head_k")
     p.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
@@ -211,7 +225,9 @@ def main(argv=None):
                    c_heads=a.c_heads, c_decay=a.c_decay, c_decay_init=a.c_decay_init,
                    c_sepq=a.c_sepq, conv=a.conv,
                    gated_read=a.gated_read,
-                   Ls=a.Ls, rope_base=a.rope_base, slow_frac=a.slow_frac, gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
+                   Ls=a.Ls, rope_base=a.rope_base, slow_frac=a.slow_frac,
+                   lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
+                   gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)
     log = open(a.log, "a")
     models = {}

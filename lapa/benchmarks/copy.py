@@ -24,6 +24,7 @@ The plot has one panel per length: accuracy vs training step, one curve per arm.
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import sys
 import time
@@ -86,6 +87,8 @@ def layer_kwargs(a):
             learn_persist=a.learn_persist,
             slow_frac=a.slow_frac,
             max_len=2 * max(int(x) for x in a.lengths.split(",")) + 2,
+            lam_max=a.lam_max,
+            mem_range=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
         )
         return kw
     if a.arm in ("gdn", "gdn2"):
@@ -116,6 +119,14 @@ def run(a):
     )
     fwd = torch.compile(m, dynamic=False) if a.compile else m
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr, weight_decay=0.0)
+
+    def lr_at(step):  # linear warmup, then cosine to 10% of the peak at the last step
+        w = a.lr * min(1.0, step / max(a.warmup, 1)) if a.warmup else a.lr
+        if a.cosine:
+            p = min(1.0, max(0, step - a.warmup) / max(a.steps - a.warmup, 1))
+            w *= 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p))
+        return w
+
     g = torch.Generator().manual_seed(a.seed)
     log = open(a.log, "a")
     ac = (
@@ -132,6 +143,8 @@ def run(a):
             loss = F.cross_entropy(
                 fwd(x).flatten(0, 1).float(), y.flatten(), ignore_index=-100
             )
+        for gr in opt.param_groups:
+            gr["lr"] = lr_at(step)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
@@ -261,6 +274,10 @@ def main(argv=None):
     r.add_argument("--rope-base", type=float, default=10000.0, dest="rope_base", help="long-head grid omega_m = pi * base^(-m/(M-1))")
     r.add_argument("--learn-persist", action="store_true", dest="learn_persist", help="no hard pin: lambda_m = lam_max*sigmoid(a_m); the persistent fraction is learned")
     r.add_argument("--slow-frac", type=float, default=0.0, dest="slow_frac", help="fraction of long-head modes kept as slow integrators")
+    r.add_argument("--lam-max", type=float, default=None, dest="lam_max", help="decay cap of the damped modes; default 1/L (window-aligned). Pre-2026-09-11 runs: 0.125")
+    r.add_argument("--damp-mem", default=None, dest="damp_mem", help="init memories lo,hi of the damped modes; default L,32L. Pre-2026-09-11 runs: 64,4096")
+    r.add_argument("--warmup", type=int, default=0, help="linear lr warmup steps (0 = none)")
+    r.add_argument("--cosine", action="store_true", help="cosine decay to 10%% of the peak lr at the last step")
     r.add_argument("--gdn-heads", type=int, default=3, dest="gdn_heads")
     r.add_argument("--gdn-head-k", type=int, default=60, dest="gdn_head_k")
     r.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")

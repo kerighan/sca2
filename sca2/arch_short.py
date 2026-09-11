@@ -165,6 +165,15 @@ class ShortLayer(SCA2Layer):
         super().__init__(cfg, self.C_CLS, DHeadSepQPolarFlat)                # built, then replaced
         dv = cfg.dv if cfg.dv is not None else cfg.d // 2
         self.dh = CHeadShort(cfg.d, cfg.Ls, dv, theta_scale=cfg.theta_scale or 0.02)
+        # window-aligned damping (mirror of lapa/layer.py _damp_params): the damped half of the
+        # long head starts just beyond the exact window and may never forget faster than it
+        if hasattr(self.c, "lam_raw"):
+            lam_max = cfg.lam_max if cfg.lam_max is not None else 1.0 / cfg.Ls
+            lo, hi = cfg.damp_mem if cfg.damp_mem is not None else (float(cfg.Ls), 32.0 * cfg.Ls)
+            self.c.LAM_MAX = lam_max                                          # instance attr shadows the class cap
+            with torch.no_grad():
+                mem = torch.exp(torch.empty(self.c.M).uniform_(math.log(lo), math.log(hi)))
+                self.c.lam_raw.copy_(torch.log(torch.expm1(1.0 / mem)))
 
 
 class ShortLayerRaw(ShortLayer):
