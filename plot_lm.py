@@ -72,7 +72,10 @@ def main(argv=None):
         print(f"{k:>20} {c[-1][0]/1e6:6.0f}M {c[-1][1]:7.4f} | median {np.median(g[last]):+.4f} (last 25%)  {slope:+.3f} | {ppl:12.2f}")
     ax1.set_ylabel("val loss (nats)"); ax1.grid(alpha=.3); ax1.legend(fontsize=8)
     if a.ymax: ax1.set_ylim(top=a.ymax)
-    ax1.set_ylim(bottom=min(min(v for _, v in C[k][3:]) for k in labels) - 0.05)
+    # an arm with <= 3 evals (just started) has no points after the burn-in slice: skip it here
+    floors = [min(v for _, v in C[k][3:]) for k in labels if len(C[k]) > 3]
+    if floors:
+        ax1.set_ylim(bottom=min(floors) - 0.05)
     ax1.set_title(f"{a.log}  --  val loss; gaps to {a.ref}")
     ax2.axhline(0, color="k", lw=0.8); ax2.set_xlabel("tokens (M)"); ax2.set_ylabel(f"gap to {a.ref} (nats)"); ax2.grid(alpha=.3); ax2.legend(fontsize=8)
     plt.tight_layout(); plt.savefig(out, dpi=130); print("saved", out)
