@@ -49,15 +49,17 @@ def main(argv=None):
     out = a.out or f"plot/{a.log.split('/')[-1].split('.')[0]}.png"
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 9), sharex=True, gridspec_kw={"height_ratios": [3, 2]})
     cmap = plt.get_cmap("tab10")
-    print(f"{'arm':>20} {'tokens':>7} {'val':>7} | {'gap to '+a.ref:>18} {'slope/ln(tok) >200M':>20}")
+    # perplexity = exp(val loss), from the MEDIAN of the last 3 evals (single evals swing by ±0.02-0.05 nats)
+    print(f"{'arm':>20} {'tokens':>7} {'val':>7} | {'gap to '+a.ref:>18} {'slope/ln(tok) >200M':>20} | {'ppl (last 3)':>12}")
     for j, k in enumerate(labels):
         c = C[k]; x = np.array([t for t, _ in c]) / 1e6; y = np.array([v for _, v in c])
         lw = 2.4 if k in bold else 1.0; col = "#2c3e50" if k == a.ref else cmap(j % 10)
         done = c[-1][0] >= 0.95 * G[-1][0]
         ax1.plot(x[1:], y[1:], color=col, lw=lw, alpha=1 if lw > 1.5 else 0.75,
                  label=k + ("" if done else f"  (running, {c[-1][0]/1e6:.0f}M)"))
+        ppl = math.exp(float(np.median([v for _, v in c[-3:]])))
         if k == a.ref:
-            print(f"{k:>20} {c[-1][0]/1e6:6.0f}M {c[-1][1]:7.4f} | {'(reference)':>18}"); continue
+            print(f"{k:>20} {c[-1][0]/1e6:6.0f}M {c[-1][1]:7.4f} | {'(reference)':>18} {'':>20} | {ppl:12.2f}"); continue
         hi = min(c[-1][0], G[-1][0])
         if hi < 60e6: continue
         xs = np.arange(40e6, hi + 1, 10e6); g = np.array([ip(c, v) - ip(G, v) for v in xs])
@@ -67,7 +69,7 @@ def main(argv=None):
         last = xs >= hi - 0.25 * (hi - 40e6)
         m = xs >= 200e6
         slope = np.polyfit(np.log(xs[m]), g[m], 1)[0] if m.sum() >= 4 else float("nan")
-        print(f"{k:>20} {c[-1][0]/1e6:6.0f}M {c[-1][1]:7.4f} | median {np.median(g[last]):+.4f} (last 25%)  {slope:+.3f}")
+        print(f"{k:>20} {c[-1][0]/1e6:6.0f}M {c[-1][1]:7.4f} | median {np.median(g[last]):+.4f} (last 25%)  {slope:+.3f} | {ppl:12.2f}")
     ax1.set_ylabel("val loss (nats)"); ax1.grid(alpha=.3); ax1.legend(fontsize=8)
     if a.ymax: ax1.set_ylim(top=a.ymax)
     ax1.set_ylim(bottom=min(min(v for _, v in C[k][3:]) for k in labels) - 0.05)
