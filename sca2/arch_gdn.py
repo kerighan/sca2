@@ -37,13 +37,31 @@ from .registry import register
 from .versions.v1_quad_scan import CHeadQuad
 from .compiled import wrap as _cw
 
-_FLA = ("/home/maixent/miniconda3/lib/python3.10/site-packages/"
-        "fla/ops/gated_delta_rule/naive.py")
+def _fla_naive_path():
+    """Locate fla's own naive reference without importing fla/__init__ (which pulls Triton).
+
+    $SCA2_FLA_NAIVE overrides; otherwise the installed package is located by spec so the
+    path follows the environment instead of one machine's site-packages.
+    """
+    env = os.environ.get("SCA2_FLA_NAIVE")
+    if env:
+        return env
+    spec = importlib.util.find_spec("fla")
+    if spec is None or not spec.submodule_search_locations:
+        return ""
+    return os.path.join(list(spec.submodule_search_locations)[0],
+                        "ops", "gated_delta_rule", "naive.py")
+
+
+_FLA = _fla_naive_path()
 
 
 def _load_ref():
-    if not os.path.exists(_FLA):
-        raise ImportError(f"fla reference not found at {_FLA}")
+    if not _FLA or not os.path.exists(_FLA):
+        raise ImportError(
+            "fla reference not found (pip install flash-linear-attention, "
+            "or set SCA2_FLA_NAIVE to .../fla/ops/gated_delta_rule/naive.py); "
+            f"looked at {_FLA!r}")
     import sys
     spec = importlib.util.spec_from_file_location("_gdn_naive", _FLA)
     m = importlib.util.module_from_spec(spec)

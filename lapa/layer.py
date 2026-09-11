@@ -45,16 +45,27 @@ so the delta rule is one triangular solve per chunk, E = (I + diag(beta) tril(G,
 ================================================================================
 PRECISION POLICY (the part that makes this trainable in bf16)
 ================================================================================
-* The recurrent STATE is always float32, whatever the model dtype.
-* Phases, cos/sin codes, decay scales, the Gram matrix and its triangular solve are
-  computed in float32 (autocast disabled around them): they are cheap and they are
-  where bf16 would hurt (unit-modulus codes summed over 2M terms, a solve).
-* The two large GEMMs of the long head -- the intra-chunk kernel K2 = Fq Fk^T and
-  its application K2 e -- run in `gemm_dtype`: None (default) follows autocast if it
-  is active, else float32.  Projections, mix and FFN follow autocast as usual.
-* The short head runs in float32 (12% of the layer; its Dirichlet comb relies on
-  exact cancellation).
-Measured deviation bf16-autocast vs float32 is printed by the self-test.
+The rule is: the STATE and the PHASES are float32, everything else follows autocast.
+
+* The recurrent STATE is always float32, whatever the model dtype, and so is the
+  delta-rule solve that writes into it (`e = W (v - beta r)`) and the Gram's
+  triangular factor.  Those are the two places where a reduced mantissa could
+  compound along the sequence rather than just perturb one output.
+* PHASES are always float32: `p . omega` reaches thousands of radians over a
+  context and the codes are cos/sin of it, so the sum can never be narrowed.  The
+  K/V/bproj projections that feed it are ordinary GEMMs and follow autocast; only
+  `K(x) . theta + p . omega` is fp32.
+* Everything else -- the cos/sin codes once formed, the Gram GEMM, the intra-chunk
+  kernel, the state reads and writes, and the short head -- runs in `gemm_dtype`:
+  None (default) follows autocast if active, else float32.  Accumulation stays fp32
+  inside the tensor-core GEMM, which is what protects the short head's Dirichlet
+  comb: rounding its codes to bf16 leaves the exact tap at cosine similarity
+  0.999998.  Set `gemm_dtype=torch.float32` to force the old all-fp32 behaviour.
+Measured deviation bf16-autocast vs float32 is printed by the self-test (~3e-3).
+
+The long head keeps its state as ONE (B, 2M, dv) block and its codes as (., 2M)
+blocks, so every read and write of the state is a single GEMM rather than a pair and
+the sequential chunk loop contains no concatenation at all.
 
 Decode is O(1) per token in the context length: state = 2.M.dv + (L-1).(2L + dv)
 floats per layer (LapA at d=128: 21.3k + 1.4k), one small GEMV per head.
@@ -109,7 +120,9 @@ class LaplaceConfig:
         "batched"  # "batched" (intra-chunk work for all chunks at once) | "chunk"
     )
     gemm_dtype: Optional[torch.dtype] = (
-        None  # dtype of the two big long-head GEMMs; None = autocast/fp32
+        None  # dtype of the long-head GEMM OPERANDS (codes, and the state as it is read
+        #       and written); None = autocast if active, else fp32. The state itself, the
+        #       phases, the Gram's solve and the short head stay fp32 regardless.
     )
     beta_init: float = -2.0  # erase gate bias: sigmoid(-2) = 0.12 at init
 
@@ -143,18 +156,16 @@ def _causal_mask(T: int, device) -> torch.Tensor:
     return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), 1)
 
 
-class _NoAutocast:
-    """Context: disable autocast for the given device type (fp32 section)."""
+def _no_autocast(device):
+    """Context: disable autocast for the given device type (fp32 section).
 
-    def __init__(self, device):
-        self.dev = "cuda" if device.type == "cuda" else "cpu"
-
-    def __enter__(self):
-        self.ctx = torch.autocast(device_type=self.dev, enabled=False)
-        self.ctx.__enter__()
-
-    def __exit__(self, *a):
-        self.ctx.__exit__(*a)
+    Returns `torch.autocast` itself rather than a wrapper class. Dynamo traces
+    torch.autocast natively but not a custom context manager, and the wrapper
+    that used to live here cost one graph break per `with` in the layer -- 11 of
+    them, which is most of the elementwise fusion in the long head.
+    """
+    return torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu",
+                          enabled=False)
 
 
 # =============================================================================
@@ -218,9 +229,14 @@ class LongHead(nn.Module):
             * self.lam_mask
         )
 
-    def _phase(self, x: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        """x (...,d) -> phase (...,M) in float32; p (...,1) positions."""
-        return self.K(x).to(self.wd) * self.theta.to(self.wd) + p * self.omega
+    def _phase(self, k: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """k (...,M) = K(x), ALREADY projected -> phase (...,M) in float32; p (...,1) positions.
+
+        The projection is taken outside the fp32 section by every caller so that it follows
+        autocast like any other linear layer: it is a d x M GEMM, and fp32 costs 3.4x bf16
+        here. Only the sum is fp32 -- p.omega reaches thousands of radians and the codes
+        are cos/sin of it, so that part can never be reduced."""
+        return k.to(self.wd) * self.theta.to(self.wd) + p * self.omega
 
     def _gemm_dtype(self, ref: torch.Tensor) -> torch.dtype:
         if self.cfg.gemm_dtype is not None:
@@ -230,76 +246,62 @@ class LongHead(nn.Module):
         return self.wd
 
     def init_state(self, B: int, device) -> State:
-        z = lambda: torch.zeros(B, self.M, self.dv, device=device, dtype=self.wd)
+        # One (B, 2M, dv) block, rows [Re ; Im]. Keeping the two halves in ONE tensor is
+        # what lets every read and write of the state be a single GEMM against a (., 2M)
+        # code block instead of a pair -- see _batched.
         return {
-            "sr": z(),
-            "si": z(),
+            "s": torch.zeros(B, 2 * self.M, self.dv, device=device, dtype=self.wd),
             "pos": torch.zeros((), device=device, dtype=self.wd),
         }
 
+    def _damp(self, lam, n):
+        """(2M,1) decay factors for the packed state."""
+        return torch.exp(-lam * n)[:, None].repeat(2, 1)
+
     # ---- prefill: one chunk against an incoming state ---------------------- #
-    def _chunk(self, z, h, st: State):
-        B, T, _ = z.shape
-        M, dv = self.M, self.dv
-        dev = z.device
-        with _NoAutocast(dev):
+    def _chunk(self, kz, kh, vz, bz, st: State):
+        B, T, _ = kz.shape
+        M = self.M
+        dev = kz.device
+        gd = self._gemm_dtype(kz)
+        with _no_autocast(dev):
             lam = self.lam()
             idx = torch.arange(T, device=dev, dtype=self.wd)[:, None]
             gw, gq = torch.exp(lam * idx), torch.exp(-lam * idx)  # (T,M)
-            dT, gT, d1 = (
-                torch.exp(-lam * T)[:, None],
-                torch.exp(-lam * (T - 1))[:, None],
-                torch.exp(-lam)[:, None],
-            )
+            gT_2 = torch.exp(-lam * (T - 1))[:, None].repeat(2, 1)
             p = idx + st["pos"]
-            pw, pq = self._phase(h, p), self._phase(z, p)  # (B,T,M) fp32
+            pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,T,M) fp32
             cw, sw, cq, sq = pw.cos(), pw.sin(), pq.cos(), pq.sin()
-            cw_w, sw_w, cw_q, sw_q, cq_q, sq_q = (
-                cw * gw,
-                sw * gw,
-                cw * gq,
-                sw * gq,
-                cq * gq,
-                sq * gq,
-            )
-            sr0, si0 = st["sr"] * d1, st["si"] * d1  # damped incoming state
-            beta = torch.sigmoid(self.bproj(z).to(self.wd))  # (B,T,1)
-            G = (cw_q @ cw_w.transpose(1, 2) + sw_q @ sw_w.transpose(1, 2)) / M
+            Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)  # (B,T,2M) keys
+            Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,T,2M) Gram lhs / read-back
+            c1 = (self.wr * cq + self.wi * sq) * gq
+            c2 = (self.wr * sq - self.wi * cq) * gq
+            Fq = torch.cat([torch.cat([c1, c2], -1),
+                            torch.cat([-c2, c1], -1)], 1).to(gd)  # (B,2T,2M) queries
+            s0 = (st["s"] * self._damp(lam, 1)).to(gd)  # damped incoming state
+            beta = torch.sigmoid(bz.to(self.wd))  # (B,T,1)
+            G = (Qk @ Kk.transpose(1, 2)).to(self.wd) / M
             A = torch.eye(T, device=dev, dtype=self.wd) + beta * G.tril(-1)
-            r = (
-                torch.einsum("btm,bmj->btj", cw_q, sr0)
-                + torch.einsum("btm,bmj->btj", sw_q, si0)
-            ) / M
+            r = (Qk @ s0).to(self.wd) / M
             e = torch.linalg.solve_triangular(
-                A, self.V(z).to(self.wd) - beta * r, upper=False, unitriangular=True
+                A, vz.to(self.wd) - beta * r, upper=False, unitriangular=True
             )
-            Am, Bm = self.wr * cw_w - self.wi * sw_w, self.wr * sw_w + self.wi * cw_w
-            Fq = torch.cat([cq_q, sq_q], -1)  # (B,T,2M)
-            Fk = torch.cat(
-                [torch.cat([Am, Bm], -1), torch.cat([Bm, -Am], -1)], 1
-            )  # (B,2T,2M)
-        gd = self._gemm_dtype(z)
-        K2 = (Fq.to(gd) @ Fk.to(gd).transpose(1, 2)).view(B, T, 2, T)
-        K2 = K2.masked_fill(_causal_mask(T, dev)[None, :, None, :], 0)
-        o = (K2.reshape(B, 2 * T, T) @ e.to(gd)).to(self.wd).view(B, T, 2 * dv) / M
-        with _NoAutocast(dev):
-            c1, c2 = self.wr * cq_q + self.wi * sq_q, self.wr * sq_q - self.wi * cq_q
-            S4 = torch.cat(
-                [torch.cat([sr0, si0], -1), torch.cat([si0, -sr0], -1)], 1
-            )  # (B,2M,2dv)
-            o = o + (torch.cat([c1, c2], -1) @ S4) / M
-            upd = (
-                torch.cat([cw_w, sw_w], -1).transpose(1, 2) @ e * torch.cat([gT, gT], 0)
-            )
-            sr, si = st["sr"] * dT + upd[:, :M], st["si"] * dT + upd[:, M:]
-        return o, {"sr": sr, "si": si, "pos": st["pos"] + T}
+            ec = e.to(gd)
+            K2 = (Fq @ Kk.transpose(1, 2)).masked_fill(
+                _causal_mask(T, dev).repeat(2, 1)[None], 0)  # (B,2T,T) [Re;Im]
+            o = (K2 @ ec + Fq @ s0).to(self.wd)  # (B,2T,dv) kernel + state read
+            o = torch.cat([o[:, :T], o[:, T:]], -1) / M  # (B,T,2dv) = Re || Im
+            sn = st["s"] * self._damp(lam, T) + (
+                Kk.transpose(1, 2) @ ec).to(self.wd) * gT_2
+        return o, {"s": sn, "pos": st["pos"] + T}
 
     # ---- prefill: all full chunks batched, state loop only ----------------- #
-    def _batched(self, z, h, st: State, K: int):
-        B, T, _ = z.shape
+    def _batched(self, kz, kh, vz, bz, st: State, K: int):
+        B, T, _ = kz.shape
         M, dv, C = self.M, self.dv, self.cfg.chunk
-        dev = z.device
-        with _NoAutocast(dev):
+        dev = kz.device
+        gd = self._gemm_dtype(kz)
+        with _no_autocast(dev):
             lam = self.lam()
             idx = torch.arange(C, device=dev, dtype=self.wd)[:, None]
             gw, gq = torch.exp(lam * idx), torch.exp(-lam * idx)
@@ -309,22 +311,26 @@ class LongHead(nn.Module):
                 torch.exp(-lam)[:, None],
             )
             p = torch.arange(T, device=dev, dtype=self.wd)[:, None] + st["pos"]
-            pw, pq = self._phase(h, p), self._phase(z, p)
-            v = self.V(z).to(self.wd)
-            beta = torch.sigmoid(self.bproj(z).to(self.wd))
+            pw, pq = self._phase(kh, p), self._phase(kz, p)
+            v = vz.to(self.wd)
+            beta = torch.sigmoid(bz.to(self.wd))
             ch = lambda x: x.view(B, K, C, x.shape[-1])
             cw, sw, cq, sq, v, beta = map(
                 ch, (pw.cos(), pw.sin(), pq.cos(), pq.sin(), v, beta)
-            )
-            cw_w, sw_w, cw_q, sw_q, cq_q, sq_q = (
-                cw * gw,
-                sw * gw,
-                cw * gq,
-                sw * gq,
-                cq * gq,
-                sq * gq,
-            )
-            G = (cw_q @ cw_w.transpose(-1, -2) + sw_q @ sw_w.transpose(-1, -2)) / M
+            )  # (B,K,C,.)
+            # Three code blocks, each (., 2M) wide, and a state packed as (B,2M,dv). The
+            # spectral weight w is folded into the QUERY side (it is a per-mode diagonal
+            # in the contraction, so it may sit on either operand), which lets ONE key
+            # block serve the Gram, the intra-chunk kernel and the state write, and lets
+            # every state read and write be a single GEMM instead of a pair. Nothing in
+            # the sequential loop below is a cat any more.
+            Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)  # (B,K,C,2M) keys
+            Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,K,C,2M) Gram lhs / read-back
+            c1 = (self.wr * cq + self.wi * sq) * gq
+            c2 = (self.wr * sq - self.wi * cq) * gq
+            Fq = torch.cat([torch.cat([c1, c2], -1),
+                            torch.cat([-c2, c1], -1)], 2).to(gd)  # (B,K,2C,2M) queries
+            G = (Qk @ Kk.transpose(-1, -2)).to(self.wd) / M
             eye = torch.eye(C, device=dev, dtype=self.wd)
             W = torch.linalg.solve_triangular(
                 eye + beta * G.tril(-1),
@@ -332,84 +338,73 @@ class LongHead(nn.Module):
                 upper=False,
                 unitriangular=True,
             )  # (B,K,C,C)
-            Am, Bm = self.wr * cw_w - self.wi * sw_w, self.wr * sw_w + self.wi * cw_w
-            Fq = torch.cat([cq_q, sq_q], -1)
-            Fk = torch.cat([torch.cat([Am, Bm], -1), torch.cat([Bm, -Am], -1)], 2)
-            Rq = torch.cat([cw_q, sw_q], -1)
-            Cq = torch.cat(
-                [self.wr * cq_q + self.wi * sq_q, self.wr * sq_q - self.wi * cq_q], -1
-            )
-            Pw = torch.cat([cw_w, sw_w], -1).transpose(-1, -2)
-            gT2 = torch.cat([gT, gT], 0)
-        gd = self._gemm_dtype(z)
-        K2 = (Fq.to(gd) @ Fk.to(gd).transpose(-1, -2)).view(B, K, C, 2, C)
-        K2 = K2.masked_fill(_causal_mask(C, dev)[None, None, :, None, :], 0).reshape(
-            B, K, 2 * C, C
+            # K2 = Fq Kk^T in one GEMM: [c1|c2] Kk^T is the real part and [-c2|c1] Kk^T
+            # the imaginary one, so the (2C,C) block comes out already stacked [Re ; Im]
+            # -- the same layout the state read below produces, so the two just add.
+            K2 = (Fq @ Kk.transpose(-1, -2)).masked_fill(
+                _causal_mask(C, dev).repeat(2, 1)[None, None], 0)  # (B,K,2C,C)
+            d1_2, dC_2, gT_2 = (x.repeat(2, 1) for x in (d1, dC, gT))
+        Fq, W, v, beta, K2, Kk, Qk = (
+            x.unbind(1) for x in (Fq, W, v, beta, K2, Kk, Qk)
         )
-        Rq, W, v, beta, K2, Cq, Pw = (x.unbind(1) for x in (Rq, W, v, beta, K2, Cq, Pw))
-        sr, si = st["sr"], st["si"]
+        s = st["s"]
         outs = []
         for k in range(K):
-            with _NoAutocast(dev):
-                sr0, si0 = sr * d1, si * d1
-                r = (Rq[k] @ torch.cat([sr0, si0], 1)) / M
-                e = W[k] @ (v[k] - beta[k] * r)  # (B,C,dv)
-            o = (K2[k] @ e.to(gd)).to(self.wd).view(B, C, 2 * dv) / M
-            with _NoAutocast(dev):
-                S4 = torch.cat(
-                    [torch.cat([sr0, si0], -1), torch.cat([si0, -sr0], -1)], 1
-                )
-                o = o + (Cq[k] @ S4) / M
-                upd = (Pw[k] @ e) * gT2
-                sr, si = sr * dC + upd[:, :M], si * dC + upd[:, M:]
-            outs.append(o)
-        return torch.cat(outs, 1), {"sr": sr, "si": si, "pos": st["pos"] + T}
+            with _no_autocast(dev):
+                s0 = (s * d1_2).to(gd)  # (B,2M,dv) damped incoming state
+                r = (Qk[k] @ s0).to(self.wd) / M
+                e = W[k] @ (v[k] - beta[k] * r)  # (B,C,dv) fp32: the delta-rule solve
+                ec = e.to(gd)
+                outs.append((K2[k] @ ec + Fq[k] @ s0).to(self.wd))  # (B,2C,dv) [Re;Im]
+                s = s * dC_2 + (Kk[k].transpose(-1, -2) @ ec).to(self.wd) * gT_2
+        o = torch.stack(outs, 1)  # (B,K,2C,dv)
+        o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * dv) / M
+        return o, {"s": s, "pos": st["pos"] + T}
 
-    def prefill(self, z, h, state: Optional[State] = None):
+    def prefill(self, z, z_prev, state: Optional[State] = None):
+        """z (B,T,d); z_prev (B,d) is the token before z[:,0] -- the write key at t is z_{t-1}."""
         B, T, _ = z.shape
         st = state if state is not None else self.init_state(B, z.device)
+        # K, V and bproj are linear and follow autocast; doing them once here rather than
+        # per chunk also means the write keys K(h) are K(z) shifted by one row, so the
+        # second d x M projection and the (B,T,d) shifted copy of z both disappear.
+        kz, vz, bz = self.K(z), self.V(z), self.bproj(z)
+        kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
         C = self.cfg.chunk
         K = T // C
+        cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b])
         if K >= 2 and self.cfg.long_path == "batched":
-            o, st = self._batched(z[:, : K * C], h[:, : K * C], st, K)
+            o, st = self._batched(*cut(0, K * C), st, K)
             if K * C < T:
-                o2, st = self._chunk(z[:, K * C :], h[:, K * C :], st)
+                o2, st = self._chunk(*cut(K * C, T), st)
                 o = torch.cat([o, o2], 1)
         else:
             outs = []
             for s0 in range(0, T, C):
-                o, st = self._chunk(z[:, s0 : s0 + C], h[:, s0 : s0 + C], st)
+                o, st = self._chunk(*cut(s0, s0 + C), st)
                 outs.append(o)
             o = torch.cat(outs, 1)
         return _rms(o).to(z.dtype), st
 
     # ---- decode: one token, all float32 ------------------------------------ #
     def step(self, z_t, h_t, state: State):
-        with _NoAutocast(z_t.device):
+        kh, kz, vz, bz = self.K(h_t), self.K(z_t), self.V(z_t), self.bproj(z_t)
+        with _no_autocast(z_t.device):
             M = self.M
-            d1 = torch.exp(-self.lam())[:, None]
-            sr0, si0 = state["sr"] * d1, state["si"] * d1
+            s0 = state["s"] * self._damp(self.lam(), 1)  # (B,2M,dv)
             p = state["pos"]
-            pw, pq = self._phase(h_t, p), self._phase(z_t, p)  # (B,M)
-            cwt, swt = pw.cos(), pw.sin()
-            beta = torch.sigmoid(self.bproj(z_t).to(self.wd))
-            vhat = (
-                torch.einsum("bm,bmj->bj", cwt, sr0)
-                + torch.einsum("bm,bmj->bj", swt, si0)
-            ) / M
-            e = self.V(z_t).to(self.wd) - beta * vhat
-            sr = torch.addcmul(sr0, e[:, None, :], cwt[:, :, None])
-            si = torch.addcmul(si0, e[:, None, :], swt[:, :, None])
+            pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,M)
+            kt = torch.cat([pw.cos(), pw.sin()], -1)  # (B,2M) write code
+            beta = torch.sigmoid(bz.to(self.wd))
+            vhat = torch.einsum("bm,bmj->bj", kt, s0) / M
+            e = vz.to(self.wd) - beta * vhat
+            s = torch.addcmul(s0, e[:, None, :], kt[:, :, None])
             cq, sq = pq.cos(), pq.sin()
             c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
-            m = (
-                torch.einsum(
-                    "bam,bcmj->bacj", torch.stack([c1, c2], 1), torch.stack([sr, si], 1)
-                )
-                / M
-            )
-            u = torch.cat([m[:, 0, 0] + m[:, 1, 1], m[:, 0, 1] - m[:, 1, 0]], -1)
-        return _rms(u).to(z_t.dtype), {"sr": sr, "si": si, "pos": state["pos"] + 1}
+            qt = torch.stack([torch.cat([c1, c2], -1),
+                              torch.cat([-c2, c1], -1)], 1)  # (B,2,2M)
+            u = torch.einsum("bam,bmj->baj", qt, s).reshape(z_t.size(0), 2 * self.dv) / M
+        return _rms(u).to(z_t.dtype), {"s": s, "pos": state["pos"] + 1}
 
 
 # =============================================================================
@@ -419,7 +414,7 @@ class ShortHead(nn.Module):
     def __init__(self, cfg: LaplaceConfig):
         super().__init__()
         d, L, dv = cfg.d, cfg.L, cfg.dv
-        self.d, self.L, self.dv = d, L, dv
+        self.d, self.L, self.dv, self.cfg = d, L, dv, cfg
         self.K = nn.Linear(d, L, False)
         self.V = nn.Linear(d, dv, False)
         self.theta = nn.Parameter((cfg.theta_scale or 0.02) * torch.randn(L))
@@ -436,6 +431,13 @@ class ShortHead(nn.Module):
     def wd(self) -> torch.dtype:
         return _wd(self.wr)
 
+    def _gemm_dtype(self, ref: torch.Tensor) -> torch.dtype:
+        if self.cfg.gemm_dtype is not None:
+            return self.cfg.gemm_dtype
+        if torch.is_autocast_enabled() and ref.is_cuda:
+            return torch.get_autocast_gpu_dtype()
+        return self.wd
+
     def init_state(self, B: int, device) -> State:
         n, L, wd = self.L - 1, self.L, self.wd
         return {
@@ -445,9 +447,10 @@ class ShortHead(nn.Module):
             "pos": torch.zeros((), device=device, dtype=torch.long),
         }
 
-    def _phase(self, x, p):
+    def _phase(self, k, p):
+        """k (...,L) = K(x), already projected (see LongHead._phase for why)."""
         return (
-            self.K(x).to(self.wd) * self.theta.to(self.wd)
+            k.to(self.wd) * self.theta.to(self.wd)
             + (p % self.L).to(self.wd)[..., None] * self.omega
         )
 
@@ -470,22 +473,26 @@ class ShortHead(nn.Module):
             -1,
         )
 
-    def prefill(self, z, h, state: Optional[State] = None):
+    def prefill(self, z, z_prev, state: Optional[State] = None):
+        """z (B,T,d); z_prev (B,d) is the token before z[:,0] (see LongHead.prefill)."""
         B, T, _ = z.shape
         st = state if state is not None else self.init_state(B, z.device)
         L, n = self.L, self.L - 1
-        with _NoAutocast(z.device):
+        gd = self._gemm_dtype(z)  # read before autocast is disabled below
+        kz, vz = self.K(z), self.V(z)  # follow autocast
+        kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
+        with _no_autocast(z.device):
             p = torch.arange(T, device=z.device) + st["pos"]
-            phi = self._phase(h, p[None].expand(B, T))
+            phi = self._phase(kh, p[None].expand(B, T))
             cw = torch.cat([st["c"], phi.cos()], 1)
             sw = torch.cat([st["s"], phi.sin()], 1)
-            e = torch.cat([st["e"], self.V(z).to(self.wd)], 1)
-            psi = self._phase(z, p[None].expand(B, T))
-            u = self._banded(psi.cos(), psi.sin(), cw, sw, e, T)
+            e = torch.cat([st["e"], vz.to(self.wd)], 1)
+            psi = self._phase(kz, p[None].expand(B, T))
+            u = self._banded(psi.cos(), psi.sin(), cw, sw, e, T, gd)
         new = {"c": cw[:, -n:], "s": sw[:, -n:], "e": e[:, -n:], "pos": st["pos"] + T}
         return _rms(u).to(z.dtype), new
 
-    def _banded(self, cq, sq, cw, sw, e, T):
+    def _banded(self, cq, sq, cw, sw, e, T, gd=None):
         """The window read as BANDED GEMMs, all chunks at once (no sequential dependency).
 
         kappa(t,s) = Fq_t . Fk_s / L  with  Fk_s = [cw_s ; sw_s]  (2L)  and, for the real /
@@ -495,41 +502,48 @@ class ShortHead(nn.Module):
         in the extended arrays, so query t reads extended indices t .. t+L-1 = lags L-1 .. 0).
         S = Fq (B,K,2C,2L) @ Fk_ext (B,K,2L,C+L-1), band mask 0 <= j - i <= L-1, o = S @ e_ext.
         Same numbers as the unfolded contraction (checked against the repo path in __main__),
-        dense GEMMs instead of an O(T.L.L) einsum on strided views."""
+        dense GEMMs instead of an O(T.L.L) einsum on strided views.
+
+        `gd` is the dtype of the GEMM OPERANDS. The comb's cancellation is carried by the
+        fp32 accumulator inside the tensor-core GEMM, not by the operands: rounding the
+        codes to bf16 leaves the exact tap at cosine similarity 0.999998 and the whole
+        head 2.8e-3 from float64, the same order as the long head's bf16 deviation."""
         B = cq.size(0)
         L = self.L
+        gd = gd if gd is not None else self.wd
         C = L
         K = -(-T // C)
         pad = K * C - T
         if pad:                                                   # ragged tail: pad queries and keys
             cq, sq = F.pad(cq, (0, 0, 0, pad)), F.pad(sq, (0, 0, 0, pad))
             cw, sw, e = F.pad(cw, (0, 0, 0, pad)), F.pad(sw, (0, 0, 0, pad)), F.pad(e, (0, 0, 0, pad))
-        c1 = self.wr * cq + self.wi * sq                          # (B,KC,L)
-        c2 = self.wr * sq - self.wi * cq
+        c1 = (self.wr * cq + self.wi * sq).to(gd)                 # (B,KC,L)
+        c2 = (self.wr * sq - self.wi * cq).to(gd)
         Fq = torch.cat([torch.cat([c1, c2], -1).view(B, K, C, 2 * L),
                         torch.cat([-c2, c1], -1).view(B, K, C, 2 * L)], 2)          # (B,K,2C,2L)
-        Fk = torch.cat([cw, sw], -1)                                                # (B,KC+L-1,2L)
+        Fk = torch.cat([cw, sw], -1).to(gd)                                         # (B,KC+L-1,2L)
         N = C + L - 1
         Fk = Fk.unfold(1, N, C).movedim(-1, 2)                                      # (B,K,N,2L)
-        ek = e.unfold(1, N, C).movedim(-1, 2)                                       # (B,K,N,dv)
+        ek = e.to(gd).unfold(1, N, C).movedim(-1, 2)                                # (B,K,N,dv)
         S = Fq @ Fk.transpose(-1, -2) / L                                           # (B,K,2C,N)
         i = torch.arange(C, device=cq.device)[:, None]
         j = torch.arange(N, device=cq.device)[None]
         band = ((j - i) >= 0) & ((j - i) <= L - 1)                                  # (C,N)
         S = S.masked_fill(~torch.cat([band, band], 0)[None, None], 0)
-        o = S @ ek                                                                  # (B,K,2C,dv)
+        o = (S @ ek).to(self.wd)                                                    # (B,K,2C,dv)
         o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * self.dv)
         return o[:, :T]
 
     def step(self, z_t, h_t, state: State):
-        with _NoAutocast(z_t.device):
+        kh, kz, vz = self.K(h_t), self.K(z_t), self.V(z_t)
+        with _no_autocast(z_t.device):
             B = z_t.size(0)
             p = state["pos"].expand(B)
-            phi = self._phase(h_t, p)
+            phi = self._phase(kh, p)
             cw = torch.cat([state["c"], phi.cos()[:, None]], 1)
             sw = torch.cat([state["s"], phi.sin()[:, None]], 1)
-            e = torch.cat([state["e"], self.V(z_t).to(self.wd)[:, None]], 1)
-            psi = self._phase(z_t, p)
+            e = torch.cat([state["e"], vz.to(self.wd)[:, None]], 1)
+            psi = self._phase(kz, p)
             u = self._read(
                 psi.cos()[:, None],
                 psi.sin()[:, None],
@@ -583,9 +597,9 @@ class LaplaceAttention(nn.Module):
         B = x.size(0)
         st = state if state is not None else self.init_state(B, x.device)
         z = self.n(x)
-        h = torch.cat([st["z_prev"].to(z.dtype)[:, None], z[:, :-1]], 1)
-        ul, sl = self.long.prefill(z, h, st["long"])
-        us, ss = self.short.prefill(z, h, st["short"])
+        zp = st["z_prev"].to(z.dtype)
+        ul, sl = self.long.prefill(z, zp, st["long"])
+        us, ss = self.short.prefill(z, zp, st["short"])
         x = x + self.mix(torch.cat([ul, us], -1))
         x = x + self.ff(self.fn(x))
         return x, {"long": sl, "short": ss, "z_prev": z[:, -1]}
@@ -691,7 +705,7 @@ def _report_bf16(m, x, y_fp32):
         y, _ = m.prefill(x)
     rel = ((y.float() - y_fp32).abs().max() / y_fp32.abs().max()).item()
     print(
-        f"  bf16 autocast vs float32 (big GEMMs in bf16, rest fp32): max rel dev {rel:.1e}"
+        f"  bf16 autocast vs float32 (state + phases fp32, rest bf16): max rel dev {rel:.1e}"
     )
 
 
