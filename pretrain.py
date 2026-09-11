@@ -25,6 +25,18 @@ from sca2.ref import LayerCfg
 from bench_tinypython import SCA2, Transformer, generate
 
 CLS_TAB = None      # set by --class-eval; see evaluate()
+AMP = None          # set by --amp; None = float32, the whole d=128 campaign's setting
+
+
+def amp_ctx():
+    """Autocast context for the forward pass. --amp bf16 applies to EVERY arm.
+
+    The d=128 campaign trained in float32 throughout, so that stays the default and
+    nothing about those runs moves. At d=1024 on GB10 float32 costs ~2.2x (SPARK.md
+    §9) and the machine has bf16 tensor cores, so the Spark runs pass --amp bf16.
+    The loss is always taken on float32 logits, and the layer keeps its recurrent
+    state and phases in float32 regardless (lapa/layer.py precision policy)."""
+    return torch.autocast("cuda", dtype=AMP, enabled=AMP is not None)
 
 
 def batches(data, B, T, device):
@@ -66,7 +78,9 @@ def evaluate(m, val, B, T, device, nb=25, buckets=0, cls_tab=None):
     for k, (x, y) in enumerate(batches(val, B, T, device)):
         if k >= nb:
             break
-        lo = F.cross_entropy(m(x).flatten(0, 1), y.flatten(),
+        with amp_ctx():
+            lg = m(x)
+        lo = F.cross_entropy(lg.float().flatten(0, 1), y.flatten(),
                              reduction="none").view(B, T)
         ls.append(lo.mean().item())
         if w:
@@ -107,7 +121,9 @@ def run(name, m, tr, va, a, device, log):
     for _ in range(a.warm):                       # untimed: absorbs compilation
         x, y = next(it)
         opt.zero_grad(set_to_none=True)
-        F.cross_entropy(m(x).flatten(0, 1), y.flatten()).backward()
+        with amp_ctx():
+            lg = m(x)
+        F.cross_entropy(lg.float().flatten(0, 1), y.flatten()).backward()
         opt.step()
     torch.cuda.synchronize()
 
@@ -121,7 +137,9 @@ def run(name, m, tr, va, a, device, log):
         for gr in opt.param_groups:
             gr["lr"] = lr_at(step + 1, seen)
         opt.zero_grad(set_to_none=True)
-        loss = F.cross_entropy(m(x).flatten(0, 1), y.flatten())
+        with amp_ctx():
+            lg = m(x)
+        loss = F.cross_entropy(lg.float().flatten(0, 1), y.flatten())
         loss.backward(); opt.step()
         torch.cuda.synchronize()
         spent += time.perf_counter() - t0
@@ -207,8 +225,13 @@ def main(argv=None):
     p.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
     p.add_argument("--class-eval", action="store_true", dest="class_eval")
     p.add_argument("--bpe", default="pycode_bpe16k")
+    p.add_argument("--amp", default="fp32", choices=("fp32", "bf16"),
+                   help="autocast dtype of the forward pass, applied to EVERY arm. "
+                        "fp32 (default) is the d=128 campaign's setting; bf16 is what "
+                        "the Spark runs use (SPARK.md §9). Loss always on fp32 logits.")
     a = p.parse_args(argv)
-    global CLS_TAB
+    global CLS_TAB, AMP
+    AMP = torch.bfloat16 if a.amp == "bf16" else None
     if a.class_eval:
         from sca2 import tokclass as tc
         CLS_TAB = tc.load_table(a.bpe)

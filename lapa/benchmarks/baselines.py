@@ -218,6 +218,15 @@ class GDNLayer(nn.Module):
 #     S_t = (I - k_t (b_t * k_t)^T) Diag(exp(g_t)) S_{t-1} + k_t (w_t * v_t)^T
 #  channel-wise erase gate b (K), write gate w (V), channel-wise log-decay g (K).
 # --------------------------------------------------------------------------- #
+def _load_fla_gdn2_triton():
+    """fla's fused Triton kernel for GDN-2, or None. Same reasoning as _load_fla_triton."""
+    try:
+        from fla.ops.gdn2 import chunk_gdn2
+        return chunk_gdn2
+    except Exception:
+        return None
+
+
 def _load_fla_gdn2_naive():
     spec = importlib.util.find_spec("fla")
     if spec is None or not spec.submodule_search_locations:
@@ -235,9 +244,12 @@ class GatedDeltaNet2(nn.Module):
     decay projection f_proj -> softplus(+dt_bias) scaled by -exp(A_log) per head, sigmoid gates
     b (key axis) and w (value axis), L2-normalised q/k, sigmoid-gated RMSNorm on the output."""
 
-    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, conv_k=4):
+    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, conv_k=4, kernel="auto"):
         super().__init__()
         self._ref = _load_fla_gdn2_naive()
+        self._tri = None if kernel == "naive" else _load_fla_gdn2_triton()
+        if kernel == "triton" and self._tri is None:
+            raise ImportError("fla gdn2 Triton kernel unavailable")
         self.d, self.H, self.dk = d, heads, head_k
         self.dv = int(head_k * expand_v)
         self.key_dim, self.value_dim = heads * self.dk, heads * self.dv
@@ -279,8 +291,15 @@ class GatedDeltaNet2(nn.Module):
         k = F.normalize(self.ck(self.k(x)).view(B, T, self.H, self.dk), dim=-1)
         v = self.cv(self.v(x)).view(B, T, self.H, self.dv)
         g, b, w = self._gates(x, B, T)
-        o, h = self._ref.naive_chunk_gdn2(q, k, v, g, b, w, initial_state=st["h"] if state is not None else None,
-                                          output_final_state=True, chunk_size=64)
+        h0 = st["h"] if state is not None else None
+        if self._tri is not None and x.is_cuda:
+            dt = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else torch.bfloat16
+            o, h = self._tri(q.to(dt), k.to(dt), v.to(dt), g.float(), b.to(dt), w.to(dt),
+                             initial_state=None if h0 is None else h0.float(),
+                             output_final_state=True)
+        else:
+            o, h = self._ref.naive_chunk_gdn2(q, k, v, g, b, w, initial_state=h0,
+                                              output_final_state=True, chunk_size=64)
         tail = lambda z_: z_[:, -(self.conv_k - 1):] if T >= self.conv_k - 1 else F.pad(z_, (0, 0, self.conv_k - 1 - T, 0))
         return self._read(o.to(x.dtype), x, B, T), {"h": h.float(), "cq": tail(self.q(x)), "ck": tail(self.k(x)), "cv": tail(self.v(x))}
 
@@ -297,10 +316,10 @@ class GatedDeltaNet2(nn.Module):
 class GDN2Layer(GDNLayer):
     """norm -> GatedDeltaNet2 -> residual -> norm -> FFN -> residual."""
 
-    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, ff=256):
+    def __init__(self, d, heads=4, head_k=32, expand_v=1.0, ff=256, kernel="auto"):
         nn.Module.__init__(self)
         self.n = nn.LayerNorm(d)
-        self.mix = GatedDeltaNet2(d, heads, head_k, expand_v)
+        self.mix = GatedDeltaNet2(d, heads, head_k, expand_v, kernel=kernel)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
 

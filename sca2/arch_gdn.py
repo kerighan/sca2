@@ -76,6 +76,26 @@ def _load_ref():
 _ref = _load_ref()
 
 
+def _load_triton():
+    """fla's own fused Triton kernels, or None where they cannot run.
+
+    Every GDN number in this repo before the Spark came from the naive PyTorch
+    reference above, because fla's Triton kernels do not build on sm_75. They do on
+    Blackwell, and they are worth 1.66x at d=1024 (SPARK.md §9) -- training or timing
+    LapA against the reference is racing a crippled baseline. $SCA2_GDN_KERNEL takes
+    "triton" (default when importable), or "naive" to force the reference back."""
+    if os.environ.get("SCA2_GDN_KERNEL", "auto") == "naive":
+        return None
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        return chunk_gated_delta_rule
+    except Exception:
+        return None
+
+
+_triton = _load_triton()
+
+
 class ShortConv(nn.Module):
     """Depthwise causal conv, kernel 4, with a cache for decode."""
 
@@ -146,10 +166,18 @@ class GatedDeltaNet(nn.Module):
         v = self.cv(self.v(x)).view(B, T, self.H, self.dv)
         q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
         g, beta = self._gates(x)
-        o, h = _ref.naive_chunk_gated_delta_rule(
-            q, k, v, g, beta, chunk_size=64,
-            initial_state=st["h"] if state is not None else None,
-            output_final_state=True)
+        h0 = st["h"] if state is not None else None
+        if _triton is not None and x.is_cuda:
+            # bf16 activations, fp32 gates and fp32 state -- the same split the layer
+            # itself uses, so neither arm is handicapped by dtype.
+            dt = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else torch.bfloat16
+            o, h = _triton(q.to(dt), k.to(dt), v.to(dt), g.float(), beta.to(dt),
+                           initial_state=None if h0 is None else h0.float(),
+                           output_final_state=True)
+        else:
+            o, h = _ref.naive_chunk_gated_delta_rule(
+                q, k, v, g, beta, chunk_size=64,
+                initial_state=h0, output_final_state=True)
         y = self._read(o.to(x.dtype), x, B, T)
         tail = lambda z_, n: z_[:, -(self.conv_k - 1):] if T >= self.conv_k - 1 else \
             F.pad(z_, (0, 0, self.conv_k - 1 - T, 0))

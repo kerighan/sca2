@@ -62,6 +62,7 @@ def _load_variants():
     from . import arch_short    # noqa: F401  cdelta C head + short dft C head
     from . import arch_damp     # noqa: F401  cdelta with per-mode decay (Laplace)
     from . import arch_gdn2     # noqa: F401  Gated DeltaNet-2 baseline (via lapa)
+    from . import arch_lapa     # noqa: F401  Laplace Attention v1 (via lapa), the fast path
     from . import fast_dhead    # noqa: F401  loop-free D head (iso with sepq/polar)
     try:
         from . import triton_dhead  # noqa: F401  fused kernel (needs triton)
