@@ -580,6 +580,26 @@ harder than a forgetting one — cosine/clipping territory, not architecture).
 **Laplace Attention v1 = mixed grid (slow_frac 0.25, base 1e3) + window 64, M=190.**
 Queued: copy with window 32 on the same grid (does the window halve for free?).
 
+### GDN at 12k steps: the cliff was partly a learning-speed cliff (2026-09-11, 14:00)
+
+GDN 3×80 trained 3× longer (exact-string rates, L = 32 / 64 / 128 / 256 / 512, token acc
+in brackets where exact is 0):
+
+| arm | steps | L32 | L64 | L128 | L256 | L512 |
+|---|---|---|---|---|---|---|
+| GDN 3×80 | 4000 | 0.97 | 0.70 | 0.02 | 0 (0.81) | 0 (0.52) |
+| GDN 3×80 | 8000 | 1.00 | 0.92 | 0.29 | 0 (0.91) | 0 (0.65) |
+| GDN 3×80 | 12000 | 1.00 | 1.00 | 0.94 | **0.61** | 0 (0.99) |
+| LapA v1 (mixed + w64) | 8000 | 1.00 | 0.99 | 1.00 | **0.98** | **0.69** |
+
+GDN keeps improving with budget: at 12k it copies 256 exactly 61% of the time and reaches
+0.99 per token at 512. So its 4000-step "cliff" was mostly slower learning of long
+copies, not a hard capacity wall — except at L=512 exact, still 0. At equal budget (8k)
+LapA v1 is far ahead (L128 1.00 vs 0.29, L256 0.98 vs 0.00); at 1.5× GDN's budget LapA
+still leads at 256 and 512. LapA v1 at 12k queued for the equal-budget row. Lesson for the
+Spark protocol: copy curves must be read at equal steps AND to saturation — GDN's
+saturation point is beyond 12k here.
+
 ### Speed pass on Laplace Attention (2026-09-10, in progress)
 
 Profile of A's layer under compile (B=8, T=1024, fwd+bwd): long head 65%, short

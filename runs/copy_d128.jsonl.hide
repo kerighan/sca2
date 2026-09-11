@@ -2,4 +2,4 @@
 theta=0
 no damping
 M=64
-12k
+LapA M=190 12k steps
