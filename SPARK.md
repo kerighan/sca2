@@ -322,3 +322,50 @@ at this width.
   override. If a gate in §1 fails with `KeyError`, suspect this before the layer.
 - torch 2.9.1+cu130 warns that sm_121 is outside its supported range (max 12.0) on
   every import. It is noise; everything works, including Triton 3.5.1.
+- **`pretrain.py` does not train `lapa/layer.py`.** It builds through the sca2 registry,
+  so `--variant cshort_damph_cc` trains the MIRROR, which is 1.9x slower than the
+  optimised file. Use **`--variant lapa_cc`** (sca2/arch_lapa.py) for anything where
+  speed matters; it is float64-identical to cshort_damph (8.88e-16) with the same
+  parameter count, and the two remain a cross-check of each other.
+- **`pretrain.py` had no autocast at all** -- the whole d=128 campaign is float32,
+  which §3(d) states but is easy to miss when reading the loop. `--amp bf16` now
+  exists, applies to every arm and to the eval, and takes the loss on fp32 logits. It
+  DEFAULTS TO fp32 so nothing about the existing runs moves.
+- `sca2/arch_gdn.py` and `GatedDeltaNet2` were also on fla's naive reference, so an LM
+  comparison had the same 1.66x handicap the timings did. Both now use fla's Triton
+  kernels ($SCA2_GDN_KERNEL=naive forces the reference back).
+- `matplotlib` is not installed by default here; `plot_lm.py` dies on import without it.
+
+### Throughput at d=1024 (B=8, T=1024, bf16, compiled, 8-layer LM, vocab 16k)
+
+| layers | LapA M=256 dv=256 | GDN 8x128 |
+|---|---|---|
+| 8 | 25.5k tok/s, 116.0M par., 459M tok/5h | 19.4k, 142.9M, 349M |
+| 12 | 18.7k, 157.2M, 336M | 13.2k, 197.6M, 238M |
+| 16 | 14.6k, 198.4M, 263M | 10.3k, 252.3M, 186M |
+
+**Batch does NOT scale linearly on this machine**, which is worth knowing before sizing
+anything to the 128 GB (LapA, 8 layers):
+
+| B | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| tok/s | 22.6k | 26.2k | 28.0k | 29.4k |
+| peak mem | 4.3 GB | 7.0 GB | 12.3 GB | 23.1 GB |
+
+8x the batch buys 30%, and 23 GB of 128 are used. The machine is bandwidth-bound, not
+memory-bound: **the unified memory is for big MODELS, not big batches.** Sizing a run
+to fill the RAM would buy nothing and cost gradient-noise realism.
+
+### The d=1024 convergence run (`long5h_d1024.sh`)
+
+8 layers (d/layers = 128, the aspect ratio of the LFM2-1.2B reference point in §4),
+ff 4096 on every arm, 3 arms x 5 h, `--amp bf16`, B=8 T=1024. Deliberately NOT
+parameter-matched, per §3(c): LapA 116.0M / mixer 1.90M / state 156k, GDN 142.9M /
+5.27M / 140k, GDN2 155.4M / 6.83M / 140k -- LapA is the smallest model of the three.
+
+Constant lr, NOT `--cosine`: cosine decays on the fraction of the CORPUS seen, and at
+equal wall clock the arms consume different token counts (459M vs 349M), so a
+corpus-fraction schedule hands them different learning rates at the same step. That is
+a confound through the middle of the comparison; constant lr has none. `--warmup 100`.
+`lr_probe_d1024.sh` picks the lr first -- 1e-3 constant was right at d=128 and is a
+guess at this width; 7 min per lr catches divergence, not the asymptotic ranking.
