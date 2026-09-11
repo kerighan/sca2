@@ -67,3 +67,5 @@ python -m lapa.layer        # == repo fast path in float64 (9e-16); decode == pr
 - decode: ~2.7× faster than GDN's Triton path, 0.09 MB state per layer
 
 The benchmarks that produced these, and the ones to run at scale: `benchmarks/README.md`.
+Scaling to d = 1024–2048 (what is known, what is not, shapes, speed protocol, traps):
+`../SPARK.md`.
