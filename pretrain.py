@@ -231,6 +231,12 @@ def main(argv=None):
     # GDN head shape, for --variant gdn* (whole mixer) and hyb* (D-head slot)
     p.add_argument("--Ls", type=int, default=16, help="window of the short dft C head (--variant cshort*)")
     p.add_argument("--rope-base", type=float, default=10000.0, dest="rope_base", help="long-head rope grid base (unaliased range 2*base)")
+    p.add_argument("--persist", type=float, default=0.5,
+                   help="fraction of long-head modes starting persistent (lambda = 0)")
+    p.add_argument("--learn-persist", action="store_true", dest="learn_persist",
+                   help="lambda = lam_max*sigmoid(a) instead of softplus(a).clamp(max=lam_max) "
+                        "with a hard pin: nothing is pinned, --persist only sets where the split "
+                        "STARTS, and there is no zero-gradient region above the cap.")
     p.add_argument("--rope-min-period", type=float, default=None, dest="rope_min_period",
                    help="shortest period in the fast rope grid (None = 2, historical). Set to "
                         "2*Ls to stop spending long-head modes on lags the short head already "
@@ -275,6 +281,7 @@ def main(argv=None):
                    gated_read=a.gated_read,
                    Ls=a.Ls, rope_base=a.rope_base, slow_frac=a.slow_frac,
                    rope_min_period=a.rope_min_period,
+                   persist=a.persist, learn_persist=a.learn_persist,
                    lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

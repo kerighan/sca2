@@ -312,6 +312,10 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    persist: float = 0.5         # fraction of long-head modes starting persistent (lambda = 0)
+    learn_persist: bool = False  # no hard pin: lambda = lam_max*sigmoid(a), the gradient decides
+    #   the persistent/damped split and `persist` only sets where it STARTS. Also removes the
+    #   hard clamp, which has zero gradient above its bound -- see SPARK.md §9.
     rope_min_period: float = None  # shortest period in the fast rope grid; None = 2 (historical).
     #   2*Ls starts the long head where the short head's exact window ends instead of overlapping
     #   it. At M=256/Ls=64 the overlap wastes 115 of 256 modes; see lapa.layer.rope_grid.
