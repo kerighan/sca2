@@ -336,7 +336,43 @@ long head's addressing exists for, and exactly where LapA crushed GDN at d=128 (
 0.85 vs 0.00 at L=512). Losing there at 8× the width is the signature of addressing
 that did not scale with the model, which is hypothesis (a).
 
-### THE DECAY CAP IS FROZEN SHUT — half the long head's spectrum is disabled
+### WHAT ACTUALLY CARRIES THE LOSS (ablation on round 1's trained checkpoint)
+
+Each mechanism switched off at EVAL time on `runs/ck_d1024_lapa`, no retraining, 20 val
+batches. This is the cheapest diagnostic in the campaign and it should have been the first.
+
+| mechanism muted | val | cost |
+|---|---|---|
+| intact | 1.8188 | — |
+| **short head** (mix cols) | 8.2643 | **+6.45** |
+| long head (mix cols) | 4.5838 | +2.77 |
+| `theta` = 0 (content path) | 3.9200 | +2.10 |
+| **persistent modes** (w=0) | 3.8542 | +2.04 |
+| `beta` → 0 (delta rule off) | 3.2352 | +1.42 |
+| slow modes (w=0) | 2.3351 | +0.52 |
+| fast modes (w=0) | 2.2838 | +0.47 |
+| **damped modes** (w=0) | 1.9531 | **+0.13** |
+
+**Half the long head's spectrum is near-dead.** Muting 128 of 256 modes costs 0.13 nats
+while the persistent half costs 2.04 — a factor of 15 between the two halves of the same
+head. Everything else follows from that:
+
+- it retro-explains the whole d=1024 day: `--lam-max 0.0625` landing at +0.002 was
+  predictable, because the modes whose cap it releases do not carry the loss;
+- it is the overlap the damping-alignment note describes, with the winner now visible: the
+  damped modes converge to the cap, i.e. a memory of 64 tokens = exactly the short head's
+  window, and duplicate its job. The short head wins that overlap by 2.3x;
+- the fast/slow split is redundant (+0.52 and +0.47 alone, against +2.77 for the whole
+  head): either half alone carries most of the function.
+
+What is load-bearing and was never questioned: the SHORT head, by a distance. Its window
+is set to 64 by convention, not by measurement.
+
+Queued from this: `--persist 0.875` (reallocate the spectrum toward the half that works,
+zero extra parameters or state) and `--Ls 128` (widen the pillar, +0.065M params/layer,
+state 156k → 197k).
+
+### The decay cap is frozen shut — but the modes it holds are the dead ones
 
 Read off round 1's checkpoint, not inferred. `lam` is
 `softplus(lam_raw).clamp(max=lam_max)` with `lam_max = 1/L = 1/64`, a floor of 64 tokens
