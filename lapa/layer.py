@@ -128,6 +128,9 @@ class LaplaceConfig:
         #       phases, the Gram's solve and the short head stay fp32 regardless.
     )
     beta_init: float = -2.0  # erase gate bias: sigmoid(-2) = 0.12 at init
+    conv: int = 0  # width of a causal depthwise conv applied to z BEFORE both heads (0 = none).
+    #   Every competitive linear mixer has one -- Mamba, GDN (kernel 4 on q/k/v), LFM2 -- and
+    #   this layer did not. Initialised to the identity, so at init it is exactly a no-op.
 
 
 def _rms(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -602,15 +605,34 @@ class LaplaceAttention(nn.Module):
         self.mix = nn.Linear(4 * dv, d)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
+        self.ck = cfg.conv
+        if self.ck:
+            w = torch.zeros(d, 1, self.ck)
+            w[:, 0, -1] = 1.0  # identity at init: the conv starts as a no-op
+            self.cw = nn.Parameter(w)
 
     def init_state(self, B: int, device) -> State:
-        return {
+        dt = self.n.weight.dtype
+        st = {
             "long": self.long.init_state(B, device),
             "short": self.short.init_state(B, device),
-            "z_prev": torch.zeros(
-                B, self.cfg.d, device=device, dtype=self.n.weight.dtype
-            ),
+            "z_prev": torch.zeros(B, self.cfg.d, device=device, dtype=dt),
         }
+        if self.ck:
+            st["cbuf"] = torch.zeros(B, self.ck - 1, self.cfg.d, device=device, dtype=dt)
+        return st
+
+    def _conv(self, z, buf):
+        """Causal depthwise conv on (B,T,d); `buf` holds the ck-1 tokens preceding z."""
+        zz = torch.cat([buf.to(z.dtype), z], 1)
+        zc = F.conv1d(zz.transpose(1, 2), self.cw.to(z.dtype),
+                      groups=self.cfg.d).transpose(1, 2)
+        return zc, zz[:, -(self.ck - 1):]
+
+    def _conv_step(self, z_t, buf):
+        """Same filter, one token. out = sum_j w_j . window_j, window = [buf ; z_t]."""
+        win = torch.cat([buf.to(z_t.dtype), z_t[:, None]], 1)          # (B,ck,d)
+        return (win.transpose(1, 2) * self.cw.squeeze(1).to(z_t.dtype)).sum(-1), win[:, 1:]
 
     def forward(self, x):
         return self.prefill(x)[0]
@@ -619,21 +641,27 @@ class LaplaceAttention(nn.Module):
         B = x.size(0)
         st = state if state is not None else self.init_state(B, x.device)
         z = self.n(x)
+        new = {}
+        if self.ck:
+            z, new["cbuf"] = self._conv(z, st["cbuf"])
         zp = st["z_prev"].to(z.dtype)
         ul, sl = self.long.prefill(z, zp, st["long"])
         us, ss = self.short.prefill(z, zp, st["short"])
         x = x + self.mix(torch.cat([ul, us], -1))
         x = x + self.ff(self.fn(x))
-        return x, {"long": sl, "short": ss, "z_prev": z[:, -1]}
+        return x, {**new, "long": sl, "short": ss, "z_prev": z[:, -1]}
 
     def step(self, x_t, state: State):
         z = self.n(x_t)
+        new = {}
+        if self.ck:
+            z, new["cbuf"] = self._conv_step(z, state["cbuf"])
         h = state["z_prev"].to(z.dtype)
         ul, sl = self.long.step(z, h, state["long"])
         us, ss = self.short.step(z, h, state["short"])
         y = x_t + self.mix(torch.cat([ul, us], -1))
         y = y + self.ff(self.fn(y))
-        return y, {"long": sl, "short": ss, "z_prev": z}
+        return y, {**new, "long": sl, "short": ss, "z_prev": z}
 
     def state_floats(self) -> int:
         cfg = self.cfg
