@@ -174,6 +174,57 @@ class ShortLayer(SCA2Layer):
             with torch.no_grad():
                 mem = torch.exp(torch.empty(self.c.M).uniform_(math.log(lo), math.log(hi)))
                 self.c.lam_raw.copy_(torch.log(torch.expm1(1.0 / mem)))
+        # Causal depthwise conv on z, before BOTH heads (mirror of lapa/layer.py). Every
+        # competitive linear mixer has one -- Mamba, GDN (kernel 4 on q/k/v), LFM2 -- and this
+        # lineage never did; LayerCfg.conv existed but only arch_gatedc implemented it.
+        # Identity at init, so cfg.conv > 0 changes nothing until it is trained.
+        self.ck = cfg.conv
+        if self.ck:
+            w = torch.zeros(cfg.d, 1, self.ck)
+            w[:, 0, -1] = 1.0
+            self.cw = nn.Parameter(w)
+
+    def init_state(self, B, device, dtype=torch.float32):
+        st = super().init_state(B, device, dtype)
+        if getattr(self, "ck", 0):
+            st["cbuf"] = torch.zeros(B, self.ck - 1, self.cfg.d, device=device, dtype=dtype)
+        return st
+
+    def _conv(self, z, buf):
+        zz = torch.cat([buf.to(z.dtype), z], 1)
+        zc = F.conv1d(zz.transpose(1, 2), self.cw.to(z.dtype),
+                      groups=self.cfg.d).transpose(1, 2)
+        return zc, zz[:, -(self.ck - 1):]
+
+    def prefill(self, x, state=None):
+        if not getattr(self, "ck", 0):
+            return super().prefill(x, state)
+        B = x.size(0)
+        if state is None:
+            state = self.init_state(B, x.device, x.dtype)
+        z = self.n(x)
+        z, cbuf = self._conv(z, state["cbuf"])
+        h = torch.empty_like(z)
+        h[:, 0] = state["z_prev"]
+        h[:, 1:] = z[:, :-1]
+        uc, cs = self.c.prefill(z, h, state["c"])
+        ud, ds = self.dh.prefill(z, h, state["d"])
+        x = x + self.mix(torch.cat([uc, ud], -1))
+        x = x + self.ff(self.fn(x))
+        return x, {"c": cs, "d": ds, "z_prev": z[:, -1], "cbuf": cbuf}
+
+    def step(self, x_t, state):
+        if not getattr(self, "ck", 0):
+            return super().step(x_t, state)
+        z = self.n(x_t)
+        win = torch.cat([state["cbuf"].to(z.dtype), z[:, None]], 1)
+        z = (win.transpose(1, 2) * self.cw.squeeze(1).to(z.dtype)).sum(-1)
+        h = state["z_prev"]
+        uc, cs = self.c.step(z, h, state["c"])
+        ud, ds = self.dh.step(z, h, state["d"])
+        y = x_t + self.mix(torch.cat([uc, ud], -1))
+        y = y + self.ff(self.fn(y))
+        return y, {"c": cs, "d": ds, "z_prev": z, "cbuf": win[:, 1:]}
 
 
 class ShortLayerRaw(ShortLayer):
