@@ -235,6 +235,10 @@ def main(argv=None):
                    help="key-verification width on the lapa path (0 = off, 16 matches sca2's "
                         "cshort_damphkv). Stores the write key beside the value and gates the "
                         "read on whether it comes back matching the query's key.")
+    p.add_argument("--beta-groups", type=int, default=1, dest="beta_groups",
+                   help="erase-gate granularity: 1 = one scalar per token for all M modes "
+                        "(historical), 3 = one per spectral band (slow / persistent-fast / "
+                        "damped). Identical at init; 2*d extra parameters.")
     p.add_argument("--kv-gate-pc", action="store_true", dest="kv_gate_pc",
                    help="per-channel key-verification gate: ga/gb become 2*dv vectors instead "
                         "of scalars. Identical at init; 1024 extra parameters at dv=256.")
@@ -289,7 +293,7 @@ def main(argv=None):
                    Ls=a.Ls, rope_base=a.rope_base, slow_frac=a.slow_frac,
                    rope_min_period=a.rope_min_period,
                    persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
-                   kv_gate_pc=a.kv_gate_pc,
+                   kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

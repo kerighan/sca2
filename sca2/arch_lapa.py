@@ -41,6 +41,7 @@ def config_from(cfg) -> LaplaceConfig:
         conv=cfg.conv,
         kv_dk=cfg.kv_dk,
         kv_gate_pc=cfg.kv_gate_pc,
+        beta_groups=cfg.beta_groups,
         slow_frac=cfg.slow_frac,
         max_len=cfg.max_len,
         mem_range=cfg.damp_mem,

@@ -137,6 +137,14 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    beta_groups: int = 1  # erase-gate granularity. 1 = one scalar per token for ALL M modes,
+    #   which is what the layer has always done -- and it is incoherent with its own design:
+    #   the spectrum is deliberately heterogeneous (half persistent with infinite memory, a
+    #   slow-integrator slice, a damped fast remainder) yet one write strength is forced on
+    #   all of it. A fast pole holds short-lived content that should be overwritten hard; a
+    #   persistent pole holds document memory that should not. 3 splits it by band --
+    #   slow integrators / persistent-but-fast / damped -- for 2*d parameters. Identical at
+    #   init (bproj starts at zero weight and a constant bias, so every band agrees).
     kv_gate_pc: bool = False  # PER-CHANNEL key-verification gate: ga, gb become vectors of
     #   length 2*dv instead of scalars, so each output channel gets its own slope and bias on
     #   the SAME evidence m. Both reference architectures gate per channel (GDN's is
@@ -243,7 +251,8 @@ class LongHead(nn.Module):
         self.wi = nn.Parameter(torch.zeros(M))
         self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
                                                 cfg.rope_min_period))
-        self.bproj = nn.Linear(d, 1, True)  # erase gate beta = sigmoid(bproj(z))
+        self.bg = max(1, cfg.beta_groups)
+        self.bproj = nn.Linear(d, self.bg, True)  # erase gate beta = sigmoid(bproj(z))
         nn.init.zeros_(self.bproj.weight)
         nn.init.constant_(self.bproj.bias, cfg.beta_init)
         lo, hi, self.lam_max = _damp_params(cfg)
@@ -265,6 +274,21 @@ class LongHead(nn.Module):
             if n_pin:
                 mask[low] = 0.0
             self.register_buffer("lam_mask", mask)
+        if self.bg > 1:
+            # disjoint bands, in the order the grid is built: 0 = slow integrators (the last
+            # n_slow modes), 1 = persistent but on the fast grid, 2 = damped. Extra groups
+            # beyond 3 subdivide the damped band evenly.
+            n_slow = int(round(cfg.slow_frac * M))
+            g = torch.full((M,), min(2, self.bg - 1), dtype=torch.long)
+            pinned = torch.zeros(M, dtype=torch.bool)
+            pinned[low] = True
+            g[pinned] = min(1, self.bg - 1)
+            if n_slow:
+                g[M - n_slow:] = 0
+            if self.bg > 3:                       # subdivide the damped band
+                dmp = (~pinned).nonzero(as_tuple=True)[0]
+                g[dmp] = 2 + (torch.arange(len(dmp)) * (self.bg - 2) // max(len(dmp), 1))
+            self.register_buffer("bgroup", g.clamp(max=self.bg - 1))
 
     # ---- pieces ----------------------------------------------------------- #
     @property
@@ -294,6 +318,11 @@ class LongHead(nn.Module):
         if torch.is_autocast_enabled() and ref.is_cuda:
             return torch.get_autocast_gpu_dtype()
         return self.wd
+
+    def _beta(self, bz):
+        """sigmoid(bproj(z)) -> (...,1) when shared, (...,M) when banded."""
+        b = torch.sigmoid(bz.to(self.wd))
+        return b if self.bg == 1 else b[..., self.bgroup]
 
     def _out(self, u, z):
         """(..., 2*dvi) -> (..., 2*dv). Without key verification this is just the RMS read."""
@@ -340,12 +369,18 @@ class LongHead(nn.Module):
             Fq = torch.cat([torch.cat([c1, c2], -1),
                             torch.cat([-c2, c1], -1)], 1).to(gd)  # (B,2T,2M) queries
             s0 = (st["s"] * self._damp(lam, 1)).to(gd)  # damped incoming state
-            beta = torch.sigmoid(bz.to(self.wd))  # (B,T,1)
+            # The erase gate folds into the QUERY-side codes. beta multiplies the read-back
+            # inside the sum over modes, so a per-mode beta is a per-mode scale on Qk -- the
+            # chunked closed form is unchanged, it just sees pre-scaled queries.
+            beta = self._beta(bz)  # (B,T,1) or (B,T,M)
+            Qk = (Qk * torch.cat([beta, beta], -1).to(gd)) if self.bg > 1 else Qk
             G = (Qk @ Kk.transpose(1, 2)).to(self.wd) / M
-            A = torch.eye(T, device=dev, dtype=self.wd) + beta * G.tril(-1)
+            A = torch.eye(T, device=dev, dtype=self.wd) + (
+                G.tril(-1) if self.bg > 1 else beta * G.tril(-1))
             r = (Qk @ s0).to(self.wd) / M
             e = torch.linalg.solve_triangular(
-                A, vz.to(self.wd) - beta * r, upper=False, unitriangular=True
+                A, vz.to(self.wd) - (r if self.bg > 1 else beta * r),
+                upper=False, unitriangular=True
             )
             ec = e.to(gd)
             K2 = (Fq @ Kk.transpose(1, 2)).masked_fill(
@@ -374,7 +409,7 @@ class LongHead(nn.Module):
             p = torch.arange(T, device=dev, dtype=self.wd)[:, None] + st["pos"]
             pw, pq = self._phase(kh, p), self._phase(kz, p)
             v = vz.to(self.wd)
-            beta = torch.sigmoid(bz.to(self.wd))
+            beta = self._beta(bz)  # (B,T,1) or (B,T,M); folded into Qk below when banded
             ch = lambda x: x.view(B, K, C, x.shape[-1])
             cw, sw, cq, sq, v, beta = map(
                 ch, (pw.cos(), pw.sin(), pq.cos(), pq.sin(), v, beta)
@@ -387,6 +422,8 @@ class LongHead(nn.Module):
             # the sequential loop below is a cat any more.
             Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)  # (B,K,C,2M) keys
             Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,K,C,2M) Gram lhs / read-back
+            if self.bg > 1:  # per-mode erase gate: a scale on the query-side codes
+                Qk = Qk * torch.cat([beta, beta], -1).to(gd)
             c1 = (self.wr * cq + self.wi * sq) * gq
             c2 = (self.wr * sq - self.wi * cq) * gq
             Fq = torch.cat([torch.cat([c1, c2], -1),
@@ -394,7 +431,7 @@ class LongHead(nn.Module):
             G = (Qk @ Kk.transpose(-1, -2)).to(self.wd) / M
             eye = torch.eye(C, device=dev, dtype=self.wd)
             W = torch.linalg.solve_triangular(
-                eye + beta * G.tril(-1),
+                eye + (G.tril(-1) if self.bg > 1 else beta * G.tril(-1)),
                 eye.expand(B, K, C, C),
                 upper=False,
                 unitriangular=True,
@@ -414,7 +451,7 @@ class LongHead(nn.Module):
             with _no_autocast(dev):
                 s0 = (s * d1_2).to(gd)  # (B,2M,dv) damped incoming state
                 r = (Qk[k] @ s0).to(self.wd) / M
-                e = W[k] @ (v[k] - beta[k] * r)  # (B,C,dv) fp32: the delta-rule solve
+                e = W[k] @ (v[k] - (r if self.bg > 1 else beta[k] * r))  # delta-rule solve
                 ec = e.to(gd)
                 outs.append((K2[k] @ ec + Fq[k] @ s0).to(self.wd))  # (B,2C,dv) [Re;Im]
                 s = s * dC_2 + (Kk[k].transpose(-1, -2) @ ec).to(self.wd) * gT_2
@@ -463,9 +500,10 @@ class LongHead(nn.Module):
             p = state["pos"]
             pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,M)
             kt = torch.cat([pw.cos(), pw.sin()], -1)  # (B,2M) write code
-            beta = torch.sigmoid(bz.to(self.wd))
-            vhat = torch.einsum("bm,bmj->bj", kt, s0) / M
-            e = vz.to(self.wd) - beta * vhat
+            beta = self._beta(bz)
+            ktb = kt * torch.cat([beta, beta], -1) if self.bg > 1 else kt
+            vhat = torch.einsum("bm,bmj->bj", ktb, s0) / M
+            e = vz.to(self.wd) - (vhat if self.bg > 1 else beta * vhat)
             s = torch.addcmul(s0, e[:, None, :], kt[:, :, None])
             cq, sq = pq.cos(), pq.sin()
             c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
@@ -505,6 +543,11 @@ class ShortHead(nn.Module):
         if torch.is_autocast_enabled() and ref.is_cuda:
             return torch.get_autocast_gpu_dtype()
         return self.wd
+
+    def _beta(self, bz):
+        """sigmoid(bproj(z)) -> (...,1) when shared, (...,M) when banded."""
+        b = torch.sigmoid(bz.to(self.wd))
+        return b if self.bg == 1 else b[..., self.bgroup]
 
     def _out(self, u, z):
         """(..., 2*dvi) -> (..., 2*dv). Without key verification this is just the RMS read."""
