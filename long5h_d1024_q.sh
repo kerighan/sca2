@@ -53,11 +53,19 @@ cell () { local label=$1; shift; echo "##### $(date +%H:%M) $label :: $*"
           python -u pretrain.py --label "$label" --seed 0 $COMMON --save runs/ck_$label "$@"; }
 
 cell d1024_max      --ff 5729 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3
-# arm 2 STACKS rather than ablates. --persist 0.875 hands 88% of the spectrum to the
-# infinite-memory half instead of 50%, which the checkpoint ablation asks for directly:
-# muting the persistent modes costs +2.04 nats, muting the damped half costs +0.13. The
-# damped modes converge to the cap, i.e. a memory of exactly the short head's window, and
-# duplicate a mechanism that beats them 2.3x -- so the budget is better spent elsewhere.
+# arm 2 STACKS rather than ablates, and takes the record's own recommendation rather than
+# a guessed constant. CATCHUP: "no damping: no change at L=32, +0.08 at L=512 (0.95 vs
+# 0.87 -- the damped half costs range in long copy; THE PERSISTENT FRACTION SHOULD BE
+# LEARNED, NOT FIXED AT 0.5)". --learn-persist is that: lambda = lam_max*sigmoid(a) with
+# nothing pinned, --persist only setting where the split starts, and no zero-gradient
+# region above a clamp (80-99% of damped modes sat exactly there all of round 1).
+#
+# Our d=1024 ablation says the damped half is near-dead (+0.13 muted, against the
+# persistent half's +2.04), and the d=128 record explains why it was NOT dead there: the
+# optimiser drove those modes to memories of 8-26 tokens against a window of Ls=16, so
+# they occupied a band the window did not cover, "and it paid: every class improved,
+# retrieval included (-0.126)". At L=64 they want 23-34 tokens -- entirely INSIDE the
+# window. Moving the window from 16 to 64 turned a productive band into a duplicate.
 # Free: no parameters, no state, no throughput. Single change against d1024_max.
-cell d1024_max_p875 --ff 5729 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3 --persist 0.875
+cell d1024_max_lp --ff 5729 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3 --learn-persist
 echo "##### LONG5H_D1024_Q DONE"
