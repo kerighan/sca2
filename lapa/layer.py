@@ -111,6 +111,9 @@ class LaplaceConfig:
     #   the window remembers, so the two heads overlap instead of meeting at a hard edge); lam_max*chunk <~ 60
     chunk: int = 128  # prefill chunk (also decides lam_max's safety)
     rope_base: float = 10000.0
+    rope_min_period: Optional[float] = None  # shortest period in the fast rope grid. None = 2
+    #   (historical). Set to 2*L to start the long head where the short head's exact window ends
+    #   instead of overlapping it -- see rope_grid(). Free: no parameters, no state.
     slow_frac: float = 0.0  # fraction of long-head modes reserved as SLOW integrators (periods
     #                          2T..20T at max_len T, i.e. rope base 10*max_len over that slice);
     #                          the rest is the geometric rope grid of `rope_base`. The LM keeps
@@ -136,15 +139,33 @@ def _wd(p: torch.Tensor) -> torch.dtype:
     return torch.float64 if p.dtype == torch.float64 else torch.float32
 
 
-def rope_grid(M: int, base: float, slow_frac: float = 0.0, max_len: int = 1024) -> torch.Tensor:
+def rope_grid(M: int, base: float, slow_frac: float = 0.0, max_len: int = 1024,
+              min_period: Optional[float] = None) -> torch.Tensor:
     """omega_m for the long head. slow_frac = 0: pi * base^(-m/(M-1)) (geometric, unaliased over
     2*base). slow_frac > 0: the last n_slow = round(slow_frac*M) frequencies are replaced by a
     geometric slice over periods [2*max_len, 20*max_len] -- integrators, near-constant over a
-    sequence -- and the other M - n_slow keep the base grid. Sorted decreasing, as before."""
+    sequence -- and the other M - n_slow keep the base grid. Sorted decreasing, as before.
+
+    min_period moves the FAST end of the grid. None (default, and the only setting anything has
+    been measured at) keeps the historical grid, which starts at period 2 whatever the short
+    head's window is. The observation behind the knob: every mode with period < 2L addresses a
+    lag the short head already taps EXACTLY, and that overlap grows with L -- 57 of 190 modes at
+    the d=128 campaign's Ls=16 (30%), 115 of 256 at v1's Ls=64 (45%), so raising M from 190 to
+    256 moved the modes reaching BEYOND the short window only from 133 to 141.
+
+    UNTESTED, and not obviously right. The rope grid is a positional ENCODING, not a bank of
+    independent period detectors: the high frequencies are what separate NEARBY positions, and
+    dropping them does not hand those modes to long lags for free, it coarsens resolution. At
+    min_period = 2L nothing but the single fastest mode distinguishes positions 64-128 apart.
+    Measure before believing. Note also that the damped modes and the grid's SLOW end are
+    already tied to L and to the context (lam_max = 1/L, mem_range = (L, 32L), 2*base ~ context);
+    this knob is a third tie, not a replacement for those."""
     n_slow = int(round(slow_frac * M))
     n_fast = M - n_slow
     k = torch.arange(n_fast, dtype=torch.float32)
-    fast = math.pi * base ** (-k / max(n_fast - 1, 1))
+    w_hi = math.pi if min_period is None else 2 * math.pi / min_period   # fastest mode kept
+    span = (math.pi / base) / w_hi                                       # down to period 2*base
+    fast = w_hi * span ** (k / max(n_fast - 1, 1))
     if n_slow == 0:
         return fast
     p = torch.logspace(math.log10(2 * max_len), math.log10(20 * max_len), n_slow)
@@ -192,7 +213,8 @@ class LongHead(nn.Module):
         )
         self.wr = nn.Parameter(torch.ones(M))  # spectral read weights, w = wr + i wi
         self.wi = nn.Parameter(torch.zeros(M))
-        self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len))
+        self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
+                                                cfg.rope_min_period))
         self.bproj = nn.Linear(d, 1, True)  # erase gate beta = sigmoid(bproj(z))
         nn.init.zeros_(self.bproj.weight)
         nn.init.constant_(self.bproj.bias, cfg.beta_init)

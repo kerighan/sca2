@@ -35,6 +35,7 @@ def config_from(cfg) -> LaplaceConfig:
         ff=cfg.ff,
         theta_scale=cfg.theta_scale,
         rope_base=cfg.rope_base,
+        rope_min_period=cfg.rope_min_period,
         slow_frac=cfg.slow_frac,
         max_len=cfg.max_len,
         mem_range=cfg.damp_mem,

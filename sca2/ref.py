@@ -312,6 +312,9 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    rope_min_period: float = None  # shortest period in the fast rope grid; None = 2 (historical).
+    #   2*Ls starts the long head where the short head's exact window ends instead of overlapping
+    #   it. At M=256/Ls=64 the overlap wastes 115 of 256 modes; see lapa.layer.rope_grid.
     slow_frac: float = 0.0       # fraction of modes kept as slow integrators (periods 2..20 x max_len); LM used ~1/4 of a base-1e4 grid that way
     damp_mem: tuple = None       # init memories of the damped modes; None -> (Ls, 32*Ls) (window-aligned)
     lam_max: float = None        # decay cap; None -> 1/Ls (a damped mode never forgets faster than the window remembers)
