@@ -137,6 +137,12 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    kv_gate_pc: bool = False  # PER-CHANNEL key-verification gate: ga, gb become vectors of
+    #   length 2*dv instead of scalars, so each output channel gets its own slope and bias on
+    #   the SAME evidence m. Both reference architectures gate per channel (GDN's is
+    #   silu(gp(x)) over H*dv); ours was one number for all 2*dv channels, which was never a
+    #   measured choice. Identical to the scalar gate at init (same 4.0 / 0.0), so it can only
+    #   earn its keep. 2*(2*dv) parameters -- 1024 at dv=256.
     conv: int = 0  # width of a causal depthwise conv applied to z BEFORE both heads (0 = none).
     #   Every competitive linear mixer has one -- Mamba, GDN (kernel 4 on q/k/v), LFM2 -- and
     #   this layer did not. Initialised to the identity, so at init it is exactly a no-op.
@@ -224,8 +230,10 @@ class LongHead(nn.Module):
         self.V = nn.Linear(d, dv, False)
         if self.dk:
             self.Kv = nn.Linear(d, self.dk, False)
-            self.ga = nn.Parameter(torch.tensor(4.0))   # gate slope on the cosine
-            self.gb = nn.Parameter(torch.tensor(0.0))   # bias: g = 0.5 at zero evidence
+            # 0-dim when shared (matches sca2's CHeadDeltaKV exactly), (2*dv,) when per-channel
+            sh = (2 * dv,) if cfg.kv_gate_pc else ()
+            self.ga = nn.Parameter(torch.full(sh, 4.0))  # gate slope on the cosine
+            self.gb = nn.Parameter(torch.zeros(sh))      # bias: g = 0.5 at zero evidence
         self.theta = nn.Parameter(
             torch.zeros(M)
             if cfg.theta_scale == 0.0
@@ -295,7 +303,8 @@ class LongHead(nn.Module):
         re, im = u[..., :dvi], u[..., dvi:]
         val = torch.cat([re[..., :dv], im[..., :dv]], -1)
         m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
-        return _rms(val) * torch.sigmoid(self.ga * m + self.gb)[..., None]
+        # m[..., None] broadcasts against a 0-dim ga (one gate) or a (2*dv,) ga (one per channel)
+        return _rms(val) * torch.sigmoid(self.ga * m[..., None] + self.gb)
 
     def init_state(self, B: int, device) -> State:
         # One (B, 2M, dv) block, rows [Re ; Im]. Keeping the two halves in ONE tensor is
@@ -505,7 +514,8 @@ class ShortHead(nn.Module):
         re, im = u[..., :dvi], u[..., dvi:]
         val = torch.cat([re[..., :dv], im[..., :dv]], -1)
         m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
-        return _rms(val) * torch.sigmoid(self.ga * m + self.gb)[..., None]
+        # m[..., None] broadcasts against a 0-dim ga (one gate) or a (2*dv,) ga (one per channel)
+        return _rms(val) * torch.sigmoid(self.ga * m[..., None] + self.gb)
 
     def init_state(self, B: int, device) -> State:
         n, L, wd = self.L - 1, self.L, self.wd

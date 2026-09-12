@@ -312,6 +312,7 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    kv_gate_pc: bool = False     # per-channel key-verification gate (ga, gb as 2*dv vectors)
     kv_dk: int = 0               # key-verification width for the lapa path (0 = off); sca2's
     #   cshort_damphkv hardcodes 16. See lapa.layer.LaplaceConfig.kv_dk.
     persist: float = 0.5         # fraction of long-head modes starting persistent (lambda = 0)

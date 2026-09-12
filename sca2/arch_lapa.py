@@ -40,6 +40,7 @@ def config_from(cfg) -> LaplaceConfig:
         learn_persist=cfg.learn_persist,
         conv=cfg.conv,
         kv_dk=cfg.kv_dk,
+        kv_gate_pc=cfg.kv_gate_pc,
         slow_frac=cfg.slow_frac,
         max_len=cfg.max_len,
         mem_range=cfg.damp_mem,
