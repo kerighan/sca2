@@ -336,6 +336,51 @@ long head's addressing exists for, and exactly where LapA crushed GDN at d=128 (
 0.85 vs 0.00 at L=512). Losing there at 8× the width is the signature of addressing
 that did not scale with the model, which is hypothesis (a).
 
+### theta_scale = 0.02 does not survive the move to d=1024
+
+The round-1 checkpoint says so directly. `theta` was initialised at `0.02*randn`
+(mean|theta| 0.016) and came out of 5 h at, by layer:
+
+| layer | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| mean\|theta\| | 0.058 | 0.111 | 0.157 | 0.256 | 0.268 | 0.282 | 0.231 | 0.317 |
+
+A 4x to 20x rise, monotone with depth, **against AdamW's default weight_decay of 0.01
+pulling it toward zero**. The gradient pushed on it for the whole run. `theta` sets how
+much CONTENT (`theta.K(h)`) there is against POSITION (`s.omega`) in the phase code, and
+0.02 was settled at d=128 — where `||K_m||` at init is 0.577, exactly what it is at
+d=1024, so the init never scaled with the width at all. The learned structure is sensible
+and was not available at d=128: shallow layers stay nearly positional, deep layers become
+strongly content-addressed.
+
+It also fits the shape of the failure better than capacity does. The round-1 gap is a
+CONSTANT offset — slopes −0.3454 ± 0.0141 (LapA) against −0.3321 ± 0.0155 (GDN), a
+**0.63 sigma** difference, indistinguishable, and even taken at face value that slope
+difference would need 3e5x the tokens to close 0.168 nats. A capacity ceiling would
+FLATTEN LapA's slope; it does not, and doubling the mixer moved nothing (below). A
+mis-set constant costs a fixed amount everywhere at unchanged slope, which is what is
+observed.
+
+`d1024_lapa_th02` (theta_scale 0.02 → 0.20, everything else round 1's) tests it as a
+single change. It costs nothing in parameters, state or throughput, so unlike a
+parameter-matched arm it is readable at matched tokens AND at equal wall clock.
+
+### Capacity is not the bottleneck (preliminary)
+
+`d1024_lapa_M512` doubles both M and dv (mixer 1.90M → 3.74M, state 156k → 566k). At 80M
+tokens it sat **0.0005 nats** from round 1, and its gap to GDN reproduced round 1's
++0.15..+0.22. Early, and the arm is being left to run, but if it holds: raising M further
+will not help, and the 1.44x speed advantage of the small mixer was efficiency rather
+than a capacity deficit in disguise.
+
+### The gap is smaller at equal wall clock than at matched tokens
+
+Both readings are legitimate and they are different claims (§6). At matched tokens the
+round-1 gap is +0.168; at equal wall clock — 18000 s each, which is what the protocol
+actually equalises — it is **+0.088**, because LapA's 1.28x throughput buys it 486M
+tokens against GDN's 381M. In token terms LapA needs 1.66x the data to reach GDN's loss
+but runs 1.28x faster, so it needs 1.30x the wall clock. Quote whichever, but say which.
+
 ### What is NOT answered
 
 **(a) Does M have to grow with d?** Still unmeasured, and now the question the whole
