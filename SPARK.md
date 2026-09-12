@@ -301,16 +301,53 @@ the exact tap at cosine similarity 0.999998 (min 0.999996). The caution was over
   (its two GEMMs measure 51-57 TFLOP/s, i.e. at peak). Further layer-level speedup has
   to come from the mixer or from the FFN shape, not from tuning.
 
+### THE d=1024 LM RESULT: LapA v1 is BEHIND GDN by +0.17 nats
+
+`runs/long5h_d1024.jsonl`, `long5h_d1024.sh`, 8 layers, ff 4096 on every arm, 5 h per
+arm, bf16, constant lr 5e-4, one seed. Read with `sh curves.sh`.
+
+| arm | tokens in 5 h | val | ppl | tok/s | params |
+|---|---|---|---|---|---|
+| d1024_lapa (M=256, dv=256, L=64) | 486M | 1.8319 | 6.37 | 27.0k | 116.0M |
+| d1024_gdn (8×128) | 381M | **1.7439** | **5.72** | 21.1k | 142.9M |
+
+The gap at matched tokens, interpolated, is flat across the whole range — +0.185 at
+50M, +0.206 at 150M, +0.187 at 250M, +0.155 at 350M, +0.168 at 380M. It is NOT closing;
+the −0.042/ln(tok) slope the plotter prints sits inside that jitter. **At d=128 LapA was
+0.031–0.037 nats AHEAD of GDN. The reversal is about 0.20 nats.**
+
+What it is not: not noise (4–8× the ±0.02–0.05 per-eval sd, stable over 8 interpolation
+points), not the lr (5e-4 was chosen on LapA's own probe, so if it biases anything it
+biases toward LapA), not a NaN or a short arm (both ran the full 18000 s, zero
+non-finite steps, the gradient guard never fired), not the kernel (GDN's Triton and
+naive paths agree to 4 digits in the grad norm). LapA does carry 19% fewer parameters,
+which might account for 0.03–0.05 of it — not 0.17.
+
+The diagnostic that points somewhere: the loss by token class.
+
+| | word_new | word_rep | pos first→last |
+|---|---|---|---|
+| LapA | 4.666 | **1.399** | 2.273 → 1.712 |
+| GDN | 4.542 | **1.281** | 2.186 → 1.622 |
+
+LapA is behind on both, but the bigger relative deficit is on `word_rep` — a word
+already seen inside the window, i.e. in-context retrieval. That is exactly what the
+long head's addressing exists for, and exactly where LapA crushed GDN at d=128 (copy
+0.85 vs 0.00 at L=512). Losing there at 8× the width is the signature of addressing
+that did not scale with the model, which is hypothesis (a).
+
 ### What is NOT answered
 
-**(a) Does M have to grow with d?** Untouched — still the most important question, and
-the copy sweep in §3 is still the thing to run first. Nothing here bears on it.
+**(a) Does M have to grow with d?** Still unmeasured, and now the question the whole
+thing hangs on rather than merely the first item on a list. `copy_d1024_M.sh` (queued
+behind the LM run) is §3(a)'s sweep: M in 128/256/512/1024 at d=1024, against GDN and
+GDN-2. If M=256 still copies L=512 there, the LM gap is about something else and the
+search moves elsewhere. If the cliff tracks M/d, M must scale with width, the mixer
+stops being linear in d, and the speed argument in §9 above goes with it.
 
 **(c) The FFN/mixer split**, beyond the three columns reported above at one shape.
-
-Also untouched: any LM run at d=1024. The numbers above are one layer, fwd+bwd,
-synthetic input. They say the layer is fast; they say nothing about whether it learns
-at this width.
+A parameter-matched arm (GDN's ff cut to ~2450) was never run, so 0.03–0.05 of the
+0.17 is unattributed.
 
 ### Traps found here, to add to §7
 
