@@ -194,7 +194,10 @@ class ShortLayer(SCA2Layer):
         zz = torch.cat([buf.to(z.dtype), z], 1)
         zc = F.conv1d(zz.transpose(1, 2), self.cw.to(z.dtype),
                       groups=self.cfg.d).transpose(1, 2)
-        return zc, zz[:, -(self.ck - 1):]
+        # BACK TO z's dtype. LayerNorm returns fp32 under autocast, but conv1d is an
+        # autocast-eligible op and returns bf16; letting that through hands bf16 to the
+        # long head, whose triangular solve has no bfloat16 CUDA kernel at all.
+        return zc.to(z.dtype), zz[:, -(self.ck - 1):]
 
     def prefill(self, x, state=None):
         if not getattr(self, "ck", 0):
@@ -218,7 +221,7 @@ class ShortLayer(SCA2Layer):
             return super().step(x_t, state)
         z = self.n(x_t)
         win = torch.cat([state["cbuf"].to(z.dtype), z[:, None]], 1)
-        z = (win.transpose(1, 2) * self.cw.squeeze(1).to(z.dtype)).sum(-1)
+        z = (win.transpose(1, 2) * self.cw.squeeze(1).to(z.dtype)).sum(-1).to(win.dtype)
         h = state["z_prev"]
         uc, cs = self.c.step(z, h, state["c"])
         ud, ds = self.dh.step(z, h, state["d"])

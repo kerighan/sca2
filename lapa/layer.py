@@ -627,12 +627,15 @@ class LaplaceAttention(nn.Module):
         zz = torch.cat([buf.to(z.dtype), z], 1)
         zc = F.conv1d(zz.transpose(1, 2), self.cw.to(z.dtype),
                       groups=self.cfg.d).transpose(1, 2)
-        return zc, zz[:, -(self.ck - 1):]
+        # BACK TO z's dtype: LayerNorm stays fp32 under autocast but conv1d does not, and
+        # the long head's triangular solve has no bfloat16 CUDA kernel.
+        return zc.to(z.dtype), zz[:, -(self.ck - 1):]
 
     def _conv_step(self, z_t, buf):
         """Same filter, one token. out = sum_j w_j . window_j, window = [buf ; z_t]."""
         win = torch.cat([buf.to(z_t.dtype), z_t[:, None]], 1)          # (B,ck,d)
-        return (win.transpose(1, 2) * self.cw.squeeze(1).to(z_t.dtype)).sum(-1), win[:, 1:]
+        o = (win.transpose(1, 2) * self.cw.squeeze(1).to(z_t.dtype)).sum(-1)
+        return o.to(win.dtype), win[:, 1:]
 
     def forward(self, x):
         return self.prefill(x)[0]
