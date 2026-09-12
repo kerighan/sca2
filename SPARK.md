@@ -336,6 +336,47 @@ long head's addressing exists for, and exactly where LapA crushed GDN at d=128 (
 0.85 vs 0.00 at L=512). Losing there at 8× the width is the signature of addressing
 that did not scale with the model, which is hypothesis (a).
 
+### THE DECAY CAP IS FROZEN SHUT — half the long head's spectrum is disabled
+
+Read off round 1's checkpoint, not inferred. `lam` is
+`softplus(lam_raw).clamp(max=lam_max)` with `lam_max = 1/L = 1/64`, a floor of 64 tokens
+on how fast a damped mode may forget. What the trained model ASKS for — `softplus(lam_raw)`
+read before the clamp, on the damped half:
+
+| layer | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| median memory wanted | 33.6t | 32.5t | 33.6t | 26.6t | 27.4t | 27.1t | 42.3t | 85.4t |
+| × over the cap | 1.9 | 2.0 | 1.9 | 2.4 | 2.3 | 2.4 | 1.5 | 0.7 |
+| % of damped modes AT the cap | 80 | 86 | 99 | 99 | 98 | 99 | 90 | 33 |
+
+**`clamp()` has zero gradient above its bound.** Every mode that goes over stops hearing
+the loss entirely and feels only weight decay. Half the spectrum (`persist=0.5`) sat
+disabled for the whole 5 h with no gradient path out.
+
+It accounts for the three things that did not add up:
+
+- **raising M does nothing** — the new modes get clamped identically. `d1024_lapa_M512`
+  (M and dv both doubled, state 156k → 566k) came in at a median **−0.018** nats over 19
+  interpolation points, inside the ±0.02–0.05 noise, for 1.7× the compute and 3.6× the
+  state. Cut short at 250M tokens.
+- **the gap is a CONSTANT offset at unchanged slope** (0.63 sigma between slopes) — a
+  fixed fraction of the spectrum is off from the first step to the last.
+- **only 57–183 of 256 modes carry read weight** (participation ratio of |w|²).
+
+Where it came from: `lam_max = 1/L` was introduced on 11 September so a damped mode never
+forgets faster than the short window remembers, and validated on COPY at the campaign's
+**Ls=16** — where it means a 16-token floor and 23–34 is permitted. v1 then moved the
+window to **L=64** without revisiting it, tightening the floor 4× and pushing it straight
+through the range the model wants. The rule that L, the damped modes' minimum memory and
+the rope base must stay coherent is right; this is that rule broken by the L=16 → 64 move.
+
+`d1024_lapa_lam16` tests it: `--lam-max 0.0625` (= 1/16, the campaign's effective floor),
+`mem_range` left at the aligned default, everything else round 1's. `lam_max*chunk = 8`
+against a numerical limit near 60. Worth fixing separately whatever that arm says: a hard
+`clamp` is a bad parameterisation for a bounded positive quantity, and the layer already
+contains the smooth alternative (`learn_persist` uses `lam_max*sigmoid(lam_raw)`, which
+never has zero gradient).
+
 ### theta_scale = 0.02 does not survive the move to d=1024
 
 The round-1 checkpoint says so directly. `theta` was initialised at `0.02*randn`
@@ -364,6 +405,11 @@ observed.
 `d1024_lapa_th02` (theta_scale 0.02 → 0.20, everything else round 1's) tests it as a
 single change. It costs nothing in parameters, state or throughput, so unlike a
 parameter-matched arm it is readable at matched tokens AND at equal wall clock.
+
+**But it is the weaker of the two leads, for a reason worth keeping in mind generally:
+`theta` is NOT clamped, so the model corrected it itself during round 1.** A bad init
+there costs optimisation time and may cost little final loss. The decay cap above is a
+hard constraint the model cannot escape, which is why that one is being run first.
 
 ### Capacity is not the bottleneck (preliminary)
 
