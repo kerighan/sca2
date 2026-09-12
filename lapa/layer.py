@@ -128,6 +128,15 @@ class LaplaceConfig:
         #       phases, the Gram's solve and the short head stay fp32 regardless.
     )
     beta_init: float = -2.0  # erase gate bias: sigmoid(-2) = 0.12 at init
+    kv_dk: int = 0  # KEY VERIFICATION (0 = off). The long head stores a copy of its own write
+    #   key beside the value, reads it back, and gates the output on whether it matches the
+    #   query's key: e_s = [V(z_s) ; Kv(h_s)], m_t = cos(Re key part, Kv(z_t)),
+    #   g_t = sigmoid(ga.m_t + gb), out = RMS(value part).g_t. A genuine match wrote its key
+    #   with h_s ~ z_t so the key read back agrees; a random mixture does not. It exists
+    #   because neither the query nor the read's MAGNITUDE distinguishes "found" from "not
+    #   found" -- measured, the read norms on new and repeated words are the same
+    #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
+    #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
     conv: int = 0  # width of a causal depthwise conv applied to z BEFORE both heads (0 = none).
     #   Every competitive linear mixer has one -- Mamba, GDN (kernel 4 on q/k/v), LFM2 -- and
     #   this layer did not. Initialised to the identity, so at init it is exactly a no-op.
@@ -206,9 +215,17 @@ class LongHead(nn.Module):
     def __init__(self, cfg: LaplaceConfig):
         super().__init__()
         d, M, dv = cfg.d, cfg.M, cfg.dv
+        # dv is what the head EMITS (2*dv, Re||Im); dvi is what the state carries. With key
+        # verification the state also carries the dk-wide key copy, so dvi = dv + dk.
+        self.dk = cfg.kv_dk
+        self.dvi = dv + self.dk
         self.d, self.M, self.dv, self.cfg = d, M, dv, cfg
         self.K = nn.Linear(d, M, False)
         self.V = nn.Linear(d, dv, False)
+        if self.dk:
+            self.Kv = nn.Linear(d, self.dk, False)
+            self.ga = nn.Parameter(torch.tensor(4.0))   # gate slope on the cosine
+            self.gb = nn.Parameter(torch.tensor(0.0))   # bias: g = 0.5 at zero evidence
         self.theta = nn.Parameter(
             torch.zeros(M)
             if cfg.theta_scale == 0.0
@@ -270,12 +287,22 @@ class LongHead(nn.Module):
             return torch.get_autocast_gpu_dtype()
         return self.wd
 
+    def _out(self, u, z):
+        """(..., 2*dvi) -> (..., 2*dv). Without key verification this is just the RMS read."""
+        if not self.dk:
+            return _rms(u)
+        dv, dvi = self.dv, self.dvi
+        re, im = u[..., :dvi], u[..., dvi:]
+        val = torch.cat([re[..., :dv], im[..., :dv]], -1)
+        m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
+        return _rms(val) * torch.sigmoid(self.ga * m + self.gb)[..., None]
+
     def init_state(self, B: int, device) -> State:
         # One (B, 2M, dv) block, rows [Re ; Im]. Keeping the two halves in ONE tensor is
         # what lets every read and write of the state be a single GEMM against a (., 2M)
         # code block instead of a pair -- see _batched.
         return {
-            "s": torch.zeros(B, 2 * self.M, self.dv, device=device, dtype=self.wd),
+            "s": torch.zeros(B, 2 * self.M, self.dvi, device=device, dtype=self.wd),
             "pos": torch.zeros((), device=device, dtype=self.wd),
         }
 
@@ -323,7 +350,7 @@ class LongHead(nn.Module):
     # ---- prefill: all full chunks batched, state loop only ----------------- #
     def _batched(self, kz, kh, vz, bz, st: State, K: int):
         B, T, _ = kz.shape
-        M, dv, C = self.M, self.dv, self.cfg.chunk
+        M, dv, C = self.M, self.dvi, self.cfg.chunk
         dev = kz.device
         gd = self._gemm_dtype(kz)
         with _no_autocast(dev):
@@ -395,6 +422,11 @@ class LongHead(nn.Module):
         # second d x M projection and the (B,T,d) shifted copy of z both disappear.
         kz, vz, bz = self.K(z), self.V(z), self.bproj(z)
         kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
+        if self.dk:
+            # the stored key is Kv(h_s) = Kv of the PREVIOUS token; Kv is linear, so the
+            # same shift trick as K applies and no second projection of h is needed.
+            kvz = self.Kv(z)
+            vz = torch.cat([vz, torch.cat([self.Kv(z_prev)[:, None], kvz[:, :-1]], 1)], -1)
         C = self.cfg.chunk
         K = T // C
         cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b])
@@ -409,11 +441,13 @@ class LongHead(nn.Module):
                 o, st = self._chunk(*cut(s0, s0 + C), st)
                 outs.append(o)
             o = torch.cat(outs, 1)
-        return _rms(o).to(z.dtype), st
+        return self._out(o, z).to(z.dtype), st
 
     # ---- decode: one token, all float32 ------------------------------------ #
     def step(self, z_t, h_t, state: State):
         kh, kz, vz, bz = self.K(h_t), self.K(z_t), self.V(z_t), self.bproj(z_t)
+        if self.dk:
+            vz = torch.cat([vz, self.Kv(h_t)], -1)
         with _no_autocast(z_t.device):
             M = self.M
             s0 = state["s"] * self._damp(self.lam(), 1)  # (B,2M,dv)
@@ -428,8 +462,8 @@ class LongHead(nn.Module):
             c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
             qt = torch.stack([torch.cat([c1, c2], -1),
                               torch.cat([-c2, c1], -1)], 1)  # (B,2,2M)
-            u = torch.einsum("bam,bmj->baj", qt, s).reshape(z_t.size(0), 2 * self.dv) / M
-        return _rms(u).to(z_t.dtype), {"s": s, "pos": state["pos"] + 1}
+            u = torch.einsum("bam,bmj->baj", qt, s).reshape(z_t.size(0), 2 * self.dvi) / M
+        return self._out(u, z_t).to(z_t.dtype), {"s": s, "pos": state["pos"] + 1}
 
 
 # =============================================================================
@@ -462,6 +496,16 @@ class ShortHead(nn.Module):
         if torch.is_autocast_enabled() and ref.is_cuda:
             return torch.get_autocast_gpu_dtype()
         return self.wd
+
+    def _out(self, u, z):
+        """(..., 2*dvi) -> (..., 2*dv). Without key verification this is just the RMS read."""
+        if not self.dk:
+            return _rms(u)
+        dv, dvi = self.dv, self.dvi
+        re, im = u[..., :dvi], u[..., dvi:]
+        val = torch.cat([re[..., :dv], im[..., :dv]], -1)
+        m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
+        return _rms(val) * torch.sigmoid(self.ga * m + self.gb)[..., None]
 
     def init_state(self, B: int, device) -> State:
         n, L, wd = self.L - 1, self.L, self.wd
@@ -668,7 +712,8 @@ class LaplaceAttention(nn.Module):
 
     def state_floats(self) -> int:
         cfg = self.cfg
-        return 2 * cfg.M * cfg.dv + (cfg.L - 1) * (2 * cfg.L + cfg.dv) + cfg.d
+        return (2 * cfg.M * (cfg.dv + cfg.kv_dk)
+                + (cfg.L - 1) * (2 * cfg.L + cfg.dv) + cfg.d)
 
 
 # =============================================================================

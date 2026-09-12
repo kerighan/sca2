@@ -231,6 +231,10 @@ def main(argv=None):
     # GDN head shape, for --variant gdn* (whole mixer) and hyb* (D-head slot)
     p.add_argument("--Ls", type=int, default=16, help="window of the short dft C head (--variant cshort*)")
     p.add_argument("--rope-base", type=float, default=10000.0, dest="rope_base", help="long-head rope grid base (unaliased range 2*base)")
+    p.add_argument("--kv-dk", type=int, default=0, dest="kv_dk",
+                   help="key-verification width on the lapa path (0 = off, 16 matches sca2's "
+                        "cshort_damphkv). Stores the write key beside the value and gates the "
+                        "read on whether it comes back matching the query's key.")
     p.add_argument("--persist", type=float, default=0.5,
                    help="fraction of long-head modes starting persistent (lambda = 0)")
     p.add_argument("--learn-persist", action="store_true", dest="learn_persist",
@@ -281,7 +285,7 @@ def main(argv=None):
                    gated_read=a.gated_read,
                    Ls=a.Ls, rope_base=a.rope_base, slow_frac=a.slow_frac,
                    rope_min_period=a.rope_min_period,
-                   persist=a.persist, learn_persist=a.learn_persist,
+                   persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
                    lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)
