@@ -52,7 +52,12 @@ COMMON="--data pycode_long1024_xl.pt --block 1024 --batch 8 --d 1024 --layers 8
 cell () { local label=$1; shift; echo "##### $(date +%H:%M) $label :: $*"
           python -u pretrain.py --label "$label" --seed 0 $COMMON --save runs/ck_$label "$@"; }
 
-cell d1024_max --ff 5729 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3
-# same thing without the FFN top-up, to price the parameter match separately
-cell d1024_max_ff4096 --ff 4096 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3
+cell d1024_max      --ff 5729 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3
+# arm 2 STACKS rather than ablates. --persist 0.875 hands 88% of the spectrum to the
+# infinite-memory half instead of 50%, which the checkpoint ablation asks for directly:
+# muting the persistent modes costs +2.04 nats, muting the damped half costs +0.13. The
+# damped modes converge to the cap, i.e. a memory of exactly the short head's window, and
+# duplicate a mechanism that beats them 2.3x -- so the budget is better spent elsewhere.
+# Free: no parameters, no state, no throughput. Single change against d1024_max.
+cell d1024_max_p875 --ff 5729 --kv-dk 16 --kv-gate-pc --conv 4 --beta-groups 3 --persist 0.875
 echo "##### LONG5H_D1024_Q DONE"
