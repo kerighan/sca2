@@ -137,6 +137,16 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    short_groups: int = 1  # spectral read weights of the SHORT head, per group of value
+    #   channels. 1 = one (L,) filter shared by all dv channels, which is what the layer has
+    #   always had. The taps ARE the DFT of the spectral weights (w_m = sum_n taps_n
+    #   e^{i n omega_m}), so the short head is one content-dependent L-tap FIR filter applied
+    #   identically to every value channel -- and that single shared temporal profile is the
+    #   rank bound arch_wgroup.py describes, which gets WORSE with width: one filter for
+    #   dv=56 at d=128, one for dv=256 at d=1024. G gives the pillar G profiles instead of 1,
+    #   each serving dv/G channels. Identical at init (every group starts at the same w).
+    #   NOTE: wg2 refuted this on the LONG head; the short head is where the loss actually
+    #   lives (+6.45 nats when muted, against the long head's +2.77) and has never been tried.
     beta_groups: int = 1  # erase-gate granularity. 1 = one scalar per token for ALL M modes,
     #   which is what the layer has always done -- and it is incoherent with its own design:
     #   the spectrum is deliberately heterogeneous (half persistent with infinite memory, a
@@ -524,10 +534,13 @@ class ShortHead(nn.Module):
         self.K = nn.Linear(d, L, False)
         self.V = nn.Linear(d, dv, False)
         self.theta = nn.Parameter((cfg.theta_scale or 0.02) * torch.randn(L))
-        self.wr = nn.Parameter(
-            torch.ones(L)
-        )  # w = 1: delta at lag 0 at init (o_t = V(z_t))
-        self.wi = nn.Parameter(torch.zeros(L))
+        # (L,) when shared -- the shape sca2's mirror uses, so the float64 gate still loads --
+        # and (L, G) when grouped. w = 1: delta at lag 0 at init (o_t = V(z_t)).
+        self.G = max(1, cfg.short_groups)
+        assert dv % self.G == 0, f"dv={dv} must divide by short_groups={self.G}"
+        sh = (L,) if self.G == 1 else (L, self.G)
+        self.wr = nn.Parameter(torch.ones(sh))
+        self.wi = nn.Parameter(torch.zeros(sh))
         # built in float64: 2*pi/L rounded in float32 breaks the comb's exact cancellation
         self.register_buffer(
             "omega", (torch.arange(L, dtype=torch.float64) * (2 * math.pi / L)).float()
@@ -578,22 +591,25 @@ class ShortHead(nn.Module):
 
     def _read(self, cq, sq, cw, sw, e):
         """Re/Im kappa(t,s) over the window via two folded read vectors, then contract with e."""
-        c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
-        k_re = (
-            torch.einsum("btwl,btl->btw", cw, c1)
-            + torch.einsum("btwl,btl->btw", sw, c2)
-        ) / self.L
-        k_im = (
-            torch.einsum("btwl,btl->btw", sw, c1)
-            - torch.einsum("btwl,btl->btw", cw, c2)
-        ) / self.L
-        return torch.cat(
-            [
-                torch.einsum("btw,btwj->btj", k_re, e),
-                torch.einsum("btw,btwj->btj", k_im, e),
-            ],
-            -1,
-        )
+        if self.G == 1:
+            c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
+            k_re = (torch.einsum("btwl,btl->btw", cw, c1)
+                    + torch.einsum("btwl,btl->btw", sw, c2)) / self.L
+            k_im = (torch.einsum("btwl,btl->btw", sw, c1)
+                    - torch.einsum("btwl,btl->btw", cw, c2)) / self.L
+            return torch.cat([torch.einsum("btw,btwj->btj", k_re, e),
+                              torch.einsum("btw,btwj->btj", k_im, e)], -1)
+        G, dv = self.G, self.dv
+        c1 = self.wr * cq[..., None] + self.wi * sq[..., None]                      # (B,T,L,G)
+        c2 = self.wr * sq[..., None] - self.wi * cq[..., None]
+        k_re = (torch.einsum("btwl,btlg->btwg", cw, c1)
+                + torch.einsum("btwl,btlg->btwg", sw, c2)) / self.L                 # (B,T,W,G)
+        k_im = (torch.einsum("btwl,btlg->btwg", sw, c1)
+                - torch.einsum("btwl,btlg->btwg", cw, c2)) / self.L
+        eg = e.view(*e.shape[:-1], G, dv // G)                                      # (B,T,W,G,dv/G)
+        re = torch.einsum("btwg,btwgj->btgj", k_re, eg).reshape(*e.shape[:2], dv)
+        im = torch.einsum("btwg,btwgj->btgj", k_im, eg).reshape(*e.shape[:2], dv)
+        return torch.cat([re, im], -1)
 
     def prefill(self, z, z_prev, state: Optional[State] = None):
         """z (B,T,d); z_prev (B,d) is the token before z[:,0] (see LongHead.prefill)."""
@@ -639,20 +655,36 @@ class ShortHead(nn.Module):
         if pad:                                                   # ragged tail: pad queries and keys
             cq, sq = F.pad(cq, (0, 0, 0, pad)), F.pad(sq, (0, 0, 0, pad))
             cw, sw, e = F.pad(cw, (0, 0, 0, pad)), F.pad(sw, (0, 0, 0, pad)), F.pad(e, (0, 0, 0, pad))
-        c1 = (self.wr * cq + self.wi * sq).to(gd)                 # (B,KC,L)
-        c2 = (self.wr * sq - self.wi * cq).to(gd)
-        Fq = torch.cat([torch.cat([c1, c2], -1).view(B, K, C, 2 * L),
-                        torch.cat([-c2, c1], -1).view(B, K, C, 2 * L)], 2)          # (B,K,2C,2L)
-        Fk = torch.cat([cw, sw], -1).to(gd)                                         # (B,KC+L-1,2L)
         N = C + L - 1
+        Fk = torch.cat([cw, sw], -1).to(gd)                                         # (B,KC+L-1,2L)
         Fk = Fk.unfold(1, N, C).movedim(-1, 2)                                      # (B,K,N,2L)
         ek = e.to(gd).unfold(1, N, C).movedim(-1, 2)                                # (B,K,N,dv)
-        S = Fq @ Fk.transpose(-1, -2) / L                                           # (B,K,2C,N)
         i = torch.arange(C, device=cq.device)[:, None]
         j = torch.arange(N, device=cq.device)[None]
         band = ((j - i) >= 0) & ((j - i) <= L - 1)                                  # (C,N)
-        S = S.masked_fill(~torch.cat([band, band], 0)[None, None], 0)
-        o = (S @ ek).to(self.wd)                                                    # (B,K,2C,dv)
+        band2 = ~torch.cat([band, band], 0)      # True OUTSIDE the band: what gets zeroed
+        G, dv = self.G, self.dv
+        if G == 1:
+            c1 = (self.wr * cq + self.wi * sq).to(gd)                               # (B,KC,L)
+            c2 = (self.wr * sq - self.wi * cq).to(gd)
+            Fq = torch.cat([torch.cat([c1, c2], -1).view(B, K, C, 2 * L),
+                            torch.cat([-c2, c1], -1).view(B, K, C, 2 * L)], 2)      # (B,K,2C,2L)
+            S = (Fq @ Fk.transpose(-1, -2) / L).masked_fill(band2[None, None], 0)
+            o = (S @ ek).to(self.wd)                                                # (B,K,2C,dv)
+        else:
+            # one spectral mixture per group of value channels: G kernels instead of one.
+            # The state, the phases and the write path are untouched and shared.
+            cqg, sqg = cq[..., None], sq[..., None]                                 # (B,KC,L,1)
+            c1 = (self.wr * cqg + self.wi * sqg).to(gd)                             # (B,KC,L,G)
+            c2 = (self.wr * sqg - self.wi * cqg).to(gd)
+            f1 = torch.cat([c1, c2], 2).view(B, K, C, 2 * L, G)
+            f2 = torch.cat([-c2, c1], 2).view(B, K, C, 2 * L, G)
+            Fq = torch.cat([f1, f2], 2).permute(0, 1, 4, 2, 3)                      # (B,K,G,2C,2L)
+            S = (Fq @ Fk.transpose(-1, -2)[:, :, None] / L).masked_fill(
+                band2[None, None, None], 0)                                         # (B,K,G,2C,N)
+            ekg = ek.view(B, K, N, G, dv // G).permute(0, 1, 3, 2, 4)               # (B,K,G,N,dv/G)
+            o = (S @ ekg).to(self.wd)                                               # (B,K,G,2C,dv/G)
+            o = o.permute(0, 1, 3, 2, 4).reshape(B, K, 2 * C, dv)
         o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * self.dv)
         return o[:, :T]
 

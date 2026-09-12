@@ -312,6 +312,10 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    short_groups: int = 1        # spectral read weights of the SHORT head, per group of value
+    #   channels (lapa path). 1 = one shared L-tap filter for all dv channels. See
+    #   lapa.layer.LaplaceConfig.short_groups -- wg2 refuted this on the LONG head, the short
+    #   head is where the loss lives and has never been tried.
     beta_groups: int = 1         # erase-gate granularity on the lapa path; 3 = per spectral
     #   band (slow integrators / persistent-fast / damped). See lapa.layer.LaplaceConfig.
     kv_gate_pc: bool = False     # per-channel key-verification gate (ga, gb as 2*dv vectors)
