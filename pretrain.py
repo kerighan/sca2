@@ -235,6 +235,9 @@ def main(argv=None):
                    help="key-verification width on the lapa path (0 = off, 16 matches sca2's "
                         "cshort_damphkv). Stores the write key beside the value and gates the "
                         "read on whether it comes back matching the query's key.")
+    p.add_argument("--long-groups", type=int, default=1, dest="long_groups",
+                   help="spectral read weights of the LONG head, per group of value "
+                        "channels. This is wg2's experiment, which lost at d=128.")
     p.add_argument("--short-groups", type=int, default=1, dest="short_groups",
                    help="spectral read weights of the SHORT head, per group of value channels. "
                         "1 = one L-tap filter shared by all dv channels (historical); G gives "
@@ -298,7 +301,7 @@ def main(argv=None):
                    rope_min_period=a.rope_min_period,
                    persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
-                   short_groups=a.short_groups,
+                   short_groups=a.short_groups, long_groups=a.long_groups,
                    lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

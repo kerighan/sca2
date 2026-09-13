@@ -137,6 +137,14 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    long_groups: int = 1  # same idea on the LONG head: its wr/wi are (M,), one temporal
+    #   profile shared by every value channel. G gives it G profiles, group g reading value
+    #   channels [g.dvi/G, (g+1).dvi/G). This IS what wg2 tested and lost (+0.065 at d=128,
+    #   G=2, generation 2: "the rank-2 bound is real but is NOT the binding constraint"), so
+    #   the prior is against it; retried only because the bound scales with dv (one filter
+    #   for dv=56 there, 256 here) and the base has changed completely. With key
+    #   verification on, the dk-wide key copy lands in the LAST group, so the gate's
+    #   evidence is read through that group's kernel.
     short_groups: int = 1  # spectral read weights of the SHORT head, per group of value
     #   channels. 1 = one (L,) filter shared by all dv channels, which is what the layer has
     #   always had. The taps ARE the DFT of the spectral weights (w_m = sum_n taps_n
@@ -257,8 +265,14 @@ class LongHead(nn.Module):
             if cfg.theta_scale == 0.0
             else cfg.theta_scale * torch.randn(M)
         )
-        self.wr = nn.Parameter(torch.ones(M))  # spectral read weights, w = wr + i wi
-        self.wi = nn.Parameter(torch.zeros(M))
+        # (M,) when shared -- the shape sca2's mirror uses, so the float64 gate still loads --
+        # and (M, NG) when grouped.
+        self.NG = max(1, cfg.long_groups)
+        assert self.dvi % self.NG == 0, \
+            f"dv+kv_dk={self.dvi} must divide by long_groups={self.NG}"
+        wsh = (M,) if self.NG == 1 else (M, self.NG)
+        self.wr = nn.Parameter(torch.ones(wsh))  # spectral read weights, w = wr + i wi
+        self.wi = nn.Parameter(torch.zeros(wsh))
         self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
                                                 cfg.rope_min_period))
         self.bg = max(1, cfg.beta_groups)
@@ -374,10 +388,18 @@ class LongHead(nn.Module):
             cw, sw, cq, sq = pw.cos(), pw.sin(), pq.cos(), pq.sin()
             Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)  # (B,T,2M) keys
             Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,T,2M) Gram lhs / read-back
-            c1 = (self.wr * cq + self.wi * sq) * gq
-            c2 = (self.wr * sq - self.wi * cq) * gq
-            Fq = torch.cat([torch.cat([c1, c2], -1),
-                            torch.cat([-c2, c1], -1)], 1).to(gd)  # (B,2T,2M) queries
+            if self.NG == 1:
+                c1 = (self.wr * cq + self.wi * sq) * gq
+                c2 = (self.wr * sq - self.wi * cq) * gq
+                Fq = torch.cat([torch.cat([c1, c2], -1),
+                                torch.cat([-c2, c1], -1)], 1).to(gd)  # (B,2T,2M)
+            else:
+                cg, sg_, gg = cq[..., None], sq[..., None], gq[..., None]
+                c1 = (self.wr * cg + self.wi * sg_) * gg               # (B,T,M,NG)
+                c2 = (self.wr * sg_ - self.wi * cg) * gg
+                f1 = torch.cat([c1, c2], 2).view(B, T, 2 * M, self.NG)
+                f2 = torch.cat([-c2, c1], 2).view(B, T, 2 * M, self.NG)
+                Fq = torch.cat([f1, f2], 1).permute(0, 3, 1, 2).to(gd)  # (B,NG,2T,2M)
             s0 = (st["s"] * self._damp(lam, 1)).to(gd)  # damped incoming state
             # The erase gate folds into the QUERY-side codes. beta multiplies the read-back
             # inside the sum over modes, so a per-mode beta is a per-mode scale on Qk -- the
@@ -393,9 +415,17 @@ class LongHead(nn.Module):
                 upper=False, unitriangular=True
             )
             ec = e.to(gd)
-            K2 = (Fq @ Kk.transpose(1, 2)).masked_fill(
-                _causal_mask(T, dev).repeat(2, 1)[None], 0)  # (B,2T,T) [Re;Im]
-            o = (K2 @ ec + Fq @ s0).to(self.wd)  # (B,2T,dv) kernel + state read
+            Kkt = Kk.transpose(1, 2) if self.NG == 1 else Kk.transpose(1, 2)[:, None]
+            K2 = (Fq @ Kkt).masked_fill(
+                _causal_mask(T, dev).repeat(2, 1)[None], 0)  # (B,[NG,]2T,T) [Re;Im]
+            if self.NG == 1:
+                o = (K2 @ ec + Fq @ s0).to(self.wd)  # (B,2T,dvi)
+            else:
+                NG, w_ = self.NG, self.dvi // self.NG
+                ecg = ec.view(B, T, NG, w_).transpose(1, 2)          # (B,NG,T,w)
+                s0g = s0.view(B, 2 * M, NG, w_).transpose(1, 2)      # (B,NG,2M,w)
+                og = (K2 @ ecg + Fq @ s0g).to(self.wd)               # (B,NG,2T,w)
+                o = og.transpose(1, 2).reshape(B, 2 * T, self.dvi)
             o = torch.cat([o[:, :T], o[:, T:]], -1) / M  # (B,T,2dv) = Re || Im
             sn = st["s"] * self._damp(lam, T) + (
                 Kk.transpose(1, 2) @ ec).to(self.wd) * gT_2
@@ -434,10 +464,18 @@ class LongHead(nn.Module):
             Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,K,C,2M) Gram lhs / read-back
             if self.bg > 1:  # per-mode erase gate: a scale on the query-side codes
                 Qk = Qk * torch.cat([beta, beta], -1).to(gd)
-            c1 = (self.wr * cq + self.wi * sq) * gq
-            c2 = (self.wr * sq - self.wi * cq) * gq
-            Fq = torch.cat([torch.cat([c1, c2], -1),
-                            torch.cat([-c2, c1], -1)], 2).to(gd)  # (B,K,2C,2M) queries
+            if self.NG == 1:
+                c1 = (self.wr * cq + self.wi * sq) * gq
+                c2 = (self.wr * sq - self.wi * cq) * gq
+                Fq = torch.cat([torch.cat([c1, c2], -1),
+                                torch.cat([-c2, c1], -1)], 2).to(gd)  # (B,K,2C,2M)
+            else:
+                cg, sg_, gg = cq[..., None], sq[..., None], gq[..., None]
+                c1 = (self.wr * cg + self.wi * sg_) * gg              # (B,K,C,M,NG)
+                c2 = (self.wr * sg_ - self.wi * cg) * gg
+                f1 = torch.cat([c1, c2], 3).view(B, K, C, 2 * M, self.NG)
+                f2 = torch.cat([-c2, c1], 3).view(B, K, C, 2 * M, self.NG)
+                Fq = torch.cat([f1, f2], 2).permute(0, 1, 4, 2, 3).to(gd)  # (B,K,NG,2C,2M)
             G = (Qk @ Kk.transpose(-1, -2)).to(self.wd) / M
             eye = torch.eye(C, device=dev, dtype=self.wd)
             W = torch.linalg.solve_triangular(
@@ -449,8 +487,9 @@ class LongHead(nn.Module):
             # K2 = Fq Kk^T in one GEMM: [c1|c2] Kk^T is the real part and [-c2|c1] Kk^T
             # the imaginary one, so the (2C,C) block comes out already stacked [Re ; Im]
             # -- the same layout the state read below produces, so the two just add.
-            K2 = (Fq @ Kk.transpose(-1, -2)).masked_fill(
-                _causal_mask(C, dev).repeat(2, 1)[None, None], 0)  # (B,K,2C,C)
+            Kkt = Kk.transpose(-1, -2) if self.NG == 1 else Kk.transpose(-1, -2)[:, :, None]
+            K2 = (Fq @ Kkt).masked_fill(
+                _causal_mask(C, dev).repeat(2, 1)[None, None], 0)  # (B,K,[NG,]2C,C)
             d1_2, dC_2, gT_2 = (x.repeat(2, 1) for x in (d1, dC, gT))
         Fq, W, v, beta, K2, Kk, Qk = (
             x.unbind(1) for x in (Fq, W, v, beta, K2, Kk, Qk)
@@ -463,7 +502,14 @@ class LongHead(nn.Module):
                 r = (Qk[k] @ s0).to(self.wd) / M
                 e = W[k] @ (v[k] - (r if self.bg > 1 else beta[k] * r))  # delta-rule solve
                 ec = e.to(gd)
-                outs.append((K2[k] @ ec + Fq[k] @ s0).to(self.wd))  # (B,2C,dv) [Re;Im]
+                if self.NG == 1:
+                    outs.append((K2[k] @ ec + Fq[k] @ s0).to(self.wd))  # (B,2C,dvi) [Re;Im]
+                else:
+                    NG, w_ = self.NG, self.dvi // self.NG
+                    ecg = ec.view(B, C, NG, w_).transpose(1, 2)          # (B,NG,C,w)
+                    s0g = s0.view(B, 2 * M, NG, w_).transpose(1, 2)      # (B,NG,2M,w)
+                    og = (K2[k] @ ecg + Fq[k] @ s0g).to(self.wd)         # (B,NG,2C,w)
+                    outs.append(og.transpose(1, 2).reshape(B, 2 * C, self.dvi))
                 s = s * dC_2 + (Kk[k].transpose(-1, -2) @ ec).to(self.wd) * gT_2
         o = torch.stack(outs, 1)  # (B,K,2C,dv)
         o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * dv) / M
@@ -516,10 +562,23 @@ class LongHead(nn.Module):
             e = vz.to(self.wd) - (vhat if self.bg > 1 else beta * vhat)
             s = torch.addcmul(s0, e[:, None, :], kt[:, :, None])
             cq, sq = pq.cos(), pq.sin()
-            c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
-            qt = torch.stack([torch.cat([c1, c2], -1),
-                              torch.cat([-c2, c1], -1)], 1)  # (B,2,2M)
-            u = torch.einsum("bam,bmj->baj", qt, s).reshape(z_t.size(0), 2 * self.dvi) / M
+            if self.NG == 1:
+                c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
+            else:
+                cg, sg_ = cq[..., None], sq[..., None]               # (B,M,1)
+                c1 = self.wr * cg + self.wi * sg_                     # (B,M,NG)
+                c2 = self.wr * sg_ - self.wi * cg
+            B_ = z_t.size(0)
+            if self.NG == 1:
+                qt = torch.stack([torch.cat([c1, c2], -1),
+                                  torch.cat([-c2, c1], -1)], 1)  # (B,2,2M)
+                u = torch.einsum("bam,bmj->baj", qt, s).reshape(B_, 2 * self.dvi) / M
+            else:
+                NG, w_ = self.NG, self.dvi // self.NG
+                qt = torch.stack([torch.cat([c1, c2], 1),
+                                  torch.cat([-c2, c1], 1)], 1)      # (B,2,2M,NG)
+                sg = s.view(B_, 2 * self.M, NG, w_)                 # (B,2M,NG,w)
+                u = torch.einsum("bamg,bmgj->bagj", qt, sg).reshape(B_, 2 * self.dvi) / M
         return self._out(u, z_t).to(z_t.dtype), {"s": s, "pos": state["pos"] + 1}
 
 
