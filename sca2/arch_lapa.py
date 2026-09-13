@@ -40,6 +40,7 @@ def config_from(cfg) -> LaplaceConfig:
         learn_persist=cfg.learn_persist,
         conv=cfg.conv,
         conv_silu=cfg.conv_silu,
+        beta_init=cfg.beta_init,
         kv_dk=cfg.kv_dk,
         kv_gate_pc=cfg.kv_gate_pc,
         beta_groups=cfg.beta_groups,
