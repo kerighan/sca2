@@ -137,6 +137,10 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    conv_silu: bool = False  # SiLU after the causal conv, as GDN does on its q/k/v convs
+    #   (F.silu(F.conv1d(...))). Ours was a purely LINEAR convolution, so the whole path from
+    #   z to the residual was linear apart from the FFN. Note this breaks identity-at-init:
+    #   at init the conv is the identity, so the layer starts from silu(z) rather than z.
     long_groups: int = 1  # same idea on the LONG head: its wr/wi are (M,), one temporal
     #   profile shared by every value channel. G gives it G profiles, group g reading value
     #   channels [g.dvi/G, (g+1).dvi/G). This IS what wg2 tested and lost (+0.065 at d=128,
@@ -817,12 +821,14 @@ class LaplaceAttention(nn.Module):
                       groups=self.cfg.d).transpose(1, 2)
         # BACK TO z's dtype: LayerNorm stays fp32 under autocast but conv1d does not, and
         # the long head's triangular solve has no bfloat16 CUDA kernel.
+        zc = F.silu(zc) if self.cfg.conv_silu else zc
         return zc.to(z.dtype), zz[:, -(self.ck - 1):]
 
     def _conv_step(self, z_t, buf):
         """Same filter, one token. out = sum_j w_j . window_j, window = [buf ; z_t]."""
         win = torch.cat([buf.to(z_t.dtype), z_t[:, None]], 1)          # (B,ck,d)
         o = (win.transpose(1, 2) * self.cw.squeeze(1).to(z_t.dtype)).sum(-1)
+        o = F.silu(o) if self.cfg.conv_silu else o
         return o.to(win.dtype), win[:, 1:]
 
     def forward(self, x):
