@@ -235,6 +235,10 @@ def main(argv=None):
                    help="key-verification width on the lapa path (0 = off, 16 matches sca2's "
                         "cshort_damphkv). Stores the write key beside the value and gates the "
                         "read on whether it comes back matching the query's key.")
+    p.add_argument("--layer-scale", action="store_true", dest="layer_scale",
+                   help="learned gain on each residual branch, init 1 (LayerScale). The "
+                        "residual stream grows 29x across 10 layers while each branch emits "
+                        "a constant norm, so deep layers' relative contribution collapses.")
     p.add_argument("--decay-input", action="store_true", dest="decay_input",
                    help="data-dependent forgetting: lam = lam_max*sigmoid(a_m + Wd(z)_m), a "
                         "function of the token, instead of a constant per mode. GDN's decay "
@@ -313,6 +317,7 @@ def main(argv=None):
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    short_groups=a.short_groups, long_groups=a.long_groups,
                    conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input,
+                   layer_scale=a.layer_scale,
                    lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

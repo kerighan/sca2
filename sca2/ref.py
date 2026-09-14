@@ -312,6 +312,7 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    layer_scale: bool = False    # learned gain on each residual branch (lapa path), init 1
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
     beta_init: float = -2.0      # erase-gate bias: sigmoid(-2) = 0.12 at init. GDN's b has

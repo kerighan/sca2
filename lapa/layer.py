@@ -137,6 +137,18 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    layer_scale: bool = False  # a learned gain on each RESIDUAL BRANCH (LayerScale), init 1.
+    #   Measured on the trained 10-layer model: the residual stream grows 29x from layer 0 to
+    #   layer 9 (||x|| 25.8 -> 759.4) while each branch emits a roughly CONSTANT norm
+    #   (130-216), because the LayerNorm at the head of the branch erases the stream's scale.
+    #   So the relative contribution collapses -- layer 0 moves the stream by 785%, layer 8 by
+    #   19% -- and the per-layer ablation shows the same collapse in loss terms (+1.59 vs
+    #   +0.013). The gradient does NOT vanish: it decays only 3x across the stack, which AdamW
+    #   largely absorbs. In principle mix could grow its own weights to compensate and this is
+    #   redundant; in practice giving the scale its own parameter and its own gradient, rather
+    #   than leaving it entangled in a 4dv x d matrix, is what LayerScale does and it is known
+    #   to help deep stacks. 2 parameters per layer. If it changes nothing, the deep layers
+    #   genuinely have nothing to say.
     decay_input: bool = False  # DATA-DEPENDENT forgetting. lam becomes lam_max*sigmoid(a_m +
     #   Wd(z_t)_m), a function of the token, instead of a constant per mode. GDN's decay is
     #   g_t = -exp(A_log)*softplus(a(x_t)+dt_bias) and ablates at +1.08 nats there; ours is
@@ -851,6 +863,9 @@ class LaplaceAttention(nn.Module):
         self.mix = nn.Linear(4 * dv, d)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
+        if cfg.layer_scale:   # init 1: identical to no scaling at the first step
+            self.gs_mix = nn.Parameter(torch.ones(()))
+            self.gs_ff = nn.Parameter(torch.ones(()))
         self.ck = cfg.conv
         if self.ck:
             w = torch.zeros(d, 1, self.ck)
@@ -898,8 +913,12 @@ class LaplaceAttention(nn.Module):
         zp = st["z_prev"].to(z.dtype)
         ul, sl = self.long.prefill(z, zp, st["long"])
         us, ss = self.short.prefill(z, zp, st["short"])
-        x = x + self.mix(torch.cat([ul, us], -1))
-        x = x + self.ff(self.fn(x))
+        if self.cfg.layer_scale:
+            x = x + self.gs_mix * self.mix(torch.cat([ul, us], -1))
+            x = x + self.gs_ff * self.ff(self.fn(x))
+        else:
+            x = x + self.mix(torch.cat([ul, us], -1))
+            x = x + self.ff(self.fn(x))
         return x, {**new, "long": sl, "short": ss, "z_prev": z[:, -1]}
 
     def step(self, x_t, state: State):
@@ -910,8 +929,12 @@ class LaplaceAttention(nn.Module):
         h = state["z_prev"].to(z.dtype)
         ul, sl = self.long.step(z, h, state["long"])
         us, ss = self.short.step(z, h, state["short"])
-        y = x_t + self.mix(torch.cat([ul, us], -1))
-        y = y + self.ff(self.fn(y))
+        if self.cfg.layer_scale:
+            y = x_t + self.gs_mix * self.mix(torch.cat([ul, us], -1))
+            y = y + self.gs_ff * self.ff(self.fn(y))
+        else:
+            y = x_t + self.mix(torch.cat([ul, us], -1))
+            y = y + self.ff(self.fn(y))
         return y, {**new, "long": sl, "short": ss, "z_prev": z}
 
     def state_floats(self) -> int:
