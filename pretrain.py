@@ -102,7 +102,20 @@ def evaluate(m, val, B, T, device, nb=25, buckets=0, cls_tab=None):
     return sum(ls) / len(ls), prof, cls
 
 
-def run(name, m, tr, va, a, device, log):
+def _write_ckpt(m, name, a, V):
+    """Checkpoint to the SAME path the final save uses, so the end of the arm overwrites
+    it and no stale file is left behind. Written to a temp path and os.replace'd, so a
+    kill during the write cannot leave a truncated checkpoint."""
+    import os
+    inner = getattr(m, "_orig_mod", m)
+    dst = f"{a.save}.{name.lower()}.pt"
+    tmp = dst + ".tmp"
+    torch.save({"model": inner.state_dict(), "cfg": vars(a), "V": V}, tmp)
+    os.replace(tmp, dst)
+    return dst
+
+
+def run(name, m, tr, va, a, device, log, V=None):
     m.to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr)
     n_train = len(tr)
@@ -128,6 +141,7 @@ def run(name, m, tr, va, a, device, log):
     torch.cuda.synchronize()
 
     spent, step, seen, nxt = 0.0, 0, 0, 0.0
+    nxt_save = a.save_every if (a.save and a.save_every and V is not None) else float("inf")
     while spent < a.seconds:
         try:
             x, y = next(it)
@@ -179,6 +193,13 @@ def run(name, m, tr, va, a, device, log):
                   flush=True)
             log.write(json.dumps(rec) + "\n"); log.flush()
             nxt = spent + a.eval_every
+            if spent >= nxt_save:
+                # mid-run checkpoint: lets the arm be inspected (or salvaged after a kill)
+                # without waiting 5 h. Same path as the final save, so it is overwritten
+                # rather than accumulated. Outside the timed region, so tok_s is unaffected.
+                print(f"  checkpoint {_write_ckpt(m, name, a, V)} "
+                      f"(t={spent:.0f}s, {seen/1e6:.1f}M tok)", flush=True)
+                nxt_save = spent + a.save_every
     return m
 
 
@@ -212,6 +233,12 @@ def main(argv=None):
     p.add_argument("--log", default="runs/pretrain.jsonl")
     p.add_argument("--samples", type=int, default=3)
     p.add_argument("--save", default=None)
+    p.add_argument("--save-every", type=float, default=3600.0, dest="save_every",
+                   help="seconds of TRAINING time between mid-run checkpoints (default "
+                        "3600, so 5 per 5h arm; 0 disables). Written to the same path as "
+                        "the final save, atomically, so the end of the arm overwrites it "
+                        "and nothing stale is left behind. An arm can then be inspected, "
+                        "or salvaged after a kill, without waiting for it to finish.")
     p.add_argument("--label", default=None, help="name this arm in the log")
     # init seed. The batch ORDER is deterministic either way (batches() is
     # sequential), so repeats vary only in initialisation -- which is what the
@@ -279,7 +306,7 @@ def main(argv=None):
                         "fp32 safety ceiling (--lam-ceil, default 55/chunk = 0.43, a memory "
                         "floor of 2.3 tokens). Replaces softplus(a).clamp(max=lam_max) with a "
                         "hard pin, whose realised spectrum on the trained d=1024 checkpoint is "
-                        "TWO POINTS: 41-100% of each layer's free modes sit exactly at the "
+                        "TWO POINTS: 41-100%% of each layer's free modes sit exactly at the "
                         "clamp, where the gradient is zero and no mode ever escapes, and the "
                         "rest are pinned at 0. Use with a WIDE --damp-mem (GDN's measured span "
                         "is 2.5 .. 5.8e6 tokens). --persist is ignored.")
@@ -338,7 +365,7 @@ def main(argv=None):
         torch.manual_seed(a.seed)
         nm = a.label or "SCA2"
         models[nm] = run(nm, SCA2(V, cfg, a.variant, device, a.layers),
-                         tr, va, a, device, log)
+                         tr, va, a, device, log, V)
     if a.only != "sca2":
         torch.manual_seed(a.seed)
         trf = Transformer(V, a.d, 4, a.trf_ff, a.block, a.layers).to(device)
@@ -350,14 +377,11 @@ def main(argv=None):
             blocks = trf.blocks
             trf = torch.compile(trf, dynamic=False)
             trf.core_params = lambda: sum(p.numel() for p in blocks.parameters())
-        models["Transformer"] = run("Transformer", trf, tr, va, a, device, log)
+        models["Transformer"] = run("Transformer", trf, tr, va, a, device, log, V)
     log.close()
     if a.save:
         for name, m in models.items():
-            inner = getattr(m, "_orig_mod", m)
-            torch.save({"model": inner.state_dict(), "cfg": vars(a), "V": V},
-                       f"{a.save}.{name.lower()}.pt")
-            print(f"saved {a.save}.{name.lower()}.pt", flush=True)
+            print(f"saved {_write_ckpt(m, name, a, V)}", flush=True)
 
     if a.samples:
         from tokenizers import ByteLevelBPETokenizer
