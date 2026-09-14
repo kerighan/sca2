@@ -137,6 +137,14 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
+    decay_input: bool = False  # DATA-DEPENDENT forgetting. lam becomes lam_max*sigmoid(a_m +
+    #   Wd(z_t)_m), a function of the token, instead of a constant per mode. GDN's decay is
+    #   g_t = -exp(A_log)*softplus(a(x_t)+dt_bias) and ablates at +1.08 nats there; ours is
+    #   frozen after training. The chunked closed form survives: with C_t = sum_{u<=t} lam_u,
+    #   decay(t,s) = exp(-(C_t - C_s)), so the ramps become a CUMSUM along the chunk instead
+    #   of lam*idx and the factorisation gw_s = exp(C_s), gq_t = exp(-C_t) is unchanged.
+    #   Costs d*M parameters and one (B,T,M) tensor. Wd starts at zero, so at init this is
+    #   exactly the learn_persist parameterisation (smooth, no clamp, no dead zone).
     conv_silu: bool = False  # SiLU after the causal conv, as GDN does on its q/k/v convs
     #   (F.silu(F.conv1d(...))). Ours was a purely LINEAR convolution, so the whole path from
     #   z to the residual was linear apart from the FFN. Note this breaks identity-at-init:
@@ -279,6 +287,9 @@ class LongHead(nn.Module):
         self.wi = nn.Parameter(torch.zeros(wsh))
         self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
                                                 cfg.rope_min_period))
+        if cfg.decay_input:
+            self.lam_proj = nn.Linear(d, M, False)
+            nn.init.zeros_(self.lam_proj.weight)   # at init: identical to learn_persist
         self.bg = max(1, cfg.beta_groups)
         self.bproj = nn.Linear(d, self.bg, True)  # erase gate beta = sigmoid(bproj(z))
         nn.init.zeros_(self.bproj.weight)
@@ -322,6 +333,10 @@ class LongHead(nn.Module):
     @property
     def wd(self) -> torch.dtype:
         return _wd(self.wr)
+
+    def lam_t(self, lz):
+        """(...,M) per-token decay in (0, lam_max) from the ALREADY-PROJECTED lam_proj(z)."""
+        return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd) + lz.to(self.wd))
 
     def lam(self) -> torch.Tensor:
         if self.cfg.learn_persist:
@@ -377,16 +392,22 @@ class LongHead(nn.Module):
         return torch.exp(-lam * n)[:, None].repeat(2, 1)
 
     # ---- prefill: one chunk against an incoming state ---------------------- #
-    def _chunk(self, kz, kh, vz, bz, st: State):
+    def _chunk(self, kz, kh, vz, bz, lz, st: State):
         B, T, _ = kz.shape
         M = self.M
         dev = kz.device
         gd = self._gemm_dtype(kz)
         with _no_autocast(dev):
+            di = self.cfg.decay_input
             lam = self.lam()
             idx = torch.arange(T, device=dev, dtype=self.wd)[:, None]
-            gw, gq = torch.exp(lam * idx), torch.exp(-lam * idx)  # (T,M)
-            gT_2 = torch.exp(-lam * (T - 1))[:, None].repeat(2, 1)
+            if di:
+                Ct = self.lam_t(lz).cumsum(1)                      # (B,T,M) inclusive
+                gw, gq = torch.exp(Ct), torch.exp(-Ct)
+                dT_2 = torch.cat([torch.exp(-Ct[:, -1:]), torch.exp(-Ct[:, -1:])], -1)[:, 0]
+            else:
+                gw, gq = torch.exp(lam * idx), torch.exp(-lam * idx)  # (T,M)
+            gT_2 = torch.exp(-lam * (T - 1))[:, None].repeat(2, 1) if not self.cfg.decay_input else None
             p = idx + st["pos"]
             pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,T,M) fp32
             cw, sw, cq, sq = pw.cos(), pw.sin(), pq.cos(), pq.sin()
@@ -404,7 +425,7 @@ class LongHead(nn.Module):
                 f1 = torch.cat([c1, c2], 2).view(B, T, 2 * M, self.NG)
                 f2 = torch.cat([-c2, c1], 2).view(B, T, 2 * M, self.NG)
                 Fq = torch.cat([f1, f2], 1).permute(0, 3, 1, 2).to(gd)  # (B,NG,2T,2M)
-            s0 = (st["s"] * self._damp(lam, 1)).to(gd)  # damped incoming state
+            s0 = (st["s"] if di else st["s"] * self._damp(lam, 1)).to(gd)
             # The erase gate folds into the QUERY-side codes. beta multiplies the read-back
             # inside the sum over modes, so a per-mode beta is a per-mode scale on Qk -- the
             # chunked closed form is unchanged, it just sees pre-scaled queries.
@@ -431,25 +452,39 @@ class LongHead(nn.Module):
                 og = (K2 @ ecg + Fq @ s0g).to(self.wd)               # (B,NG,2T,w)
                 o = og.transpose(1, 2).reshape(B, 2 * T, self.dvi)
             o = torch.cat([o[:, :T], o[:, T:]], -1) / M  # (B,T,2dv) = Re || Im
-            sn = st["s"] * self._damp(lam, T) + (
-                Kk.transpose(1, 2) @ ec).to(self.wd) * gT_2
+            if di:
+                f = dT_2[:, :, None]
+                sn = st["s"] * f + (Kk.transpose(1, 2) @ ec).to(self.wd) * f
+            else:
+                sn = st["s"] * self._damp(lam, T) + (
+                    Kk.transpose(1, 2) @ ec).to(self.wd) * gT_2
         return o, {"s": sn, "pos": st["pos"] + T}
 
     # ---- prefill: all full chunks batched, state loop only ----------------- #
-    def _batched(self, kz, kh, vz, bz, st: State, K: int):
+    def _batched(self, kz, kh, vz, bz, lz, st: State, K: int):
         B, T, _ = kz.shape
         M, dv, C = self.M, self.dvi, self.cfg.chunk
         dev = kz.device
         gd = self._gemm_dtype(kz)
         with _no_autocast(dev):
-            lam = self.lam()
-            idx = torch.arange(C, device=dev, dtype=self.wd)[:, None]
-            gw, gq = torch.exp(lam * idx), torch.exp(-lam * idx)
-            dC, gT, d1 = (
-                torch.exp(-lam * C)[:, None],
-                torch.exp(-lam * (C - 1))[:, None],
-                torch.exp(-lam)[:, None],
-            )
+            di = self.cfg.decay_input
+            if di:
+                # C_t = sum_{u<=t} lam_u along the chunk; decay(t,s) = exp(-(C_t - C_s)),
+                # so gw_s = exp(C_s), gq_t = exp(-C_t) and the closed form is unchanged.
+                lam_all = self.lam_t(lz).view(B, K, C, M)            # (B,K,C,M)
+                Ct = lam_all.cumsum(2)                                # inclusive
+                gw, gq = torch.exp(Ct), torch.exp(-Ct)
+                dC = gT = torch.exp(-Ct[:, :, -1:])                   # (B,K,1,M)
+                d1 = None                                             # folded into gq
+            else:
+                lam = self.lam()
+                idx = torch.arange(C, device=dev, dtype=self.wd)[:, None]
+                gw, gq = torch.exp(lam * idx), torch.exp(-lam * idx)
+                dC, gT, d1 = (
+                    torch.exp(-lam * C)[:, None],
+                    torch.exp(-lam * (C - 1))[:, None],
+                    torch.exp(-lam)[:, None],
+                )
             p = torch.arange(T, device=dev, dtype=self.wd)[:, None] + st["pos"]
             pw, pq = self._phase(kh, p), self._phase(kz, p)
             v = vz.to(self.wd)
@@ -494,15 +529,23 @@ class LongHead(nn.Module):
             Kkt = Kk.transpose(-1, -2) if self.NG == 1 else Kk.transpose(-1, -2)[:, :, None]
             K2 = (Fq @ Kkt).masked_fill(
                 _causal_mask(C, dev).repeat(2, 1)[None, None], 0)  # (B,K,[NG,]2C,C)
-            d1_2, dC_2, gT_2 = (x.repeat(2, 1) for x in (d1, dC, gT))
+            if di:
+                dC_2 = torch.cat([dC, dC], -1).squeeze(2)             # (B,K,2M)
+                gT_2 = dC_2
+                d1_2 = None
+            else:
+                d1_2, dC_2, gT_2 = (x.repeat(2, 1) for x in (d1, dC, gT))
         Fq, W, v, beta, K2, Kk, Qk = (
             x.unbind(1) for x in (Fq, W, v, beta, K2, Kk, Qk)
         )
+        if di:
+            dC_l, gT_l = dC_2.unbind(1), gT_2.unbind(1)   # per chunk (B,2M)
         s = st["s"]
         outs = []
         for k in range(K):
             with _no_autocast(dev):
-                s0 = (s * d1_2).to(gd)  # (B,2M,dv) damped incoming state
+                # with per-token decay the incoming-state factor is already inside gq
+                s0 = (s if di else s * d1_2).to(gd)  # (B,2M,dvi)
                 r = (Qk[k] @ s0).to(self.wd) / M
                 e = W[k] @ (v[k] - (r if self.bg > 1 else beta[k] * r))  # delta-rule solve
                 ec = e.to(gd)
@@ -514,7 +557,11 @@ class LongHead(nn.Module):
                     s0g = s0.view(B, 2 * M, NG, w_).transpose(1, 2)      # (B,NG,2M,w)
                     og = (K2[k] @ ecg + Fq[k] @ s0g).to(self.wd)         # (B,NG,2C,w)
                     outs.append(og.transpose(1, 2).reshape(B, 2 * C, self.dvi))
-                s = s * dC_2 + (Kk[k].transpose(-1, -2) @ ec).to(self.wd) * gT_2
+                if di:
+                    s = s * dC_l[k][:, :, None] \
+                        + (Kk[k].transpose(-1, -2) @ ec).to(self.wd) * gT_l[k][:, :, None]
+                else:
+                    s = s * dC_2 + (Kk[k].transpose(-1, -2) @ ec).to(self.wd) * gT_2
         o = torch.stack(outs, 1)  # (B,K,2C,dv)
         o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * dv) / M
         return o, {"s": s, "pos": st["pos"] + T}
@@ -527,6 +574,7 @@ class LongHead(nn.Module):
         # per chunk also means the write keys K(h) are K(z) shifted by one row, so the
         # second d x M projection and the (B,T,d) shifted copy of z both disappear.
         kz, vz, bz = self.K(z), self.V(z), self.bproj(z)
+        lz = self.lam_proj(z) if self.cfg.decay_input else None
         kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
         if self.dk:
             # the stored key is Kv(h_s) = Kv of the PREVIOUS token; Kv is linear, so the
@@ -535,7 +583,8 @@ class LongHead(nn.Module):
             vz = torch.cat([vz, torch.cat([self.Kv(z_prev)[:, None], kvz[:, :-1]], 1)], -1)
         C = self.cfg.chunk
         K = T // C
-        cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b])
+        cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b],
+                            lz[:, a:b] if lz is not None else None)
         if K >= 2 and self.cfg.long_path == "batched":
             o, st = self._batched(*cut(0, K * C), st, K)
             if K * C < T:
@@ -552,11 +601,16 @@ class LongHead(nn.Module):
     # ---- decode: one token, all float32 ------------------------------------ #
     def step(self, z_t, h_t, state: State):
         kh, kz, vz, bz = self.K(h_t), self.K(z_t), self.V(z_t), self.bproj(z_t)
+        lz = self.lam_proj(z_t) if self.cfg.decay_input else None
         if self.dk:
             vz = torch.cat([vz, self.Kv(h_t)], -1)
         with _no_autocast(z_t.device):
             M = self.M
-            s0 = state["s"] * self._damp(self.lam(), 1)  # (B,2M,dv)
+            if self.cfg.decay_input:
+                lt = self.lam_t(lz)                                   # (B,M)
+                s0 = state["s"] * torch.cat([lt, lt], -1).neg().exp()[:, :, None]
+            else:
+                s0 = state["s"] * self._damp(self.lam(), 1)  # (B,2M,dv)
             p = state["pos"]
             pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,M)
             kt = torch.cat([pw.cos(), pw.sin()], -1)  # (B,2M) write code

@@ -312,6 +312,8 @@ class LayerCfg:
     # raising Mc grows SCA2's state fast, so GDN needs the same lever.
     Ls: int = 16            # window of the short dft C head (arch_short.py), in tokens
     rope_base: float = 10000.0   # long-head grid omega_m = pi * base^(-m/(M-1)); unaliased range 2*base. Copy bench: base ~ T wins
+    decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
+    #   function of the token instead of a constant per mode. See lapa.layer.
     beta_init: float = -2.0      # erase-gate bias: sigmoid(-2) = 0.12 at init. GDN's b has
     #   NO bias, so its erase gate starts at sigmoid(0) = 0.5 -- 4x bolder than ours, and its
     #   delta rule ablates 3x heavier (+4.51 vs our +1.42).
