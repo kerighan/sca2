@@ -340,6 +340,12 @@ class LayerCfg:
     slow_frac: float = 0.0       # fraction of modes kept as slow integrators (periods 2..20 x max_len); LM used ~1/4 of a base-1e4 grid that way
     damp_mem: tuple = None       # init memories of the damped modes; None -> (Ls, 32*Ls) (window-aligned)
     lam_max: float = None        # decay cap; None -> 1/Ls (a damped mode never forgets faster than the window remembers)
+    lam_free: bool = False       # FREE MODES: lambda = exp(a), no pin, no cap but the fp32 safety
+    #   ceiling. The trained d=1024 checkpoint has 41-100% of each layer's free modes sitting
+    #   exactly at the softplus clamp (zero gradient, never escapes) and the other half pinned at
+    #   0, so the realised spectrum is two points and the 8 layers' 16 temporal profiles span an
+    #   effective rank of 2.82. See lapa.layer.LaplaceConfig.lam_free and SPARK.md §9.
+    lam_ceil: float = None       # fp32 safety ceiling for lam_free; None -> 55/chunk
     gdn_heads: int = 3
     gdn_head_k: int = 60
     gdn_expand_v: float = 1.0

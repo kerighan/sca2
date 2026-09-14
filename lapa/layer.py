@@ -105,6 +105,23 @@ class LaplaceConfig:
     )
     learn_persist: bool = False  # no hard pin: lambda_m = lam_max*sigmoid(a_m); the `persist`
     #                              fraction merely starts persistent (a=-8), the gradient decides
+    lam_free: bool = False  # FREE MODES. lambda_m = exp(a_m), no pin, no cap other than the fp32
+    #   safety ceiling `lam_ceil`. Motivation, measured on the trained d=1024 checkpoint: with
+    #   softplus(a).clamp(max=lam_max), 41-100% of the FREE modes of every layer sit exactly AT
+    #   the clamp (layer 5: 128/128), where the gradient is exactly zero -- a mode that reaches
+    #   it can never come back. Combined with `persist` pinning the other half at exactly 0, the
+    #   realised spectrum is a TWO-POINT set: 86-100% of the |w| mass sits on one endpoint or the
+    #   other, the |w|-weighted median memory is 1/lam_max (64.0 tokens) in 7 layers out of 8, and
+    #   the 8 layers' 16 temporal profiles span an effective rank of 2.82 (97.7% of the singular
+    #   mass on 2). GDN, measured the same way, spans 2.5 to 5.8e6 tokens with a monotone depth
+    #   gradient (median memory 12.9 -> 7983, x619). The link function is NOT the problem: for
+    #   lambda <~ 1/64, softplus(a) ~ exp(a), so |d log tau / da| = 0.94..1.00 across the range --
+    #   already scale-free, already the log-rate parameterisation GDN (exp(A_log)), Mamba
+    #   (-exp(A_log)) and RWKV (exp(-exp(w))) use. The BOUND is the problem. So: keep the
+    #   exponential, drop the pin, and move the ceiling out to where fp32 actually needs it.
+    lam_ceil: Optional[float] = None  # fp32 safety ceiling for lam_free. None -> 55/chunk (0.43 at
+    #   chunk 128, i.e. a memory floor of 2.3 tokens -- just past GDN's fastest measured head at
+    #   2.5). e^{lambda*chunk} is formed in the closed form, and fp32 overflows past ~88.
     mem_range: Optional[Tuple[float, float]] = None  # init memories 1/lambda of the damped modes;
     #   None -> (L, 32*L): the damped half starts just beyond the exact window and takes over from it
     lam_max: Optional[float] = None  # decay cap; None -> 1/L (a damped mode never forgets faster than
@@ -310,7 +327,16 @@ class LongHead(nn.Module):
         mem = torch.exp(torch.empty(M).uniform_(math.log(lo), math.log(hi)))
         n_pin = int(round(cfg.persist * M))
         low = self.omega.abs().argsort()[:n_pin]  # lowest frequencies persist
-        if cfg.learn_persist:
+        if cfg.lam_free:
+            # lambda = exp(a): every mode log-uniform over the WHOLE of mem_range, nothing
+            # pinned, nothing masked. `persist` is ignored on purpose -- freeing the modes is
+            # the point -- so set mem_range wide (the measured GDN span is 2.5 .. 5.8e6).
+            self.lam_ceil = cfg.lam_ceil if cfg.lam_ceil is not None else 55.0 / cfg.chunk
+            assert self.lam_ceil * cfg.chunk < 88.0, \
+                f"lam_ceil*chunk = {self.lam_ceil*cfg.chunk:.1f} overflows fp32 in e^(lam*chunk)"
+            self.lam_raw = nn.Parameter(torch.log(1.0 / mem))     # exp^{-1}
+            self.register_buffer("lam_mask", torch.ones(M))
+        elif cfg.learn_persist:
             # lambda_m = lam_max * sigmoid(a_m): reaches ~0 (a=-8 -> memory > 20k tokens) or the
             # cap within a few hundred steps either way; nothing pinned, the task decides the split.
             a = torch.logit((1.0 / mem / self.lam_max).clamp(1e-4, 1 - 1e-4))
@@ -332,7 +358,8 @@ class LongHead(nn.Module):
             n_slow = int(round(cfg.slow_frac * M))
             g = torch.full((M,), min(2, self.bg - 1), dtype=torch.long)
             pinned = torch.zeros(M, dtype=torch.bool)
-            pinned[low] = True
+            if not cfg.lam_free:      # with free modes there is no persistent band to split on
+                pinned[low] = True
             g[pinned] = min(1, self.bg - 1)
             if n_slow:
                 g[M - n_slow:] = 0
@@ -347,10 +374,16 @@ class LongHead(nn.Module):
         return _wd(self.wr)
 
     def lam_t(self, lz):
-        """(...,M) per-token decay in (0, lam_max) from the ALREADY-PROJECTED lam_proj(z)."""
+        """(...,M) per-token decay from the ALREADY-PROJECTED lam_proj(z)."""
+        if self.cfg.lam_free:
+            # exp(a + lz) = exp(a) * exp(lz): a MULTIPLICATIVE rate modulation, which is
+            # exactly GDN's g = -exp(A_log) * softplus(a(x) + dt_bias) form.
+            return torch.exp(self.lam_raw.to(self.wd) + lz.to(self.wd)).clamp(max=self.lam_ceil)
         return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd) + lz.to(self.wd))
 
     def lam(self) -> torch.Tensor:
+        if self.cfg.lam_free:
+            return torch.exp(self.lam_raw.to(self.wd)).clamp(max=self.lam_ceil)
         if self.cfg.learn_persist:
             return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd))
         return (

@@ -274,6 +274,17 @@ def main(argv=None):
                         "2*Ls to stop spending long-head modes on lags the short head already "
                         "taps exactly -- at M=256/Ls=64 that overlap is 45%% of all modes.")
     p.add_argument("--slow-frac", type=float, default=0.0, dest="slow_frac", help="fraction of long-head modes kept as slow integrators (periods 2..20 x block)")
+    p.add_argument("--lam-free", action="store_true", dest="lam_free",
+                   help="FREE MODES: lambda = exp(a), nothing pinned at 0 and no cap but the "
+                        "fp32 safety ceiling (--lam-ceil, default 55/chunk = 0.43, a memory "
+                        "floor of 2.3 tokens). Replaces softplus(a).clamp(max=lam_max) with a "
+                        "hard pin, whose realised spectrum on the trained d=1024 checkpoint is "
+                        "TWO POINTS: 41-100% of each layer's free modes sit exactly at the "
+                        "clamp, where the gradient is zero and no mode ever escapes, and the "
+                        "rest are pinned at 0. Use with a WIDE --damp-mem (GDN's measured span "
+                        "is 2.5 .. 5.8e6 tokens). --persist is ignored.")
+    p.add_argument("--lam-ceil", type=float, default=None, dest="lam_ceil",
+                   help="fp32 safety ceiling for --lam-free; default 55/chunk")
     p.add_argument("--lam-max", type=float, default=None, dest="lam_max", help="decay cap of the damped modes; default 1/Ls (window-aligned). Runs before 2026-09-11: 0.125")
     p.add_argument("--damp-mem", default=None, dest="damp_mem", help="init memories lo,hi of the damped modes; default Ls,32*Ls. Runs before 2026-09-11: 64,4096")
     p.add_argument("--warmup", type=int, default=0, help="linear lr warmup steps (0 = none, the campaign's setting)")
@@ -318,7 +329,7 @@ def main(argv=None):
                    short_groups=a.short_groups, long_groups=a.long_groups,
                    conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input,
                    layer_scale=a.layer_scale,
-                   lam_max=a.lam_max, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
+                   lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)
     log = open(a.log, "a")

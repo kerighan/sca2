@@ -52,6 +52,8 @@ def config_from(cfg) -> LaplaceConfig:
         max_len=cfg.max_len,
         mem_range=cfg.damp_mem,
         lam_max=cfg.lam_max,
+        lam_free=cfg.lam_free,
+        lam_ceil=cfg.lam_ceil,
         chunk=int(os.environ.get("SCA2_CTX_CHUNK", 128)),
         long_path=os.environ.get("SCA2_LONG_PATH", "batched"),
     )
