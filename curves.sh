@@ -30,9 +30,14 @@ print("d1024_gdn" if "d1024_gdn" in seen else seen[0])
 BASE=$(basename "${LOG%.jsonl}")
 OUT=plot/${BASE}.png
 OUT_WC=plot/${BASE}_wallclock.png
-python plot_lm.py "$LOG" --ref "$REF" --out "$OUT" "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+
+# Show only the arms that matter: the reference, the starting point, key milestones,
+# and anything currently running. The full data stays in the JSONL.
+SHOW="d1024_gdn,d1024_lapa,d1024_kv_conv4,d1024_lsfree,d1024_lsfree_g2,d1024_g4tri"
+
+python plot_lm.py "$LOG" --ref "$REF" --out "$OUT" --only "$SHOW" "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 echo
-python plot_lm.py "$LOG" --ref "$REF" --out "$OUT_WC" --wallclock "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+python plot_lm.py "$LOG" --ref "$REF" --out "$OUT_WC" --wallclock --only "$SHOW" "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 
 echo
 python -c '
