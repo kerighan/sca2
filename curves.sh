@@ -33,7 +33,7 @@ OUT_WC=plot/${BASE}_wallclock.png
 
 # Show only the arms that matter: the reference, the starting point, key milestones,
 # and anything currently running. The full data stays in the JSONL.
-SHOW="d1024_gdn,d1024_lapa,d1024_kv_conv4,d1024_lsfree,d1024_lsfree_g2,d1024_g4tri,d1024_big_g2,d1024_gdngate"
+SHOW="d1024_gdn,d1024_lapa,d1024_kv_conv4,d1024_lsfree,d1024_lsfree_g2,d1024_gdngate,d1024_big_gdngate"
 
 python plot_lm.py "$LOG" --ref "$REF" --out "$OUT" --only "$SHOW" "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 echo
