@@ -137,7 +137,8 @@ class LaplaceConfig:
     #                          55-85% of its state energy in such modes (document memory); copy wants 0.
     max_len: int = 1024     # context the slow slice is sized for
     long_path: str = (
-        "batched"  # "batched" (intra-chunk work for all chunks at once) | "chunk"
+        "batched"  # "chunk" | "triton" (inverse) | "triton_codes" (codes/products)
+        # | "triton_fused" (codes/products + inverse + state loop)
     )
     gemm_dtype: Optional[torch.dtype] = (
         None  # dtype of the long-head GEMM OPERANDS (codes, and the state as it is read
@@ -555,56 +556,93 @@ class LongHead(nn.Module):
                     torch.exp(-lam * (C - 1))[:, None],
                     torch.exp(-lam)[:, None],
                 )
-            p = torch.arange(T, device=dev, dtype=self.wd)[:, None] + st["pos"]
-            pw, pq = self._phase(kh, p), self._phase(kz, p)
-            v = vz.to(self.wd)
-            beta = self._beta(bz)  # (B,T,1) or (B,T,M); folded into Qk below when banded
             ch = lambda x: x.view(B, K, C, x.shape[-1])
-            cw, sw, cq, sq, v, beta = map(
-                ch, (pw.cos(), pw.sin(), pq.cos(), pq.sin(), v, beta)
-            )  # (B,K,C,.)
-            # Three code blocks, each (., 2M) wide, and a state packed as (B,2M,dv). The
-            # spectral weight w is folded into the QUERY side (it is a per-mode diagonal
-            # in the contraction, so it may sit on either operand), which lets ONE key
-            # block serve the Gram, the intra-chunk kernel and the state write, and lets
-            # every state read and write be a single GEMM instead of a pair. Nothing in
-            # the sequential loop below is a cat any more.
-            Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)  # (B,K,C,2M) keys
-            Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,K,C,2M) Gram lhs / read-back
-            if self.bg > 1:  # per-mode erase gate: a scale on the query-side codes
-                Qk = Qk * torch.cat([beta, beta], -1).to(gd)
-            if self.NG == 1:
-                c1 = (self.wr * cq + self.wi * sq) * gq
-                c2 = (self.wr * sq - self.wi * cq) * gq
-                Fq = torch.cat([torch.cat([c1, c2], -1),
-                                torch.cat([-c2, c1], -1)], 2).to(gd)  # (B,K,2C,2M)
+            v, beta = ch(vz.to(self.wd)), ch(self._beta(bz))
+            use_codes = (self.cfg.long_path in ("triton_fused", "triton_codes",
+                                                "triton_scan")
+                         and kz.is_cuda and self.wd == torch.float32
+                         and gd in (torch.float32, torch.bfloat16) and not di and self.bg == 1)
+            if use_codes:
+                from .triton_phase import phase_codes
+                Kk, Qk, Fq = phase_codes(kz, kh, self.theta, self.omega, lam,
+                                          self.wr, self.wi, st["pos"], C, gd,
+                                          self.cfg.long_path == "triton_scan")
+                if self.NG == 1:
+                    Fq = Fq.squeeze(2)
             else:
-                cg, sg_, gg = cq[..., None], sq[..., None], gq[..., None]
-                c1 = (self.wr * cg + self.wi * sg_) * gg              # (B,K,C,M,NG)
-                c2 = (self.wr * sg_ - self.wi * cg) * gg
-                f1 = torch.cat([c1, c2], 3).view(B, K, C, 2 * M, self.NG)
-                f2 = torch.cat([-c2, c1], 3).view(B, K, C, 2 * M, self.NG)
-                Fq = torch.cat([f1, f2], 2).permute(0, 1, 4, 2, 3).to(gd)  # (B,K,NG,2C,2M)
-            G = (Qk @ Kk.transpose(-1, -2)).to(self.wd) / M
-            eye = torch.eye(C, device=dev, dtype=self.wd)
-            W = torch.linalg.solve_triangular(
-                eye + (G.tril(-1) if self.bg > 1 else beta * G.tril(-1)),
-                eye.expand(B, K, C, C),
-                upper=False,
-                unitriangular=True,
-            )  # (B,K,C,C)
+                p = torch.arange(T, device=dev, dtype=self.wd)[:, None] + st["pos"]
+                pw, pq = self._phase(kh, p), self._phase(kz, p)
+                cw, sw, cq, sq = map(ch, (pw.cos(), pw.sin(), pq.cos(), pq.sin()))
+                # Packed real/imaginary codes share the same state GEMMs.
+                Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)
+                Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)
+                if self.bg > 1:
+                    Qk = Qk * torch.cat([beta, beta], -1).to(gd)
+                if self.NG == 1:
+                    c1 = (self.wr * cq + self.wi * sq) * gq
+                    c2 = (self.wr * sq - self.wi * cq) * gq
+                    Fq = torch.cat([torch.cat([c1, c2], -1),
+                                    torch.cat([-c2, c1], -1)], 2).to(gd)
+                else:
+                    cg, sg_, gg = cq[..., None], sq[..., None], gq[..., None]
+                    c1 = (self.wr * cg + self.wi * sg_) * gg
+                    c2 = (self.wr * sg_ - self.wi * cg) * gg
+                    f1 = torch.cat([c1, c2], 3).view(B, K, C, 2 * M, self.NG)
+                    f2 = torch.cat([-c2, c1], 3).view(B, K, C, 2 * M, self.NG)
+                    Fq = torch.cat([f1, f2], 2).permute(0, 1, 4, 2, 3).to(gd)
+            if use_codes and self.cfg.long_path == "triton_scan":
+                # Gram, inverse, causal kernel and chunk loop are ONE graph node:
+                # every code gradient is accumulated in place by the node that
+                # produces the next one, so no gradient add pass runs at all.
+                # The result is already [Re | Im] packed and divided by M.
+                from .triton_scan import long_chunk
+                d1_2, dC_2, gT_2 = (x.repeat(2, 1) for x in (d1, dC, gT))
+                o, sn = long_chunk(Kk, Qk, Fq.unsqueeze(2) if self.NG == 1 else Fq,
+                                   v, beta, st["s"], d1_2, dC_2, gT_2)
+                return o, {"s": sn, "pos": st["pos"] + T}
+            if use_codes:
+                from .triton_product import code_product
+                G = code_product(Qk.unsqueeze(2), Kk, gram=True).squeeze(2)
+            else:
+                G = (Qk @ Kk.transpose(-1, -2)).to(self.wd) / M
+            if self.cfg.long_path in ("triton", "triton_fused"):
+                from .triton_solve import triangular_inverse
+                W = triangular_inverse(G, None if self.bg > 1 else beta)
+            else:
+                eye = torch.eye(C, device=dev, dtype=self.wd)
+                W = torch.linalg.solve_triangular(
+                    eye + (G.tril(-1) if self.bg > 1 else beta * G.tril(-1)),
+                    eye.expand(B, K, C, C),
+                    upper=False,
+                    unitriangular=True,
+                )  # (B,K,C,C)
             # K2 = Fq Kk^T in one GEMM: [c1|c2] Kk^T is the real part and [-c2|c1] Kk^T
             # the imaginary one, so the (2C,C) block comes out already stacked [Re ; Im]
             # -- the same layout the state read below produces, so the two just add.
             Kkt = Kk.transpose(-1, -2) if self.NG == 1 else Kk.transpose(-1, -2)[:, :, None]
-            K2 = (Fq @ Kkt).masked_fill(
-                _causal_mask(C, dev).repeat(2, 1)[None, None], 0)  # (B,K,[NG,]2C,C)
+            if use_codes:
+                K2 = code_product(Fq.unsqueeze(2) if self.NG == 1 else Fq, Kk)
+                if self.NG == 1:
+                    K2 = K2.squeeze(2)
+            else:
+                K2 = (Fq @ Kkt).masked_fill(
+                    _causal_mask(C, dev).repeat(2, 1)[None, None], 0)
             if di:
                 dC_2 = torch.cat([dC, dC], -1).squeeze(2)             # (B,K,2M)
                 gT_2 = dC_2
                 d1_2 = None
             else:
                 d1_2, dC_2, gT_2 = (x.repeat(2, 1) for x in (d1, dC, gT))
+        if (self.cfg.long_path == "triton_fused" and kz.is_cuda
+                and self.wd == torch.float32 and gd in (torch.float32, torch.bfloat16)
+                and not di and self.bg == 1):
+            from .triton_state import state_loop
+            fq = Fq.unsqueeze(2) if self.NG == 1 else Fq
+            k2 = K2.unsqueeze(2) if self.NG == 1 else K2
+            with _no_autocast(dev):
+                o, s = state_loop(Kk, Qk, fq, k2, W, v, beta, st["s"], d1_2, dC_2, gT_2)
+                o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * dv) / M
+            return o, {"s": s, "pos": st["pos"] + T}
         Fq, W, v, beta, K2, Kk, Qk = (
             x.unbind(1) for x in (Fq, W, v, beta, K2, Kk, Qk)
         )
@@ -655,7 +693,8 @@ class LongHead(nn.Module):
         K = T // C
         cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b],
                             lz[:, a:b] if lz is not None else None)
-        if K >= 2 and self.cfg.long_path == "batched":
+        if K >= 2 and self.cfg.long_path in ("batched", "triton", "triton_fused",
+                                            "triton_codes", "triton_scan"):
             o, st = self._batched(*cut(0, K * C), st, K)
             if K * C < T:
                 o2, st = self._chunk(*cut(K * C, T), st)
