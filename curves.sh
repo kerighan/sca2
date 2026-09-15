@@ -27,8 +27,12 @@ for l in open(sys.argv[1]):
 print("d1024_gdn" if "d1024_gdn" in seen else seen[0])
 ' "$LOG")
 
-OUT=plot/$(basename "${LOG%.jsonl}").png
+BASE=$(basename "${LOG%.jsonl}")
+OUT=plot/${BASE}.png
+OUT_WC=plot/${BASE}_wallclock.png
 python plot_lm.py "$LOG" --ref "$REF" --out "$OUT" "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+echo
+python plot_lm.py "$LOG" --ref "$REF" --out "$OUT_WC" --wallclock "$@" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 
 echo
 python -c '
