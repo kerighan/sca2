@@ -273,6 +273,9 @@ def main(argv=None):
     p.add_argument("--w-antipodal", type=float, default=0.0, dest="w_antipodal",
                    help="symmetry-breaking noise epsilon on wr/wi when --long-groups > 1. "
                         "w0 = 1+eps*n, w1 = 1-eps*n, mean unchanged. 0 = off (default).")
+    p.add_argument("--gdn-gate", action="store_true", dest="gdn_gate",
+                   help="GDN-style readout on the long head: LayerNorm(val) * silu(Linear(z)), "
+                        "per channel. Replaces the cosine-match scalar gate.")
     p.add_argument("--decay-input", action="store_true", dest="decay_input",
                    help="data-dependent forgetting: lam = lam_max*sigmoid(a_m + Wd(z)_m), a "
                         "function of the token, instead of a constant per mode. GDN's decay "
@@ -365,6 +368,7 @@ def main(argv=None):
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
                    ls_mix_per_channel=a.ls_mix_per_channel, w_antipodal=a.w_antipodal,
+                   gdn_gate=a.gdn_gate,
                    lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

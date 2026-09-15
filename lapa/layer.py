@@ -223,6 +223,12 @@ class LaplaceConfig:
     #   silu(gp(x)) over H*dv); ours was one number for all 2*dv channels, which was never a
     #   measured choice. Identical to the scalar gate at init (same 4.0 / 0.0), so it can only
     #   earn its keep. 2*(2*dv) parameters -- 1024 at dv=256.
+    gdn_gate: bool = False  # REPLACE our readout with GDN's: LayerNorm(o) * silu(Linear(x)).
+    #   Our gate is a SCALAR per token (sigmoid of a cosine match); GDN's is a LEARNED
+    #   NON-LINEAR function of x, PER CHANNEL. Each of the 2*dv output channels gets its own
+    #   silu(W_gp @ x) gate that can independently amplify or suppress it. This is a ROUTER,
+    #   not a confidence gate. Cost: d*(2*dv) + 2*dv + 4*dv = ~525k params at d=1024 dv=256
+    #   (LayerNorm 2*dv + Linear d->2*dv). Replaces kv_dk when both are on.
     conv: int = 0  # width of a causal depthwise conv applied to z BEFORE both heads (0 = none).
     #   Every competitive linear mixer has one -- Mamba, GDN (kernel 4 on q/k/v), LFM2 -- and
     #   this layer did not. Initialised to the identity, so at init it is exactly a no-op.
@@ -308,7 +314,10 @@ class LongHead(nn.Module):
         self.d, self.M, self.dv, self.cfg = d, M, dv, cfg
         self.K = nn.Linear(d, M, False)
         self.V = nn.Linear(d, dv, False)
-        if self.dk:
+        if cfg.gdn_gate:
+            self.o_norm = nn.LayerNorm(2 * dv)
+            self.gp = nn.Linear(d, 2 * dv)
+        elif self.dk:
             self.Kv = nn.Linear(d, self.dk, False)
             # 0-dim when shared (matches sca2's CHeadDeltaKV exactly), (2*dv,) when per-channel
             sh = (2 * dv,) if cfg.kv_gate_pc else ()
@@ -439,14 +448,15 @@ class LongHead(nn.Module):
         return b if self.bg == 1 else b[..., self.bgroup]
 
     def _out(self, u, z):
-        """(..., 2*dvi) -> (..., 2*dv). Without key verification this is just the RMS read."""
-        if not self.dk:
-            return _rms(u)
+        """(..., 2*dvi) -> (..., 2*dv)."""
         dv, dvi = self.dv, self.dvi
         re, im = u[..., :dvi], u[..., dvi:]
         val = torch.cat([re[..., :dv], im[..., :dv]], -1)
+        if self.cfg.gdn_gate:
+            return self.o_norm(val) * F.silu(self.gp(z))
+        if not self.dk:
+            return _rms(torch.cat([u[..., :dv], u[..., dvi:dvi + dv]], -1))
         m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
-        # m[..., None] broadcasts against a 0-dim ga (one gate) or a (2*dv,) ga (one per channel)
         return _rms(val) * torch.sigmoid(self.ga * m[..., None] + self.gb)
 
     def init_state(self, B: int, device) -> State:

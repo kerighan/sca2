@@ -47,6 +47,7 @@ def config_from(cfg) -> LaplaceConfig:
         ls_ff_init=cfg.ls_ff_init,
         ls_mix_per_channel=cfg.ls_mix_per_channel,
         w_antipodal=cfg.w_antipodal,
+        gdn_gate=cfg.gdn_gate,
         kv_dk=cfg.kv_dk,
         kv_gate_pc=cfg.kv_gate_pc,
         beta_groups=cfg.beta_groups,

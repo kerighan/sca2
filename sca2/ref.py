@@ -317,6 +317,7 @@ class LayerCfg:
     ls_ff_init: float = 1.0
     ls_mix_per_channel: bool = False
     w_antipodal: float = 0.0
+    gdn_gate: bool = False       # GDN-style readout: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
     beta_init: float = -2.0      # erase-gate bias: sigmoid(-2) = 0.12 at init. GDN's b has
