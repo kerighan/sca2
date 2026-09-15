@@ -263,9 +263,16 @@ def main(argv=None):
                         "cshort_damphkv). Stores the write key beside the value and gates the "
                         "read on whether it comes back matching the query's key.")
     p.add_argument("--layer-scale", action="store_true", dest="layer_scale",
-                   help="learned gain on each residual branch, init 1 (LayerScale). The "
-                        "residual stream grows 29x across 10 layers while each branch emits "
-                        "a constant norm, so deep layers' relative contribution collapses.")
+                   help="learned gain on each residual branch (LayerScale).")
+    p.add_argument("--ls-mix-init", type=float, default=1.0, dest="ls_mix_init",
+                   help="init value for gs_mix (default 1.0; two runs converge to ~0.26)")
+    p.add_argument("--ls-ff-init", type=float, default=1.0, dest="ls_ff_init",
+                   help="init value for gs_ff (default 1.0; two runs converge to ~0.6)")
+    p.add_argument("--ls-mix-pc", action="store_true", dest="ls_mix_per_channel",
+                   help="gs_mix shape (d,) instead of (): per-channel gain on the mixer branch")
+    p.add_argument("--w-antipodal", type=float, default=0.0, dest="w_antipodal",
+                   help="symmetry-breaking noise epsilon on wr/wi when --long-groups > 1. "
+                        "w0 = 1+eps*n, w1 = 1-eps*n, mean unchanged. 0 = off (default).")
     p.add_argument("--decay-input", action="store_true", dest="decay_input",
                    help="data-dependent forgetting: lam = lam_max*sigmoid(a_m + Wd(z)_m), a "
                         "function of the token, instead of a constant per mode. GDN's decay "
@@ -356,6 +363,8 @@ def main(argv=None):
                    short_groups=a.short_groups, long_groups=a.long_groups,
                    conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input,
                    layer_scale=a.layer_scale,
+                   ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
+                   ls_mix_per_channel=a.ls_mix_per_channel, w_antipodal=a.w_antipodal,
                    lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

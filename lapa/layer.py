@@ -154,7 +154,12 @@ class LaplaceConfig:
     #   found" -- measured, the read norms on new and repeated words are the same
     #   distribution -- so the gate needs evidence the read itself carries. Port of sca2's
     #   CHeadDeltaKV, which was the best arm at d=128. Costs 2.d.dk + 2 parameters.
-    layer_scale: bool = False  # a learned gain on each RESIDUAL BRANCH (LayerScale), init 1.
+    layer_scale: bool = False  # a learned gain on each RESIDUAL BRANCH (LayerScale).
+    ls_mix_init: float = 1.0   # init value for gs_mix. Two trained checkpoints (lsfree, g2)
+    #   converge to a median of ~0.26; starting at 0.25 saves 2h of convergence.
+    ls_ff_init: float = 1.0    # init value for gs_ff. Converges to ~0.6 in both runs.
+    ls_mix_per_channel: bool = False  # gs_mix shape (d,) instead of (): lets each branch
+    #   choose WHERE in the residual stream it writes, not just how much.
     #   Measured on the trained 10-layer model: the residual stream grows 29x from layer 0 to
     #   layer 9 (||x|| 25.8 -> 759.4) while each branch emits a roughly CONSTANT norm
     #   (130-216), because the LayerNorm at the head of the branch erases the stream's scale.
@@ -186,6 +191,13 @@ class LaplaceConfig:
     #   for dv=56 there, 256 here) and the base has changed completely. With key
     #   verification on, the dk-wide key copy lands in the LAST group, so the gate's
     #   evidence is read through that group's kernel.
+    w_antipodal: float = 0.0  # symmetry-breaking noise on wr/wi when long_groups > 1.
+    #   w0 = 1 + eps*n, w1 = 1 - eps*n (n ~ N(0,1)): the MEAN of the two columns is
+    #   exactly the current w, so the layer's average behaviour is unchanged at init, but
+    #   the gradient no longer starts from a symmetric fixed point. Measured: the gradient
+    #   at the symmetric point already has cos(g0,g1) = -0.71 (anti-correlated), so the
+    #   symmetry breaks by real signal, not floating-point noise. But it takes ~4h to reach
+    #   cos(kappa0,kappa1) = 0.86; eps = 0.10 starts there instantly.
     short_groups: int = 1  # spectral read weights of the SHORT head, per group of value
     #   channels. 1 = one (L,) filter shared by all dv channels, which is what the layer has
     #   always had. The taps ARE the DFT of the spectral weights (w_m = sum_n taps_n
@@ -312,8 +324,21 @@ class LongHead(nn.Module):
         assert self.dvi % self.NG == 0, \
             f"dv+kv_dk={self.dvi} must divide by long_groups={self.NG}"
         wsh = (M,) if self.NG == 1 else (M, self.NG)
-        self.wr = nn.Parameter(torch.ones(wsh))  # spectral read weights, w = wr + i wi
-        self.wi = nn.Parameter(torch.zeros(wsh))
+        wr_init = torch.ones(wsh)
+        wi_init = torch.zeros(wsh)
+        if self.NG > 1 and cfg.w_antipodal > 0:
+            # Antipodal symmetry breaking: w_g = 1 ± eps*n. The MEAN across groups is
+            # exactly 1, so the layer's average behaviour is unchanged at init. The noise
+            # is shared (same n, opposite signs) to maximise the initial separation.
+            eps = cfg.w_antipodal
+            nr = eps * torch.randn(M)
+            ni = eps * torch.randn(M)
+            for g in range(self.NG):
+                sign = 1.0 - 2.0 * g / (self.NG - 1) if self.NG > 1 else 0.0
+                wr_init[:, g] = 1.0 + sign * nr
+                wi_init[:, g] = sign * ni
+        self.wr = nn.Parameter(wr_init)  # spectral read weights, w = wr + i wi
+        self.wi = nn.Parameter(wi_init)
         self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
                                                 cfg.rope_min_period))
         if cfg.decay_input:
@@ -896,9 +921,10 @@ class LaplaceAttention(nn.Module):
         self.mix = nn.Linear(4 * dv, d)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
-        if cfg.layer_scale:   # init 1: identical to no scaling at the first step
-            self.gs_mix = nn.Parameter(torch.ones(()))
-            self.gs_ff = nn.Parameter(torch.ones(()))
+        if cfg.layer_scale:
+            mix_shape = (d,) if cfg.ls_mix_per_channel else ()
+            self.gs_mix = nn.Parameter(torch.full(mix_shape, cfg.ls_mix_init))
+            self.gs_ff = nn.Parameter(torch.full((), cfg.ls_ff_init))
         self.ck = cfg.conv
         if self.ck:
             w = torch.zeros(d, 1, self.ck)
