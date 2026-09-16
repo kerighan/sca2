@@ -317,6 +317,7 @@ class LayerCfg:
     ls_ff_init: float = 1.0
     ls_mix_per_channel: bool = False
     w_antipodal: float = 0.0
+    mamba_expand: int = 1        # Mamba2 expand factor (1 = 11.8M/layer, 2 = 15M/layer)
     gdn_gate: bool = False       # GDN-style readout: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.

@@ -32,4 +32,7 @@ cell wiki_lapa_base --only sca2 --variant lapa_cc --Mc 256 --dv 256 --Ls 64 \
      --theta-scale 0.02 --rope-base 1000 --slow-frac 0.25 --conv 4 --kv-dk 16 \
      --layer-scale --lam-free --damp-mem 4,20000
 
+# ARM 4: Mamba2 (SSD) via fla, expand=1 (11.8M/layer, between us and GDN)
+cell wiki_mamba2 --only sca2 --variant mamba2_cc --mamba-expand 1
+
 echo "##### WIKI DONE"
