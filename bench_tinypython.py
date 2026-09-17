@@ -104,7 +104,8 @@ def get_batch(data, B, T, g, device):
 class SCA2(nn.Module):
     """Embedding + one SCA2 layer (from the sca2 package) + LM head."""
 
-    def __init__(self, V, cfg: LayerCfg, variant=None, device="cpu", layers=1):
+    def __init__(self, V, cfg: LayerCfg, variant=None, device="cpu", layers=1,
+                 ple_dim=0):
         super().__init__()
         self.e = nn.Embedding(V, cfg.d)
         # variant=None -> the version selected by SCA2_VERSION (default: latest);
@@ -115,14 +116,31 @@ class SCA2(nn.Module):
         self.layer = self.layers[0]          # back-compat for single-layer paths
         self.on = nn.LayerNorm(cfg.d)
         self.o = nn.Linear(cfg.d, V)
+        # PLE: per-layer embedding. One shared (V, ple_dim * layers) lookup, sliced
+        # per layer and projected to d. Each layer gets its own token-identity signal
+        # directly, bypassing the residual stream. 0 = off.
+        self.ple_dim = ple_dim
+        if ple_dim:
+            self.ple_embed = nn.Embedding(V, ple_dim * layers)
+            self.ple_proj = nn.ModuleList([
+                nn.Linear(ple_dim, cfg.d, bias=False) for _ in range(layers)])
+            # Init small so PLE starts as a perturbation, not a replacement
+            for p in self.ple_proj:
+                nn.init.normal_(p.weight, std=0.02)
 
     def core_params(self):
         return sum(p.numel() for p in self.layers.parameters())
 
     def forward(self, t):
         x = self.e(t)
-        for L in self.layers:
-            x, _ = L.prefill(x)
+        if self.ple_dim:
+            ple = self.ple_embed(t)  # (B, T, ple_dim * L)
+            L = len(self.layers)
+            ple = ple.view(*ple.shape[:-1], L, self.ple_dim)  # (B, T, L, ple_dim)
+        for i, layer in enumerate(self.layers):
+            if self.ple_dim:
+                x = x + self.ple_proj[i](ple[..., i, :])  # add before the layer
+            x, _ = layer.prefill(x)
         return self.o(self.on(x))
 
 

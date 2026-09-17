@@ -273,11 +273,19 @@ def main(argv=None):
     p.add_argument("--w-antipodal", type=float, default=0.0, dest="w_antipodal",
                    help="symmetry-breaking noise epsilon on wr/wi when --long-groups > 1. "
                         "w0 = 1+eps*n, w1 = 1-eps*n, mean unchanged. 0 = off (default).")
+    p.add_argument("--ple-dim", type=int, default=0, dest="ple_dim",
+                   help="per-layer embedding dimension (0 = off). Each layer gets its own "
+                        "token-identity signal via a (V, ple_dim*L) embedding + Linear(ple_dim, d). "
+                        "Cost: V*ple_dim*L + ple_dim*d*L params.")
     p.add_argument("--mamba-expand", type=int, default=1, dest="mamba_expand",
                    help="Mamba2 expand factor (1 or 2)")
     p.add_argument("--gdn-gate", action="store_true", dest="gdn_gate",
                    help="GDN-style readout on the long head: LayerNorm(val) * silu(Linear(z)), "
                         "per channel. Replaces the cosine-match scalar gate.")
+    p.add_argument("--gdn-gate-scope", default="long", dest="gdn_gate_scope",
+                   choices=["long", "both", "concat", "mix"],
+                   help="where the gdn-gate applies: long (default), both (long+short), "
+                        "concat (after cat before mix), mix (after mix before residual)")
     p.add_argument("--decay-input", action="store_true", dest="decay_input",
                    help="data-dependent forgetting: lam = lam_max*sigmoid(a_m + Wd(z)_m), a "
                         "function of the token, instead of a constant per mode. GDN's decay "
@@ -370,7 +378,7 @@ def main(argv=None):
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
                    ls_mix_per_channel=a.ls_mix_per_channel, w_antipodal=a.w_antipodal,
-                   mamba_expand=a.mamba_expand, gdn_gate=a.gdn_gate,
+                   mamba_expand=a.mamba_expand, gdn_gate=a.gdn_gate, gdn_gate_scope=a.gdn_gate_scope,
                    lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)
@@ -379,7 +387,8 @@ def main(argv=None):
     if a.only != "transformer":
         torch.manual_seed(a.seed)
         nm = a.label or "SCA2"
-        models[nm] = run(nm, SCA2(V, cfg, a.variant, device, a.layers),
+        models[nm] = run(nm, SCA2(V, cfg, a.variant, device, a.layers,
+                                  ple_dim=a.ple_dim),
                          tr, va, a, device, log, V)
     if a.only != "sca2":
         torch.manual_seed(a.seed)
