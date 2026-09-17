@@ -17,7 +17,7 @@ set -u
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export SCA2_CTX_CHUNK=128 SCA2_LONG_PATH=triton_scan
 
-until grep -q "saved runs/ck_l10_gdn" runs/long10h_d1024.log 2>/dev/null; do sleep 60; done
+until grep -q "saved runs/ck_l10_gdn\.l10_gdn\.pt" runs/long10h_d1024.log 2>/dev/null; do sleep 60; done
 echo "##### $(date +%H:%M) l10_gdn finished"
 
 LOG=runs/long10h_d1024.jsonl
