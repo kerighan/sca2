@@ -10,9 +10,11 @@ for l in open(sys.argv[1]):
     if m not in seen: seen.append(m)
 print("l10_gdn" if "l10_gdn" in seen else seen[0])
 ' "$LOG")
-python plot_lm.py "$LOG" --ref "$REF" --out plot/long10h_d1024.png 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+SHOW="l10_gdngate,l10_gdn,l10_conv8,l10_dv384_ff5800"
+
+python plot_lm.py "$LOG" --ref "$REF" --out plot/long10h_d1024.png --only "$SHOW" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 echo
-python plot_lm.py "$LOG" --ref "$REF" --out plot/long10h_d1024_wallclock.png --wallclock 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+python plot_lm.py "$LOG" --ref "$REF" --out plot/long10h_d1024_wallclock.png --wallclock --only "$SHOW" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 echo
 python -c '
 import json, sys
