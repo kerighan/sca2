@@ -100,9 +100,54 @@ harness's bf16 tolerance of 0.06.
 Raw per-round data is in
 [`lapa/benchmarks/results/triton_scan_gb10_20260915.json`](lapa/benchmarks/results/triton_scan_gb10_20260915.json).
 
-Next useful target: the forward scan, now the single largest kernel at about
-1.7 ms/iter. It runs at roughly 7 TFLOP/s because its grid is only
-`B x NG x ceil((dv+dk)/NG/BN)` = 48 programs at the tuned block width, so the
+### NEW PRIORITY: dv=384 support (2026-09-21)
+
+The training configuration has moved from dv=256 to **dv=384 ff=5800** (the
+"proportional scaling" arm that matches GDN's 157M params). With dv=384 and
+no kv_dk, the value width `D = dv = 384` is NOT a power of two. The current
+`triton_scan` kernels were tuned for D=272 (256+16) at dv=256 with kv_dk=16,
+and the gain collapses:
+
+```
+dv=256 (D=272):  batched 37.1 ms → triton_scan 32.1 ms  (+15.6%)
+dv=384 (D=384):  batched 89.9 ms → triton_scan 88.1 ms  (+2.0%)
+```
+
+The problem is structural:
+- `BN` (the column tile) is `min(TUNE, next_power_of_2(D//G))`. D=384 rounds to
+  512, but `BN = min(32, 512) = 32`, so 384/32 = 12 tiles per column with padding
+  in the last tile. D=272 gave 272/32 = 8.5 tiles — similar padding ratio.
+- Non-power-of-2 BN (48, 96) crashes Triton.
+- Larger BN (64, 128) increases register pressure and is slower.
+- The REAL issue: the kernel was designed and measured at D=272, and the tile
+  shapes, pipeline stages, and warp counts are all calibrated for that width.
+  D=384 needs its own tuning pass.
+
+**Also requested: conv_silu support.** The training config optionally applies
+`silu` after the causal conv (`--conv-silu`). This means the input `z` to the
+long head is no longer the raw conv output but `silu(conv(z))`. The kernel
+receives the post-activation `z` so no kernel change is needed — the silu is
+applied by PyTorch before the kernel is called. However, if the silu were to
+be fused INTO the code construction kernel (phase_codes), it would save one
+elementwise pass over the (B, T, d) input.
+
+**Target shapes for dv=384 (the new training config):**
+```
+B=8, T=2048, M=256, dv=384, dk=0, D=384, C=128, K=16, NG=1
+Code blocks:  Kk (B, K, C, 2M) = (8, 16, 128, 512) bf16
+              Qk same
+              Fc (B, K, C, 2M) = (8, 16, 128, 512) bf16   [compact]
+State:        s  (B, 2M, D) = (8, 512, 384) fp32
+Values:       v  (B, K, C, D) = (8, 16, 128, 384) fp32
+Output:       o  (B, K, 2C, D) = (8, 16, 256, 384) fp32
+```
+
+Note K=16 at T=2048 (vs K=8 at T=1024): twice as many chunks in the sequential
+loop, so the scan kernel's launch count matters more.
+
+Next useful target after dv=384: the forward scan, now the single largest kernel
+at about 1.7 ms/iter. It runs at roughly 7 TFLOP/s because its grid is only
+`B x NG x ceil(D/NG/BN)` programs at the tuned block width, so the
 machine is at about an eighth of its warp slots and the chunk's read -> solve ->
 write chain has little to overlap with. Splitting it the way the reverse scan
 was split does not help: the state write is the only mode-parallel piece, and
