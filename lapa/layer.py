@@ -243,6 +243,9 @@ class LaplaceConfig:
     #   in z. GDN does this: v = silu(conv(Wv @ z)). Ours was purely linear: v = V(z).
     #   With v_silu the state captures non-linear features rather than linear projections.
     #   Zero params, one elementwise op. NOT identity at init.
+    k_silu: bool = False  # SiLU on K(z) — the keys become non-linear in z, giving richer
+    #   content features to the phase computation. GDN does q = silu(conv(Wq @ z)),
+    #   k = silu(conv(Wk @ z)). Zero params.
     init_v2: bool = False  # CALIBRATED INIT derived from two 16h checkpoints (t2048_gdngate,
     #   t2048_dv384_silu). Every parameter starts where the model converges to, not at the
     #   standard default. Zero params, zero compute, just better starting points.
@@ -763,10 +766,13 @@ class LongHead(nn.Module):
 
     def _project(self, z):
         """K/V/beta and optional precomputed output gate (separate by default)."""
+        k = self.K(z)
+        if self.cfg.k_silu:
+            k = F.silu(k)
         v = self.V(z)
         if self.cfg.v_silu:
             v = F.silu(v)
-        return self.K(z), v, self.bproj(z), None
+        return k, v, self.bproj(z), None
 
     def prefill(self, z, z_prev, state: Optional[State] = None):
         """z (B,T,d); z_prev (B,d) is the token before z[:,0] -- the write key at t is z_{t-1}."""
@@ -806,7 +812,10 @@ class LongHead(nn.Module):
         vz = self.V(z_t)
         if self.cfg.v_silu:
             vz = F.silu(vz)
-        kh, kz, bz = self.K(h_t), self.K(z_t), self.bproj(z_t)
+        kh, kz = self.K(h_t), self.K(z_t)
+        if self.cfg.k_silu:
+            kh, kz = F.silu(kh), F.silu(kz)
+        bz = self.bproj(z_t)
         lz = self.lam_proj(z_t) if self.cfg.decay_input else None
         if self.dk:
             vz = torch.cat([vz, self.Kv(h_t)], -1)

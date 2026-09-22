@@ -49,6 +49,7 @@ def config_from(cfg) -> LaplaceConfig:
         ls_mix_per_channel=cfg.ls_mix_per_channel,
         w_antipodal=cfg.w_antipodal,
         init_v2=cfg.init_v2,
+        k_silu=cfg.k_silu,
         v_silu=cfg.v_silu,
         gdn_gate=cfg.gdn_gate,
         gdn_gate_scope=cfg.gdn_gate_scope,

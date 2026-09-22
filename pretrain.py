@@ -282,6 +282,8 @@ def main(argv=None):
     p.add_argument("--init-v2", action="store_true", dest="init_v2",
                    help="calibrated init from converged checkpoints: every parameter starts "
                         "where the model ends up, not at the standard default")
+    p.add_argument("--k-silu", action="store_true", dest="k_silu",
+                   help="silu on K(z): non-linear keys for richer content addressing")
     p.add_argument("--v-silu", action="store_true", dest="v_silu",
                    help="silu on V(z): non-linear values written to the state, like GDN")
     p.add_argument("--gdn-gate", action="store_true", dest="gdn_gate",
@@ -389,7 +391,7 @@ def main(argv=None):
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
                    ls_mix_per_channel=a.ls_mix_per_channel, w_antipodal=a.w_antipodal,
-                   mamba_expand=a.mamba_expand, init_v2=a.init_v2, v_silu=a.v_silu, gdn_gate=a.gdn_gate, gdn_gate_scope=a.gdn_gate_scope,
+                   mamba_expand=a.mamba_expand, init_v2=a.init_v2, k_silu=a.k_silu, v_silu=a.v_silu, gdn_gate=a.gdn_gate, gdn_gate_scope=a.gdn_gate_scope,
                    lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

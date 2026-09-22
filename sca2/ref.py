@@ -319,6 +319,7 @@ class LayerCfg:
     w_antipodal: float = 0.0
     mamba_expand: int = 1        # Mamba2 expand factor (1 = 11.8M/layer, 2 = 15M/layer)
     init_v2: bool = False        # calibrated init from converged checkpoints
+    k_silu: bool = False         # silu on K(z): non-linear keys
     v_silu: bool = False         # silu on V(z): non-linear values
     gdn_gate: bool = False       # GDN-style readout
     gdn_gate_scope: str = 'long'  # long | both | concat | mix: LayerNorm * silu(Linear(x)), per channel
