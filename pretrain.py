@@ -279,6 +279,11 @@ def main(argv=None):
                         "Cost: V*ple_dim*L + ple_dim*d*L params.")
     p.add_argument("--mamba-expand", type=int, default=1, dest="mamba_expand",
                    help="Mamba2 expand factor (1 or 2)")
+    p.add_argument("--init-v2", action="store_true", dest="init_v2",
+                   help="calibrated init from converged checkpoints: every parameter starts "
+                        "where the model ends up, not at the standard default")
+    p.add_argument("--v-silu", action="store_true", dest="v_silu",
+                   help="silu on V(z): non-linear values written to the state, like GDN")
     p.add_argument("--gdn-gate", action="store_true", dest="gdn_gate",
                    help="GDN-style readout on the long head: LayerNorm(val) * silu(Linear(z)), "
                         "per channel. Replaces the cosine-match scalar gate.")
@@ -296,6 +301,9 @@ def main(argv=None):
     p.add_argument("--conv-silu", action="store_true", dest="conv_silu",
                    help="SiLU after the causal conv, as GDN does on its q/k/v convs. Ours "
                         "was a purely linear convolution.")
+    p.add_argument("--beta-write", action="store_true",
+                   help="lapa/lapa_cc only: gate new long-head values with beta too, "
+                        "e = W @ (beta*v - beta*r). No extra parameters; requires --beta-groups 1.")
     p.add_argument("--long-groups", type=int, default=1, dest="long_groups",
                    help="spectral read weights of the LONG head, per group of value "
                         "channels. This is wg2's experiment, which lost at d=128.")
@@ -351,6 +359,8 @@ def main(argv=None):
                         "fp32 (default) is the d=128 campaign's setting; bf16 is what "
                         "the Spark runs use (SPARK.md §9). Loss always on fp32 logits.")
     a = p.parse_args(argv)
+    if a.beta_write and (a.variant not in ("lapa", "lapa_cc") or a.beta_groups != 1):
+        p.error("--beta-write requires --variant lapa or lapa_cc and --beta-groups 1")
     global CLS_TAB, AMP
     AMP = torch.bfloat16 if a.amp == "bf16" else None
     if a.class_eval:
@@ -375,10 +385,11 @@ def main(argv=None):
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    short_groups=a.short_groups, long_groups=a.long_groups,
                    conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input,
+                   beta_write=a.beta_write,
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
                    ls_mix_per_channel=a.ls_mix_per_channel, w_antipodal=a.w_antipodal,
-                   mamba_expand=a.mamba_expand, gdn_gate=a.gdn_gate, gdn_gate_scope=a.gdn_gate_scope,
+                   mamba_expand=a.mamba_expand, init_v2=a.init_v2, v_silu=a.v_silu, gdn_gate=a.gdn_gate, gdn_gate_scope=a.gdn_gate_scope,
                    lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
                    gdn_expand_v=a.gdn_expand_v)

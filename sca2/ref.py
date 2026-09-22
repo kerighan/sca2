@@ -318,12 +318,16 @@ class LayerCfg:
     ls_mix_per_channel: bool = False
     w_antipodal: float = 0.0
     mamba_expand: int = 1        # Mamba2 expand factor (1 = 11.8M/layer, 2 = 15M/layer)
-    gdn_gate: bool = False       # GDN-style readout: LayerNorm * silu(Linear(x)), per channel
+    init_v2: bool = False        # calibrated init from converged checkpoints
+    v_silu: bool = False         # silu on V(z): non-linear values
+    gdn_gate: bool = False       # GDN-style readout
+    gdn_gate_scope: str = 'long'  # long | both | concat | mix: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
     beta_init: float = -2.0      # erase-gate bias: sigmoid(-2) = 0.12 at init. GDN's b has
     #   NO bias, so its erase gate starts at sigmoid(0) = 0.5 -- 4x bolder than ours, and its
     #   delta rule ablates 3x heavier (+4.51 vs our +1.42).
+    beta_write: bool = False     # lapa only: also gate new values by beta; beta_groups=1
     conv_silu: bool = False      # SiLU after the causal conv (lapa path), as GDN does
     long_groups: int = 1         # same, on the LONG head (lapa path). This is wg2's
     #   experiment, which LOST at d=128 (+0.065); see lapa.layer.LaplaceConfig.long_groups.

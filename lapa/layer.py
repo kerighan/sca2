@@ -146,6 +146,8 @@ class LaplaceConfig:
         #       phases, the Gram's solve and the short head stay fp32 regardless.
     )
     beta_init: float = -2.0  # erase gate bias: sigmoid(-2) = 0.12 at init
+    beta_write: bool = False  # also gate new long-head values: e = W @ (beta*v - beta*r).
+    # No extra parameters. Requires scalar beta (beta_groups=1); short head unchanged.
     kv_dk: int = 0  # KEY VERIFICATION (0 = off). The long head stores a copy of its own write
     #   key beside the value, reads it back, and gates the output on whether it matches the
     #   query's key: e_s = [V(z_s) ; Kv(h_s)], m_t = cos(Re key part, Kv(z_t)),
@@ -229,9 +231,75 @@ class LaplaceConfig:
     #   silu(W_gp @ x) gate that can independently amplify or suppress it. This is a ROUTER,
     #   not a confidence gate. Cost: d*(2*dv) + 2*dv + 4*dv = ~525k params at d=1024 dv=256
     #   (LayerNorm 2*dv + Linear d->2*dv). Replaces kv_dk when both are on.
+    gdn_gate_scope: str = "long"  # where the gdn-gate applies when gdn_gate=True:
+    #   "long"   = long head only (default, what we've tested so far)
+    #   "both"   = long head AND short head (separate gp per head)
+    #   "concat" = after concat [ul, us] before mix (one gate over 4*dv channels)
+    #   "mix"    = after mix projection, before residual add (gate over d channels)
     conv: int = 0  # width of a causal depthwise conv applied to z BEFORE both heads (0 = none).
     #   Every competitive linear mixer has one -- Mamba, GDN (kernel 4 on q/k/v), LFM2 -- and
     #   this layer did not. Initialised to the identity, so at init it is exactly a no-op.
+    v_silu: bool = False  # SiLU on V(z) — the values written into the state become non-linear
+    #   in z. GDN does this: v = silu(conv(Wv @ z)). Ours was purely linear: v = V(z).
+    #   With v_silu the state captures non-linear features rather than linear projections.
+    #   Zero params, one elementwise op. NOT identity at init.
+    init_v2: bool = False  # CALIBRATED INIT derived from two 16h checkpoints (t2048_gdngate,
+    #   t2048_dv384_silu). Every parameter starts where the model converges to, not at the
+    #   standard default. Zero params, zero compute, just better starting points.
+
+
+def _apply_init_v2(layer: "LaplaceAttention"):
+    """Calibrated init from converged checkpoints. Every parameter starts where
+    the model ends up after 16h of training, not at the standard default.
+
+    Derived from the median of t2048_gdngate (1518M tokens) and t2048_dv384_silu
+    (1170M tokens), averaged over 8 layers and 2 checkpoints.
+    """
+    import math
+    cfg = layer.cfg
+    d, M, dv, L = cfg.d, cfg.M, cfg.dv, cfg.L
+
+    with torch.no_grad():
+        # --- LayerScale ---
+        if cfg.layer_scale:
+            layer.gs_mix.fill_(0.1)          # converges to 0.12, init was 1.0
+            layer.gs_ff.fill_(0.5)           # converges to 0.50, init was 1.0
+
+        # --- Input LayerNorm ---
+        layer.n.weight.fill_(0.8)            # converges to 0.78, init was 1.0
+
+        # --- FFN LayerNorm ---
+        layer.fn.weight.fill_(0.4)           # converges to 0.36, init was 1.0
+
+        # --- FFN up bias ---
+        layer.ff[0].bias.fill_(-0.1)         # converges to -0.10, init was 0.0
+
+        # --- Long head ---
+        long = layer.long
+
+        # theta: N(0, 0.3) instead of N(0, 0.02)
+        long.theta.copy_(0.3 * torch.randn(M))
+
+        # wr, wi: N(0.3, 0.5) and N(0, 0.5) instead of (ones, zeros)
+        long.wr.copy_(0.3 + 0.5 * torch.randn_like(long.wr))
+        long.wi.copy_(0.5 * torch.randn_like(long.wi))
+
+        # bproj bias: -1.0 instead of -2.0 (sigmoid(-1)=0.27 vs 0.12)
+        nn.init.constant_(long.bproj.bias, -1.0)
+
+        # o_norm weight: 0.8 instead of 1.0
+        if hasattr(long, 'o_norm'):
+            long.o_norm.weight.fill_(0.8)
+
+        # --- Short head ---
+        short = layer.short
+
+        # theta: N(0, 0.1) instead of N(0, 0.02)
+        short.theta.copy_(0.1 * torch.randn(L))
+
+        # wr, wi: N(0.5, 0.3) and N(0, 0.3) instead of (ones, zeros)
+        short.wr.copy_(0.5 + 0.3 * torch.randn_like(short.wr))
+        short.wi.copy_(0.3 * torch.randn_like(short.wi))
 
 
 def _rms(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -306,6 +374,8 @@ def _damp_params(cfg: "LaplaceConfig"):
 class LongHead(nn.Module):
     def __init__(self, cfg: LaplaceConfig):
         super().__init__()
+        if cfg.beta_write and cfg.beta_groups != 1:
+            raise ValueError("beta_write requires beta_groups=1 (one write gate per token)")
         d, M, dv = cfg.d, cfg.M, cfg.dv
         # dv is what the head EMITS (2*dv, Re||Im); dvi is what the state carries. With key
         # verification the state also carries the dk-wide key copy, so dvi = dv + dk.
@@ -447,13 +517,13 @@ class LongHead(nn.Module):
         b = torch.sigmoid(bz.to(self.wd))
         return b if self.bg == 1 else b[..., self.bgroup]
 
-    def _out(self, u, z):
+    def _out(self, u, z, gate=None):
         """(..., 2*dvi) -> (..., 2*dv)."""
         dv, dvi = self.dv, self.dvi
         re, im = u[..., :dvi], u[..., dvi:]
         val = torch.cat([re[..., :dv], im[..., :dv]], -1)
         if self.cfg.gdn_gate:
-            return self.o_norm(val) * F.silu(self.gp(z))
+            return self.o_norm(val) * F.silu(self.gp(z) if gate is None else gate)
         if not self.dk:
             return _rms(torch.cat([u[..., :dv], u[..., dvi:dvi + dv]], -1))
         m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
@@ -516,8 +586,11 @@ class LongHead(nn.Module):
             A = torch.eye(T, device=dev, dtype=self.wd) + (
                 G.tril(-1) if self.bg > 1 else beta * G.tril(-1))
             r = (Qk @ s0).to(self.wd) / M
+            v = vz.to(self.wd)
+            if self.cfg.beta_write:
+                v = beta * v
             e = torch.linalg.solve_triangular(
-                A, vz.to(self.wd) - (r if self.bg > 1 else beta * r),
+                A, v - (r if self.bg > 1 else beta * r),
                 upper=False, unitriangular=True
             )
             ec = e.to(gd)
@@ -568,6 +641,10 @@ class LongHead(nn.Module):
                 )
             ch = lambda x: x.view(B, K, C, x.shape[-1])
             v, beta = ch(vz.to(self.wd)), ch(self._beta(bz))
+            if self.cfg.beta_write:
+                # All backends consume gated values. Autograd adds the write
+                # contribution to d beta alongside the existing erase/solve terms.
+                v = beta * v
             use_codes = (self.cfg.long_path in ("triton_fused", "triton_codes",
                                                 "triton_scan")
                          and kz.is_cuda and self.wd == torch.float32
@@ -684,6 +761,13 @@ class LongHead(nn.Module):
         o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * dv) / M
         return o, {"s": s, "pos": st["pos"] + T}
 
+    def _project(self, z):
+        """K/V/beta and optional precomputed output gate (separate by default)."""
+        v = self.V(z)
+        if self.cfg.v_silu:
+            v = F.silu(v)
+        return self.K(z), v, self.bproj(z), None
+
     def prefill(self, z, z_prev, state: Optional[State] = None):
         """z (B,T,d); z_prev (B,d) is the token before z[:,0] -- the write key at t is z_{t-1}."""
         B, T, _ = z.shape
@@ -691,7 +775,7 @@ class LongHead(nn.Module):
         # K, V and bproj are linear and follow autocast; doing them once here rather than
         # per chunk also means the write keys K(h) are K(z) shifted by one row, so the
         # second d x M projection and the (B,T,d) shifted copy of z both disappear.
-        kz, vz, bz = self.K(z), self.V(z), self.bproj(z)
+        kz, vz, bz, gate = self._project(z)
         lz = self.lam_proj(z) if self.cfg.decay_input else None
         kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
         if self.dk:
@@ -715,11 +799,14 @@ class LongHead(nn.Module):
                 o, st = self._chunk(*cut(s0, s0 + C), st)
                 outs.append(o)
             o = torch.cat(outs, 1)
-        return self._out(o, z).to(z.dtype), st
+        return self._out(o, z, gate).to(z.dtype), st
 
     # ---- decode: one token, all float32 ------------------------------------ #
     def step(self, z_t, h_t, state: State):
-        kh, kz, vz, bz = self.K(h_t), self.K(z_t), self.V(z_t), self.bproj(z_t)
+        vz = self.V(z_t)
+        if self.cfg.v_silu:
+            vz = F.silu(vz)
+        kh, kz, bz = self.K(h_t), self.K(z_t), self.bproj(z_t)
         lz = self.lam_proj(z_t) if self.cfg.decay_input else None
         if self.dk:
             vz = torch.cat([vz, self.Kv(h_t)], -1)
@@ -736,7 +823,10 @@ class LongHead(nn.Module):
             beta = self._beta(bz)
             ktb = kt * torch.cat([beta, beta], -1) if self.bg > 1 else kt
             vhat = torch.einsum("bm,bmj->bj", ktb, s0) / M
-            e = vz.to(self.wd) - (vhat if self.bg > 1 else beta * vhat)
+            v = vz.to(self.wd)
+            if self.cfg.beta_write:
+                v = beta * v
+            e = v - (vhat if self.bg > 1 else beta * vhat)
             s = torch.addcmul(s0, e[:, None, :], kt[:, :, None])
             cq, sq = pq.cos(), pq.sin()
             if self.NG == 1:
@@ -781,6 +871,9 @@ class ShortHead(nn.Module):
         self.register_buffer(
             "omega", (torch.arange(L, dtype=torch.float64) * (2 * math.pi / L)).float()
         )
+        if cfg.gdn_gate and cfg.gdn_gate_scope == "both":
+            self.o_norm = nn.LayerNorm(2 * dv)
+            self.gp = nn.Linear(d, 2 * dv)
 
     @property
     def wd(self) -> torch.dtype:
@@ -799,15 +892,10 @@ class ShortHead(nn.Module):
         return b if self.bg == 1 else b[..., self.bgroup]
 
     def _out(self, u, z):
-        """(..., 2*dvi) -> (..., 2*dv). Without key verification this is just the RMS read."""
-        if not self.dk:
-            return _rms(u)
-        dv, dvi = self.dv, self.dvi
-        re, im = u[..., :dvi], u[..., dvi:]
-        val = torch.cat([re[..., :dv], im[..., :dv]], -1)
-        m = F.cosine_similarity(re[..., dv:], self.Kv(z).to(re.dtype), dim=-1, eps=1e-6)
-        # m[..., None] broadcasts against a 0-dim ga (one gate) or a (2*dv,) ga (one per channel)
-        return _rms(val) * torch.sigmoid(self.ga * m[..., None] + self.gb)
+        """(..., 2*dv) -> (..., 2*dv). Short head has no kv_dk."""
+        if self.cfg.gdn_gate and self.cfg.gdn_gate_scope == "both":
+            return self.o_norm(u) * F.silu(self.gp(z))
+        return _rms(u)
 
     def init_state(self, B: int, device) -> State:
         n, L, wd = self.L - 1, self.L, self.wd
@@ -970,6 +1058,12 @@ class LaplaceAttention(nn.Module):
         self.mix = nn.Linear(4 * dv, d)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
+        if cfg.gdn_gate and cfg.gdn_gate_scope == "concat":
+            self.gate_norm = nn.LayerNorm(4 * dv)
+            self.gate_proj = nn.Linear(d, 4 * dv)
+        elif cfg.gdn_gate and cfg.gdn_gate_scope == "mix":
+            self.gate_norm = nn.LayerNorm(d)
+            self.gate_proj = nn.Linear(d, d)
         if cfg.layer_scale:
             mix_shape = (d,) if cfg.ls_mix_per_channel else ()
             self.gs_mix = nn.Parameter(torch.full(mix_shape, cfg.ls_mix_init))
@@ -979,6 +1073,8 @@ class LaplaceAttention(nn.Module):
             w = torch.zeros(d, 1, self.ck)
             w[:, 0, -1] = 1.0  # identity at init: the conv starts as a no-op
             self.cw = nn.Parameter(w)
+        if cfg.init_v2:
+            _apply_init_v2(self)
 
     def init_state(self, B: int, device) -> State:
         dt = self.n.weight.dtype
@@ -994,6 +1090,15 @@ class LaplaceAttention(nn.Module):
     def _conv(self, z, buf):
         """Causal depthwise conv on (B,T,d); `buf` holds the ck-1 tokens preceding z."""
         zz = torch.cat([buf.to(z.dtype), z], 1)
+        conv_dtype = (torch.get_autocast_dtype("cuda")
+                      if z.is_cuda and torch.is_autocast_enabled("cuda") else z.dtype)
+        if (self.cfg.long_path == "triton_scan"
+                and z.is_cuda and z.dtype in (torch.float32, torch.bfloat16)
+                and conv_dtype in (torch.float32, torch.bfloat16) and self.ck <= 8):
+            # SiLU must precede both heads' projections; fusing it after K in
+            # phase_codes would change the model. Fuse the conv epilogue instead.
+            from .triton_conv import causal_conv
+            return causal_conv(zz, self.cw.to(z.dtype), self.cfg.conv_silu), zz[:, -(self.ck - 1):]
         zc = F.conv1d(zz.transpose(1, 2), self.cw.to(z.dtype),
                       groups=self.cfg.d).transpose(1, 2)
         # BACK TO z's dtype: LayerNorm stays fp32 under autocast but conv1d does not, and
@@ -1021,11 +1126,18 @@ class LaplaceAttention(nn.Module):
         zp = st["z_prev"].to(z.dtype)
         ul, sl = self.long.prefill(z, zp, st["long"])
         us, ss = self.short.prefill(z, zp, st["short"])
+        cat = torch.cat([ul, us], -1)
+        scope = self.cfg.gdn_gate_scope if self.cfg.gdn_gate else ""
+        if scope == "concat":
+            cat = self.gate_norm(cat) * F.silu(self.gate_proj(z))
+        mixer_out = self.mix(cat)
+        if scope == "mix":
+            mixer_out = self.gate_norm(mixer_out) * F.silu(self.gate_proj(z))
         if self.cfg.layer_scale:
-            x = x + self.gs_mix * self.mix(torch.cat([ul, us], -1))
+            x = x + self.gs_mix * mixer_out
             x = x + self.gs_ff * self.ff(self.fn(x))
         else:
-            x = x + self.mix(torch.cat([ul, us], -1))
+            x = x + mixer_out
             x = x + self.ff(self.fn(x))
         return x, {**new, "long": sl, "short": ss, "z_prev": z[:, -1]}
 
@@ -1037,11 +1149,18 @@ class LaplaceAttention(nn.Module):
         h = state["z_prev"].to(z.dtype)
         ul, sl = self.long.step(z, h, state["long"])
         us, ss = self.short.step(z, h, state["short"])
+        cat = torch.cat([ul, us], -1)
+        scope = self.cfg.gdn_gate_scope if self.cfg.gdn_gate else ""
+        if scope == "concat":
+            cat = self.gate_norm(cat) * F.silu(self.gate_proj(z))
+        mixer_out = self.mix(cat)
+        if scope == "mix":
+            mixer_out = self.gate_norm(mixer_out) * F.silu(self.gate_proj(z))
         if self.cfg.layer_scale:
-            y = x_t + self.gs_mix * self.mix(torch.cat([ul, us], -1))
+            y = x_t + self.gs_mix * mixer_out
             y = y + self.gs_ff * self.ff(self.fn(y))
         else:
-            y = x_t + self.mix(torch.cat([ul, us], -1))
+            y = x_t + mixer_out
             y = y + self.ff(self.fn(y))
         return y, {**new, "long": sl, "short": ss, "z_prev": z}
 
