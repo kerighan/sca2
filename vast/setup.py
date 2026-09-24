@@ -83,11 +83,18 @@ def _ship_fla(info: dict) -> None:
                         "-P", str(info["ssh_port"]), archive.name,
                         f"root@{info['ssh_host']}:/tmp/fla.tar.gz"],
                        check=True, timeout=600)
+    # fla imports einops at module level, so its own dependencies have to be
+    # there before the tree is worth testing. Installing them here rather than
+    # relying on the later `pip install DEPS` keeps this function's check
+    # meaningful on a host that has never been set up: the first run of setup
+    # used to fail on all three instances at once with ModuleNotFoundError,
+    # while a SECOND run passed, which made it look like a flaky host.
     run_remote(info,
                "SP=$(python -c 'import site; print(site.getsitepackages()[0])') && "
                "rm -rf $SP/fla && tar xzf /tmp/fla.tar.gz -C $SP && "
+               f"pip install -q {DEPS} && "
                "python -c 'from fla.ops.gated_delta_rule import chunk_gated_delta_rule'",
-               timeout=300)
+               timeout=1800)
 
 
 def _exclude(item: tarfile.TarInfo):
@@ -174,8 +181,12 @@ def main() -> None:
         return
 
     build = (
-        f"cd {REMOTE} && nohup python prep_zyda.py --tokens {args.tokens} "
-        f"--out {args.corpus_name} --bpe {BPE_PREFIX} "
+        # `;` and not `&&`: with `&&` the trailing `&` backgrounds the WHOLE
+        # chain, so ssh keeps stdout open, never returns, and the launch times
+        # out with no PID recorded -- while the job runs on regardless. Same
+        # trap submit.py already fell into.
+        f"cd {REMOTE}; mkdir -p runs; nohup python prep_zyda.py "
+        f"--tokens {args.tokens} --out {args.corpus_name} --bpe {BPE_PREFIX} "
         f"> runs/prep_zyda.log 2>&1 < /dev/null & echo $!"
     )
     out = run_remote(info, build, timeout=120)
