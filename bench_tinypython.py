@@ -135,9 +135,22 @@ class SCA2(nn.Module):
             # sqrt(1024) = 32, and the initial cross entropy is ~115 nats
             # instead of ln(V) = 10.37 -- measured, not estimated. The run does
             # recover, but it spends its warmup shrinking a norm rather than
-            # learning, and every gradient in that phase is clipped. 0.02 is the
-            # GPT-2 value and puts the logit std at 0.64. Scoped to the tied
-            # path so the untied campaign runs stay bit-comparable.
+            # learning, and every gradient in that phase is clipped.
+            #
+            # And it is NOT neutral across arms, which is what makes it worth a
+            # comment. Tied, the residual carries the raw embedding all the way
+            # to the head, so the head puts +32 sigma on the CURRENT token while
+            # the target is the next one. The damage therefore scales with how
+            # much of the residual is still the embedding: measured here, an
+            # unmixed residual costs 1023 nats against 131 for a fully mixed
+            # one. layer_scale with gs_mix = 0.1 is precisely a small mixer
+            # contribution, so init_v2 amplified this on OUR arm and not on the
+            # GDN baseline, which runs without layer_scale -- z_dv256 opened at
+            # 166.9 against z_gdn's 114.8, and was still behind at 240 s having
+            # seen 29% more tokens.
+            #
+            # 0.02 is the GPT-2 value and puts the logit std at 0.64. Scoped to
+            # the tied path so the untied campaign runs stay bit-comparable.
             nn.init.normal_(self.e.weight, std=0.02)
         # PLE: per-layer embedding. One shared (V, ple_dim * layers) lookup, sliced
         # per layer and projected to d. Each layer gets its own token-identity signal
