@@ -33,16 +33,22 @@ LAPA_FLAGS = ("--variant lapa_cc --Ls 128 --theta-scale 0.02 --rope-base 2048 "
               "--slow-frac 0.25 --conv 4 --layer-scale --lam-free --damp-mem 4,20000 "
               "--gdn-gate --v-silu --init-v2")
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
+BPE = "zyda_bpe32k"
 
 
 def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
-                  log: str) -> str:
+                  log: str, bpe: str = BPE) -> str:
     common = (
         f"--data {corpus}.json --block {block} --batch {batch} --d 1024 --layers 8 "
         f"--Md 4 --G 8 --freq rope --amp bf16 --lr 5e-4 --warmup 100 --clip 1.0 "
         f"--seconds {int(hours*3600)} --eval-batches 60 --eval-every 1200 "
         f"--pos-buckets 16 --samples 0 --only sca2 --log runs/{log}.jsonl "
-        f"--class-eval --save-every 7200"
+        # --class-eval reads the BPE to split "new word" from "repeated word",
+        # and its default prefix is the old 16k codeparrot table, which is not
+        # on the host: the arm then dies in its first second. --tie-embed is
+        # worse, because it does NOT fail -- it quietly adds 33 M untied output
+        # params to every arm and changes what the comparison measures.
+        f"--class-eval --bpe {bpe} --tie-embed --save-every 7200"
     )
     if arm == "gdn":
         return f"python -u pretrain.py --label z_gdn --seed 0 {common} {GDN_FLAGS} --ff 4096"
@@ -63,21 +69,31 @@ def main() -> None:
     parser.add_argument("--block", type=int, default=2048)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--log", default="zyda")
+    parser.add_argument("--bpe", default=BPE)
     parser.add_argument("--slot", type=int, default=0)
     args = parser.parse_args()
 
     if (args.command is None) == (args.arm is None):
         parser.error("pass exactly one of a raw command or --arm")
     command = args.command or build_command(
-        args.arm, args.hours, args.corpus, args.block, args.batch, args.log)
+        args.arm, args.hours, args.corpus, args.block, args.batch, args.log,
+        args.bpe)
 
     info = live(args.slot)
     if args.arm:
-        check = run_remote(info, f"test -s {REMOTE}/{args.corpus}.json", check=False)
-        if check.returncode != 0:
-            raise SystemExit(f"{args.corpus}.json is not on the host yet; "
-                             f"finish the corpus build first "
-                             f"(python -m vast.logs --name prep_zyda)")
+        # Every input the command names must exist BEFORE the job is detached:
+        # once it is, a missing file shows up only as an empty log, and the
+        # card bills while nothing runs.
+        need = [f"{REMOTE}/{args.corpus}.json", f"{REMOTE}/{args.corpus}.bin",
+                f"{REMOTE}/{args.bpe}-vocab.json", f"{REMOTE}/{args.bpe}-merges.txt"]
+        check = run_remote(
+            info, " ; ".join(f"test -s {p} || echo MISSING {p}" for p in need),
+            check=False)
+        missing = [ln.split()[1] for ln in check.stdout.split("\n") if "MISSING" in ln]
+        if missing:
+            raise SystemExit("not on the host yet:\n  " + "\n  ".join(missing)
+                             + "\nfinish the corpus build first "
+                               "(python -m vast.logs --name prep_zyda)")
 
     # The bracket keeps the pattern from matching the shell that carries it:
     # pgrep -f sees every command line including its own, so a bare
