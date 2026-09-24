@@ -70,3 +70,7 @@ nohup.out
 *.tmp
 *.orig
 *.rej
+
+# corpus meta genere par prep_zyda.py (pointeur vers un .bin non versionne)
+zyda*.json
+!zyda_bpe32k-vocab.json

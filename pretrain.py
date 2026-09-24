@@ -16,7 +16,7 @@ Both arms see identical data in identical order.
     python prep_fineweb.py            # once
     python pretrain.py --seconds 900
 """
-import argparse, json, math, sys, time
+import argparse, json, math, os, sys, time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,6 +37,46 @@ def amp_ctx():
     The loss is always taken on float32 logits, and the layer keeps its recurrent
     state and phases in float32 regardless (lapa/layer.py precision policy)."""
     return torch.autocast("cuda", dtype=AMP, enabled=AMP is not None)
+
+
+class MemmapTokens:
+    """A slice of a uint16 token file, indexed like a tensor.
+
+    At 20B tokens the corpus is 40 GB on disk and cannot be a torch .pt: that
+    format materialises the whole thing in RAM before it can be saved or read.
+    A memory map pages in only the window a batch touches, so the resident set
+    stays at a few hundred MB whatever the corpus size. Slicing returns int64
+    because that is what nn.Embedding wants and what the .pt path produced.
+    """
+
+    def __init__(self, arr, lo, hi):
+        self.arr, self.lo, self.hi = arr, lo, hi
+
+    def __len__(self):
+        return self.hi - self.lo
+
+    def __getitem__(self, s):
+        if isinstance(s, slice):
+            a = self.lo + (s.start or 0)
+            b = self.lo + (len(self) if s.stop is None else s.stop)
+            return torch.from_numpy(self.arr[a:min(b, self.hi)].astype("int64"))
+        return int(self.arr[self.lo + s])
+
+
+def load_corpus(path):
+    """(train, val, vocab) from either a torch .pt or a prep_zyda .json + .bin."""
+    if path.endswith(".json"):
+        import json as _json
+        import numpy as _np
+        meta = _json.load(open(path))
+        binp = os.path.join(os.path.dirname(os.path.abspath(path)), meta["bin"])
+        arr = _np.memmap(binp, dtype=meta["dtype"], mode="r", shape=(meta["total"],))
+        n_tr = meta["n_train"]
+        return (MemmapTokens(arr, 0, n_tr),
+                MemmapTokens(arr, n_tr, meta["total"]),
+                meta["vocab"])
+    z = torch.load(path)
+    return z["train"], z["val"], z["vocab"]
 
 
 def batches(data, B, T, device):
@@ -370,8 +410,7 @@ def main(argv=None):
         CLS_TAB = tc.load_table(a.bpe)
     device = "cuda"
 
-    z = torch.load(a.data)
-    tr, va, V = z["train"], z["val"], z["vocab"]
+    tr, va, V = load_corpus(a.data)
     print(f"corpus {len(tr)/1e6:.1f}M train / {len(va)/1e6:.1f}M val tokens, vocab {V}")
     print(f"budget {a.seconds:.0f}s per arm, {a.layers} layers, B={a.batch} T={a.block}\n")
 
