@@ -47,33 +47,47 @@ def _register_versions():
                      layer_cls=m.Layer, wrap=compile_wrap)
 
 
+# Imported one at a time, so a module whose optional dependency is absent costs
+# only its own variants. This used to be a single try/except ImportError around
+# the whole block: on a fresh host where flash-linear-attention had been
+# installed --no-deps, arch_mamba2 raised, the except swallowed it, and EVERY
+# variant vanished -- `lapa_cc` included, with a KeyError as the only symptom
+# and nothing pointing at the real cause.
+_VARIANT_MODULES = [
+    ("variants",      "historical experiments"),
+    ("arch_sepq",     "architecture candidate"),
+    ("arch_fixdecay", "convolution-form candidate"),
+    ("arch_cumsum",   "original SeqCond temporal form"),
+    ("arch_gdn",      "Gated DeltaNet baseline"),
+    ("arch_keyed",    "key-addressed delta rule"),
+    ("arch_gatedc",   "gated multi-head C head"),
+    ("arch_wgroup",   "per-value-group spectral weights"),
+    ("arch_cdelta",   "complex error-correcting C write"),
+    ("arch_hybrid",   "cdelta C head + GDN D head"),
+    ("arch_short",    "cdelta C head + short dft C head"),
+    ("arch_damp",     "cdelta with per-mode decay (Laplace)"),
+    ("arch_gdn2",     "Gated DeltaNet-2 baseline (via lapa)"),
+    ("arch_lapa",     "Laplace Attention v1 (via lapa), the fast path"),
+    ("arch_mamba2",   "Mamba2 (SSD) baseline via fla"),
+    ("fast_dhead",    "loop-free D head (iso with sepq/polar)"),
+    ("triton_dhead",  "fused kernel (needs triton)"),
+]
+
+#: {module name: the exception that kept it out}, for diagnosing a thin registry.
+UNAVAILABLE: dict[str, str] = {}
+
+
 def _load_variants():
     """Import experimental variants and architecture candidates."""
-    from . import variants     # noqa: F401  historical experiments
-    from . import arch_sepq     # noqa: F401  architecture candidate
-    from . import arch_fixdecay # noqa: F401  convolution-form candidate
-    from . import arch_cumsum   # noqa: F401  original SeqCond temporal form
-    from . import arch_gdn      # noqa: F401  Gated DeltaNet baseline
-    from . import arch_keyed    # noqa: F401  key-addressed delta rule
-    from . import arch_gatedc   # noqa: F401  gated multi-head C head
-    from . import arch_wgroup   # noqa: F401  per-value-group spectral weights
-    from . import arch_cdelta   # noqa: F401  complex error-correcting C write
-    from . import arch_hybrid   # noqa: F401  cdelta C head + GDN D head
-    from . import arch_short    # noqa: F401  cdelta C head + short dft C head
-    from . import arch_damp     # noqa: F401  cdelta with per-mode decay (Laplace)
-    from . import arch_gdn2     # noqa: F401  Gated DeltaNet-2 baseline (via lapa)
-    from . import arch_lapa     # noqa: F401  Laplace Attention v1 (via lapa), the fast path
-    from . import arch_mamba2   # noqa: F401  Mamba2 (SSD) baseline via fla
-    from . import fast_dhead    # noqa: F401  loop-free D head (iso with sepq/polar)
-    try:
-        from . import triton_dhead  # noqa: F401  fused kernel (needs triton)
-    except Exception as e:  # triton missing or unsupported GPU
-        import warnings
-        warnings.warn(f"triton D-head unavailable: {e}")
+    import importlib
+    import warnings
+    for name, note in _VARIANT_MODULES:
+        try:
+            importlib.import_module(f".{name}", __package__)
+        except Exception as exc:                        # noqa: BLE001
+            UNAVAILABLE[name] = f"{type(exc).__name__}: {exc}"
+            warnings.warn(f"sca2 variant module {name} ({note}) unavailable: {exc}")
 
 
 _register_versions()
-try:
-    _load_variants()
-except ImportError:
-    pass
+_load_variants()

@@ -39,9 +39,55 @@ BPE_PREFIX = "zyda_bpe32k"
 # The image lacks these. torch is deliberately absent, and so is triton: torch
 # ships its own pinned build (pytorch-triton) and a pip `triton` installs over
 # it with a version the compiled kernels were not built against.
-DEPS = "datasets tokenizers numpy pyarrow einops"
-# flash-linear-attention provides the GDN baseline's Triton kernels.
-DEPS_FLA = "flash-linear-attention"
+DEPS = "datasets tokenizers numpy pyarrow einops transformers ninja"
+
+# flash-linear-attention provides the GDN baseline's Triton kernels, and it is
+# SHIPPED FROM THIS MACHINE rather than installed from PyPI. The 0.5.2 wheel on
+# PyPI unpacks to `fla/layers` and `fla/models` only -- no `fla/ops`, so
+# `from fla.ops.gated_delta_rule import chunk_gated_delta_rule` fails and the
+# GDN baseline silently disappears from the registry. The local install has the
+# full tree (its own RECORD does not list fla/ops either, so it did not come
+# from that wheel), and every GDN number in the campaign was produced with it.
+# Copying it verbatim is also the stronger choice scientifically: the baseline
+# is then byte-identical between the GB10 results and the rented GPU.
+FLA_LOCAL = "fla"
+
+
+
+def _ship_fla(info: dict) -> None:
+    """Copy this machine's flash-linear-attention into the host's site-packages.
+
+    See FLA_LOCAL: the PyPI wheel is missing fla/ops, which is the half the GDN
+    baseline imports. Shipping the working tree keeps the baseline identical on
+    both machines, which is what makes the two sets of numbers comparable.
+    """
+    import site
+    src = None
+    for base in site.getsitepackages() + [site.getusersitepackages()]:
+        cand = Path(base) / FLA_LOCAL
+        if (cand / "ops").is_dir():
+            src = cand
+            break
+    if src is None:
+        raise FileNotFoundError(
+            "no local flash-linear-attention with fla/ops; the GDN baseline "
+            "cannot run remotely. Install one that has it, or drop the gdn arm."
+        )
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as archive:
+        with tarfile.open(archive.name, "w:gz") as bundle:
+            bundle.add(src, arcname="fla",
+                       filter=lambda i: None if "__pycache__" in i.name else i)
+        print(f"shipping flash-linear-attention from {src} "
+              f"({Path(archive.name).stat().st_size/1e6:.1f} MB)")
+        subprocess.run(["scp", "-q", "-o", "StrictHostKeyChecking=accept-new",
+                        "-P", str(info["ssh_port"]), archive.name,
+                        f"root@{info['ssh_host']}:/tmp/fla.tar.gz"],
+                       check=True, timeout=600)
+    run_remote(info,
+               "SP=$(python -c 'import site; print(site.getsitepackages()[0])') && "
+               "rm -rf $SP/fla && tar xzf /tmp/fla.tar.gz -C $SP && "
+               "python -c 'from fla.ops.gated_delta_rule import chunk_gated_delta_rule'",
+               timeout=300)
 
 
 def _exclude(item: tarfile.TarInfo):
@@ -89,12 +135,16 @@ def main() -> None:
                         f"root@{info['ssh_host']}:/tmp/{PROJECT}.tar.gz"],
                        check=True, timeout=900)
 
+    _ship_fla(info)
+
     unpack = (
         f"mkdir -p {REMOTE} && cd {REMOTE} && "
         f"tar xzf /tmp/{PROJECT}.tar.gz && mkdir -p runs plot && "
-        f"pip install -q --no-deps {DEPS_FLA} ; pip install -q {DEPS} && "
-        f"python -c \"import torch, triton; print('torch', torch.__version__, "
-        f"'cuda', torch.cuda.is_available(), 'triton', triton.__version__)\""
+        f"pip install -q {DEPS} && "
+        f"python -c \"import torch, triton; "
+        f"from fla.ops.gated_delta_rule import chunk_gated_delta_rule; "
+        f"print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), "
+        f"'triton', triton.__version__, 'fla ops ok')\""
     )
     out = run_remote(info, unpack, timeout=900)
     print(out.stdout.strip() or out.stderr.strip())
