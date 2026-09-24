@@ -128,6 +128,17 @@ class SCA2(nn.Module):
         self.tie_embed = tie_embed
         if tie_embed:
             self.o.weight = self.e.weight
+            # Tying makes the embedding the OUTPUT matrix too, and nn.Embedding
+            # initialises at N(0,1) while nn.Linear initialises at U(+-1/sqrt(d)).
+            # The head then sees a matrix 32x too large: after `on`, h has unit
+            # RMS per channel, so a logit is a 1024-term dot product with std
+            # sqrt(1024) = 32, and the initial cross entropy is ~115 nats
+            # instead of ln(V) = 10.37 -- measured, not estimated. The run does
+            # recover, but it spends its warmup shrinking a norm rather than
+            # learning, and every gradient in that phase is clipped. 0.02 is the
+            # GPT-2 value and puts the logit std at 0.64. Scoped to the tied
+            # path so the untied campaign runs stay bit-comparable.
+            nn.init.normal_(self.e.weight, std=0.02)
         # PLE: per-layer embedding. One shared (V, ple_dim * layers) lookup, sliced
         # per layer and projected to d. Each layer gets its own token-identity signal
         # directly, bypassing the residual stream. 0 = off.
