@@ -53,6 +53,56 @@ def _validate_jsonl(path: Path) -> int:
     return rows
 
 
+def _key(row: dict):
+    """What makes an eval unique: which arm, and where it was in its run."""
+    return (row.get("model"), row.get("seed"), row.get("step"), row.get("tokens"))
+
+
+def _merge_jsonl(fresh: Path, archive: Path) -> tuple[int, int]:
+    """Union the newly pulled evals into an append-only local archive.
+
+    Replacing the local file with the remote one is not safe: the remote is
+    truncated when a run is relaunched with `: > log`, a partial transfer can
+    land mid-line, and either way the history that only existed locally is
+    gone. Merging on (model, seed, step, tokens) means a pull can only ever ADD
+    evals, so no accident upstream can destroy what has already been collected.
+
+    Returns (rows in the archive, rows this pass added).
+    """
+    seen, out = {}, []
+    if archive.exists():
+        with archive.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue                      # a truncated local tail is dropped
+                k = _key(row)
+                if k not in seen:
+                    seen[k] = True
+                    out.append(line if line.endswith("\n") else line + "\n")
+    added = 0
+    with fresh.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue                          # the remote tail can be mid-write
+            k = _key(row)
+            if k not in seen:
+                seen[k] = True
+                out.append(line if line.endswith("\n") else line + "\n")
+                added += 1
+    tmp = archive.with_suffix(archive.suffix + ".part")
+    tmp.write_text("".join(out))
+    tmp.replace(archive)
+    return len(out), added
+
+
 def _validate_ckpt(path: Path) -> str:
     import torch
     ck = torch.load(path, map_location="cpu")
@@ -67,14 +117,13 @@ def collect_once(slot: int, log_name: str, checkpoints: bool) -> bool:
 
     remote_log = f"{REMOTE}/runs/{log_name}.jsonl"
     if run_remote(info, f"test -s {remote_log}", check=False).returncode == 0:
-        target = OUT / f"{log_name}.jsonl"
-        if _download(info, remote_log, target, timeout=300):
-            try:
-                rows = _validate_jsonl(target)
-                print(f"  {target.name}: {rows} evals")
-                got = True
-            except json.JSONDecodeError as exc:
-                print(f"  {target.name}: INVALID ({exc}); keeping the instance")
+        archive = OUT / f"{log_name}.jsonl"
+        staged = OUT / f".{log_name}.jsonl.remote"
+        if _download(info, remote_log, staged, timeout=300):
+            total, added = _merge_jsonl(staged, archive)
+            staged.unlink(missing_ok=True)
+            print(f"  {archive.name}: {total} evals (+{added})")
+            got = True
 
     if checkpoints:
         listing = run_remote(info, f"ls -1 {REMOTE}/runs/ck_*.pt 2>/dev/null || true",
@@ -96,6 +145,9 @@ def main() -> None:
     parser.add_argument("--slot", type=int, default=0)
     parser.add_argument("--watch", type=int, default=0,
                         help="seconds between passes; 0 = one pass and exit")
+    parser.add_argument("--ckpt-every", type=int, default=8, dest="ckpt_every",
+                        help="pull checkpoints every Nth pass (they are ~600 MB; "
+                             "the eval log comes every pass)")
     parser.add_argument("--no-checkpoints", action="store_true", dest="no_ckpt")
     parser.add_argument("--deadline-hours", type=float, default=80.0,
                         help="stop watching after this long, so nothing waits forever")
@@ -105,19 +157,40 @@ def main() -> None:
         collect_once(args.slot, args.log, not args.no_ckpt)
         return
 
+    # The eval log is a few hundred KB and IS the scientific result, so it is
+    # pulled every pass. A checkpoint is ~600 MB and only supports the
+    # structural analysis, so it is pulled every Nth. What bounds the loss when
+    # a host disappears is cadence, not completeness.
     end = time.time() + args.deadline_hours * 3600
+    n = 0
     while time.time() < end:
-        print(f"[{time.strftime('%H:%M')}] collecting")
+        n += 1
+        want_ckpt = (not args.no_ckpt) and (n % args.ckpt_every == 0)
+        print(f"[{time.strftime('%H:%M')}] pass {n}"
+              f"{' (with checkpoints)' if want_ckpt else ''}")
         try:
-            collect_once(args.slot, args.log, not args.no_ckpt)
+            collect_once(args.slot, args.log, want_ckpt)
         except Exception as exc:                              # noqa: BLE001
-            print(f"  pass failed: {exc}")
-        info = live(args.slot)
-        # bracketed so the pattern cannot match the shell carrying it
-        busy = run_remote(info, "pgrep -c -f '[p]retrain[.]py' || true", check=False)
-        if busy.stdout.strip() in ("", "0"):
-            print("no pretrain.py running: final pass, then stopping")
-            collect_once(args.slot, args.log, not args.no_ckpt)
+            # A transient ssh or API failure must never end the watch: that
+            # would leave the run uncollected AND the instance billing.
+            print(f"  pass failed ({type(exc).__name__}: {exc}); retrying next pass")
+            time.sleep(args.watch)
+            continue
+        try:
+            info = live(args.slot)
+            # bracketed so the pattern cannot match the shell carrying it
+            busy = run_remote(info, "pgrep -c -f '[p]retrain[.]py' || true",
+                              check=False)
+            idle = busy.stdout.strip() in ("", "0")
+        except Exception:                                     # noqa: BLE001
+            idle = False                                      # unknown is not idle
+        if idle:
+            print("no pretrain.py running: final pass with checkpoints, then stopping")
+            try:
+                collect_once(args.slot, args.log, not args.no_ckpt)
+            except Exception as exc:                          # noqa: BLE001
+                print(f"  final pass failed: {exc}; the instance is KEPT")
+                return
             print("teardown when you have checked the artifacts:\n"
                   "  python -m vast.teardown --yes")
             return
