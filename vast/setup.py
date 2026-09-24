@@ -30,14 +30,16 @@ from .common import PROJECT, REMOTE, live, run_remote, ssh_target, ROOT
 UPLOAD = [
     "lapa", "sca2",
     "pretrain.py", "bench_tinypython.py", "prep_zyda.py", "prep_longdoc.py",
-    "plot_lm.py", "curves_t2048.sh",
+    "bench_vocab.py", "plot_lm.py", "curves_t2048.sh",
     "vast",
 ]
 # The tokenizer files, matched by prefix. Fitted locally so both sides agree.
 BPE_PREFIX = "zyda_bpe32k"
 
-# The image lacks these; torch is deliberately absent from the list.
-DEPS = "datasets tokenizers numpy pyarrow triton einops"
+# The image lacks these. torch is deliberately absent, and so is triton: torch
+# ships its own pinned build (pytorch-triton) and a pip `triton` installs over
+# it with a version the compiled kernels were not built against.
+DEPS = "datasets tokenizers numpy pyarrow einops"
 # flash-linear-attention provides the GDN baseline's Triton kernels.
 DEPS_FLA = "flash-linear-attention"
 

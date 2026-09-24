@@ -79,7 +79,11 @@ def main() -> None:
                              f"finish the corpus build first "
                              f"(python -m vast.logs --name prep_zyda)")
 
-    busy = run_remote(info, f"pgrep -c -f 'pretrain.py' || true", check=False)
+    # The bracket keeps the pattern from matching the shell that carries it:
+    # pgrep -f sees every command line including its own, so a bare
+    # 'pretrain.py' always reports at least one match and every submission
+    # would be refused.
+    busy = run_remote(info, "pgrep -c -f '[p]retrain[.]py' || true", check=False)
     if busy.stdout.strip() not in ("", "0"):
         raise SystemExit("a pretrain.py is already running on this host; "
                          "arms are queued one at a time on a single GPU")

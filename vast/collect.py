@@ -113,7 +113,8 @@ def main() -> None:
         except Exception as exc:                              # noqa: BLE001
             print(f"  pass failed: {exc}")
         info = live(args.slot)
-        busy = run_remote(info, "pgrep -c -f pretrain.py || true", check=False)
+        # bracketed so the pattern cannot match the shell carrying it
+        busy = run_remote(info, "pgrep -c -f '[p]retrain[.]py' || true", check=False)
         if busy.stdout.strip() in ("", "0"):
             print("no pretrain.py running: final pass, then stopping")
             collect_once(args.slot, args.log, not args.no_ckpt)
