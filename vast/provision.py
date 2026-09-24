@@ -15,10 +15,30 @@ import argparse
 import base64
 import os
 from pathlib import Path
+import signal
 import subprocess
+import json
 import time
 
-from .common import PROJECT, save_instances, ssh_target, vast, wait_for_instance, account
+from .common import (PROJECT, POOL_FILE, save_instances, ssh_target, vast,
+                     wait_for_instance, account)
+
+
+class Interrupted(Exception):
+    """A signal, raised where the rent/validate loop can clean up after it.
+
+    `timeout 1500 python -m vast.provision` sends SIGTERM, whose default action
+    is to die immediately. An instance created moments earlier is then neither
+    destroyed by the `except` nor recorded by the `finally`: it bills with
+    nothing pointing at it, and every local check still looks clean. Turning the
+    signal into an ordinary exception puts it back inside the handling that
+    already exists. `vast.adopt` recovers the older orphans.
+    """
+
+
+def _raise_on_signal(signum, _frame):
+    raise Interrupted(f"signal {signum}")
+
 
 # A CUDA-enabled Torch is already in the image; never let pip replace it.
 IMAGE = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel"
@@ -57,10 +77,26 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-hourly", type=float, default=0.90)
     parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--append", action="store_true",
+                        help="add to the recorded pool instead of replacing it")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.count < 1:
         parser.error("--count must be positive")
+
+    # Saving a fresh pool over an existing one does not stop the old instances:
+    # it only stops us from KNOWING about them, and an untracked instance bills
+    # until someone notices. Either reuse what is already rented or say so.
+    existing: list[dict] = []
+    if POOL_FILE.exists():
+        existing = json.loads(POOL_FILE.read_text())
+    if existing and not args.append:
+        raise SystemExit(
+            f"{len(existing)} instance(s) already recorded: "
+            + ", ".join(str(p["id"]) for p in existing)
+            + "\npass --append to keep them and rent alongside, or "
+              "`python -m vast.teardown --yes` to release them first.")
+    base = len(existing)
 
     who = account()
     print(f"account {who.get('id')}  credit ${who.get('credit', 0):.2f}  "
@@ -82,7 +118,7 @@ def main() -> None:
     if len(preview) < args.count:
         raise RuntimeError(f"only {len(preview)} distinct hosts found")
 
-    for slot, offer in enumerate(preview):
+    for slot, offer in enumerate(preview, start=base):
         print(f"slot {slot}: offer {offer['id']}  {offer['gpu_name']} "
               f"{offer['gpu_ram']/1024:.0f} GB  "
               f"down {offer.get('inet_down', 0):.0f} Mb/s  "
@@ -102,6 +138,9 @@ def main() -> None:
                + " | base64 -d >> /root/.ssh/authorized_keys; "
                  "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys")
 
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _raise_on_signal)
+
     pool, attempted = [], set()
     try:
         for offer in offers:
@@ -111,7 +150,7 @@ def main() -> None:
             if machine in attempted:
                 continue
             attempted.add(machine)
-            slot, instance_id = len(pool), None
+            slot, instance_id = base + len(pool), None
             try:
                 created = vast("create", "instance", str(offer["id"]), "--image", IMAGE,
                                "--disk", str(DISK_GB), "--ssh", "--direct",
@@ -138,19 +177,23 @@ def main() -> None:
                              "gpu": offer["gpu_name"], "dph": float(offer["dph_total"]),
                              "machine_id": machine, "calib_tok_s": None})
             except Exception as exc:                      # noqa: BLE001
-                print(f"offer {offer['id']} ({machine}) unusable: {exc}")
+                stop = isinstance(exc, Interrupted)
+                print(f"offer {offer['id']} ({machine}) "
+                      f"{'interrupted' if stop else 'unusable'}: {exc}")
                 if instance_id is not None:
                     try:
                         vast("destroy", "instance", str(instance_id), "--yes")
                     except Exception:                     # noqa: BLE001
                         print(f"  WARNING: could not destroy {instance_id}, "
-                              f"check `vastai show instances`")
+                              f"recover it with `python -m vast.adopt`")
+                if stop:
+                    raise
         if len(pool) < args.count:
             raise RuntimeError(f"only provisioned {len(pool)}/{args.count}")
     finally:
         if pool:
-            save_instances(pool)
-            print(f"\nrecorded {len(pool)} instance(s) in vast/runtime/")
+            save_instances(existing + pool)
+            print(f"\nrecorded {len(existing) + len(pool)} instance(s) in vast/runtime/ ({len(pool)} new)")
             print("next: python -m vast.setup")
 
 
