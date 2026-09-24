@@ -135,7 +135,8 @@ def main() -> None:
                 if not ok:
                     raise RuntimeError(f"instance {instance_id} never validated CUDA")
                 pool.append({"id": instance_id, "slot": slot,
-                             "gpu": offer["gpu_name"], "dph": float(offer["dph_total"])})
+                             "gpu": offer["gpu_name"], "dph": float(offer["dph_total"]),
+                             "machine_id": machine, "calib_tok_s": None})
             except Exception as exc:                      # noqa: BLE001
                 print(f"offer {offer['id']} ({machine}) unusable: {exc}")
                 if instance_id is not None:
