@@ -1,4 +1,9 @@
-"""Fused phase/decay/code construction and analytical code gradients."""
+"""Fused phase/decay/code construction and analytical code gradients.
+
+Inputs are projected keys K(z), where z already includes conv_silu when set.
+The activation is fused before the projections in triton_conv.py: moving it
+here would compute silu(K(z)) instead of K(silu(z)), changing both heads.
+"""
 
 import torch
 import triton
@@ -25,7 +30,7 @@ def _codes(
     G: tl.constexpr,
     BT: tl.constexpr,
     BM: tl.constexpr,
-    COMPACT: tl.constexpr = False,
+    COMPACT: tl.constexpr,
 ):
     bk = tl.program_id(0) // tl.cdiv(C, BT)
     tile = tl.program_id(0) % tl.cdiv(C, BT)
@@ -92,7 +97,7 @@ def _codes_backward(
     P: tl.constexpr,
     BT: tl.constexpr,
     BM: tl.constexpr,
-    COMPACT: tl.constexpr = False,
+    COMPACT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     bk = pid // tl.cdiv(C, BT)

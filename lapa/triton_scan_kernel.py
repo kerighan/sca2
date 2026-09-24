@@ -1,4 +1,4 @@
-"""Whole-sequence long-head scan: one launch per direction.
+"""Whole-sequence forward scan and two-part reverse chunks.
 
 The chunk loop is sequential in the chunk index only. Given the codes, the
 inverse and the values, every column of the value width is independent -- the
@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .triton_scan_tune import matrix_tuner, scan_tuner
+
 
 @triton.jit
 def _scale(x, dt):
@@ -21,12 +23,13 @@ def _scale(x, dt):
     return x.to(dt).to(tl.float32)
 
 
+@scan_tuner("fwd")
 @triton.jit
 def _fwd(
     QK, KK, FQ, K2, W, V, BE, ST, D1, DC, GT, OUT, EB, RB, HB, S0,
     B: tl.constexpr, K: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
     D: tl.constexpr, G: tl.constexpr, BC: tl.constexpr, BN: tl.constexpr,
-    TK: tl.constexpr, SAVE: tl.constexpr,
+    TK: tl.constexpr, SAVE: tl.constexpr, DEV: tl.constexpr,
 ):
     b, g, jb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     WID: tl.constexpr = D // G
@@ -71,14 +74,15 @@ def _fwd(
                     cm[:, None] & cm[None, :], 0.0)
         e = tl.dot(w, h, input_precision="tf32x3")
         eb = e.to(dt)
-        # ---- output: K2 @ e + FQ @ s0, real and imaginary rows -------------
-        kp = K2 + ((bk * G + g) * 2 * C + ci[:, None]) * C + ci[None, :]
-        o_re = tl.dot(tl.load(kp, cm[:, None] & cm[None, :], 0.0), eb,
-                      input_precision="tf32x3")
-        o_im = tl.dot(tl.load(kp + C * C, cm[:, None] & cm[None, :], 0.0), eb,
-                      input_precision="tf32x3")
-        o_re = _scale(o_re, dt)
-        o_im = _scale(o_im, dt)
+        # Save the solve intermediates now: keeping r/h alive through the
+        # output/state loop caused hundreds of register spills at D=384.
+        if SAVE:
+            tl.store(EB + (bk * C + ci[:, None]) * D + j[None, :], eb, cj)
+            tl.store(RB + (bk * C + ci[:, None]) * D + j[None, :], r, cj)
+            tl.store(HB + (bk * C + ci[:, None]) * D + j[None, :], h, cj)
+        # ---- output/state update -----------------------------------------
+        # Delay K2 @ e until after the mode loop, so its two accumulators do
+        # not compete for registers with the live state and z accumulators.
         z_re = tl.zeros((BC, BN), tl.float32)
         z_im = tl.zeros((BC, BN), tl.float32)
         fp = FQ + ((bk * G + g) * C + ci[:, None]) * R
@@ -111,21 +115,22 @@ def _fwd(
             tl.store(wp + (m0 + H) * D,
                      shi * tl.load(DC + H + mm, mk, 0.0)[:, None]
                      + _scale(whi, dt) * tl.load(GT + H + mm, mk, 0.0)[:, None], sm)
+        kp = K2 + ((bk * G + g) * 2 * C + ci[:, None]) * C + ci[None, :]
+        cc = cm[:, None] & cm[None, :]
         op = OUT + (bk * C + ci[:, None]) * 2 * D + j[None, :]
+        o_re = _scale(tl.dot(tl.load(kp, cc, 0.0), eb, input_precision="tf32x3"), dt)
         tl.store(op, _scale(o_re + _scale(z_re, dt), dt) / (R // 2), cj)
+        o_im = _scale(tl.dot(tl.load(kp + C * C, cc, 0.0), eb, input_precision="tf32x3"), dt)
         tl.store(op + D, _scale(o_im + _scale(z_im, dt), dt) / (R // 2), cj)
-        if SAVE:
-            tl.store(EB + (bk * C + ci[:, None]) * D + j[None, :], eb, cj)
-            tl.store(RB + (bk * C + ci[:, None]) * D + j[None, :], r, cj)
-            tl.store(HB + (bk * C + ci[:, None]) * D + j[None, :], h, cj)
 
 
+@scan_tuner("bwd")
 @triton.jit(do_not_specialize=["n"])
 def _bwd(
-    KK, K2, W, BE, ST, D1, GT, EB, RB, DO, DSR, DE, DRM, DSG, DV, PB, PR, n,
+    KK, K2, W, BE, GT, RB, DO, DSR, DE, DRM, DSG, DV, PB, n,
     B: tl.constexpr, K: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
     D: tl.constexpr, G: tl.constexpr, BC: tl.constexpr, BN: tl.constexpr,
-    TK: tl.constexpr, NC: tl.constexpr,
+    TK: tl.constexpr, NC: tl.constexpr, DEV: tl.constexpr,
 ):
     """One reverse chunk: the state-write adjoint, the delta solve and dv/dbeta.
 
@@ -145,12 +150,14 @@ def _bwd(
     tkr = tl.arange(0, TK)
     cj = cm[:, None] & jm[None, :]
     cc = cm[:, None] & cm[None, :]
-    pc = g * NC + jb
-    pp = (b * G + g) * NC + jb
+    # Each tile owns BN/16 scratch slots, zeroing its unused slots. This
+    # keeps scratch layouts independent of autotuning without reset passes.
+    slots = tl.arange(0, BN // 16)
+    part_col = jb * (BN // 16) + slots
+    valid_part = part_col < NC
+    pc = g * NC + part_col
     bk = b * K + n
-    sp = ST + ((n * B + b) * R + tkr[:, None]) * D + j[None, :]
     dp = DSR + (b * R + tkr[:, None]) * D + j[None, :]
-    eb = tl.load(EB + (bk * C + ci[:, None]) * D + j[None, :], cj, 0.0)
     op = DO + (b * K * C + n * C + ci[:, None]) * 2 * D + j[None, :]
     dor = tl.load(op, cj, 0.0)
     doi = tl.load(op + D, cj, 0.0)
@@ -161,8 +168,6 @@ def _bwd(
         sm = mk[:, None] & jm[None, :]
         msk = cm[:, None] & mk[None, :]
         ds = tl.load(dp + m0 * D, sm, 0.0)
-        s = tl.load(sp + m0 * D, sm, 0.0).to(tl.float32) \
-            / tl.load(D1 + mm, mk, 1.0)[:, None]
         # The gT gradient is sum_j ds . (Kk^T e), which reassociates into
         # sum_c Kk . (e ds^T): the code-gradient kernel already forms that
         # product, so the write is never recomputed here.
@@ -170,7 +175,6 @@ def _bwd(
         dsg = (ds * tl.load(GT + mm, mk, 0.0)[:, None]).to(dt)
         kk = tl.load(KK + (bk * C + ci[:, None]) * R + mm[None, :], msk, 0.0)
         dek = tl.dot(kk, dsg, dek, input_precision="tf32x3")
-        tl.store(PR + ((pp * K + n) * R + mm), tl.sum(ds * s, 1), mk)
     kp = K2 + ((bk * G + g) * 2 * C + ci[:, None]) * C + ci[None, :]
     da = tl.dot(tl.trans(tl.load(kp, cc, 0.0)), dor, input_precision="tf32x3")
     da = tl.dot(tl.trans(tl.load(kp + C * C, cc, 0.0)), doi, da,
@@ -180,18 +184,21 @@ def _bwd(
     dh = tl.dot(tl.trans(w), de, input_precision="tf32x3")
     r = tl.load(RB + (bk * C + ci[:, None]) * D + j[None, :], cj, 0.0)
     be = tl.load(BE + bk * C + ci, cm, 0.0)
-    tl.store(PB + (pc * B * K * C + bk * C + ci), -tl.sum(dh * r, 1), cm)
+    tl.store(PB + pc[:, None] * B * K * C + bk * C + ci[None, :],
+             tl.where(slots[:, None] == 0, -tl.sum(dh * r, 1)[None, :], 0.0),
+             valid_part[:, None] & cm[None, :])
     tl.store(DV + (bk * C + ci[:, None]) * D + j[None, :], dh, cj)
     tl.store(DE + (bk * C + ci[:, None]) * D + j[None, :], de.to(dt), cj)
     tl.store(DRM + (bk * C + ci[:, None]) * D + j[None, :],
              (-be[:, None] * dh / H).to(dt), cj)
 
 
+@scan_tuner("bwd2")
 @triton.jit(do_not_specialize=["n"])
-def _bwd2(QK, FQ, DO, DRM, ST, DSR, D1, DC, PR, n,
+def _bwd2(QK, FQ, DO, DRM, ST, DSR, D1, DC, PR, PC, n,
           B: tl.constexpr, K: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
           D: tl.constexpr, G: tl.constexpr, BC: tl.constexpr, BN: tl.constexpr,
-          TK: tl.constexpr, NC: tl.constexpr):
+          TK: tl.constexpr, NC: tl.constexpr, DEV: tl.constexpr):
     """The mode-parallel half: the read adjoint and the state-gradient step.
 
     ds0 = Fq^T do + Qk^T dr is a per-mode outer product and the state gradient
@@ -240,18 +247,27 @@ def _bwd2(QK, FQ, DO, DRM, ST, DSR, D1, DC, PR, n,
     dhi1 = tl.load(D1 + H + mm, mk, 1.0)[:, None]
     slo = tl.load(sp, sm, 0.0).to(tl.float32) / dlo1
     shi = tl.load(sp + H * D, sm, 0.0).to(tl.float32) / dhi1
-    pd = PR + (((b * G + g) * NC + tl.program_id(1)) * K + n) * R + mm
-    tl.store(pd, tl.sum(lo * slo, 1), mk)
-    tl.store(pd + H, tl.sum(hi * shi, 1), mk)
+    slots = tl.arange(0, BN // 16)
+    part_col = tl.program_id(1) * (BN // 16) + slots
+    pd = PR + (((b * G + g) * NC + part_col[:, None]) * K + n) * R + mm[None, :]
+    pm = (part_col[:, None] < NC) & mk[None, :]
+    tl.store(pd, tl.where(slots[:, None] == 0, tl.sum(lo * slo, 1)[None, :], 0.0), pm)
+    tl.store(pd + H, tl.where(slots[:, None] == 0, tl.sum(hi * shi, 1)[None, :], 0.0), pm)
+    # dDC uses the same undecayed state and incoming adjoint as dD1.
+    # Compute it here instead of rereading the entire saved state in _bwd.
+    pc = PC + (((b * G + g) * NC + part_col[:, None]) * K + n) * R + mm[None, :]
+    tl.store(pc, tl.where(slots[:, None] == 0, tl.sum(dlo * slo, 1)[None, :], 0.0), pm)
+    tl.store(pc + H, tl.where(slots[:, None] == 0, tl.sum(dhi * shi, 1)[None, :], 0.0), pm)
     tl.store(dp, dlo * tl.load(DC + mm, mk, 0.0)[:, None] + lo * dlo1, sm)
     tl.store(dp + H * D, dhi * tl.load(DC + H + mm, mk, 0.0)[:, None] + hi * dhi1, sm)
 
 
+@matrix_tuner("grad")
 @triton.jit
 def _grad(A, BB, ST, D1, OUT, KK, GT, PG,
           B: tl.constexpr, K: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
           D: tl.constexpr, G: tl.constexpr, KIND: tl.constexpr,
-          TM: tl.constexpr, TN: tl.constexpr, TW: tl.constexpr):
+          TM: tl.constexpr, TN: tl.constexpr, TW: tl.constexpr, DEV: tl.constexpr):
     """Matrix gradients contracted over the value width: OUT = A B^T.
 
     KIND 0 dW = de h^T, 1 dQk = dr s0^T, 2 dKk = gT . (e ds^T) with the gT
@@ -300,8 +316,11 @@ def _grad(A, BB, ST, D1, OUT, KK, GT, PG,
         # dKk = gT . (e ds^T); the same product reduced along C gives d gT.
         km = tl.load(KK + (bk * C + i[:, None]) * R + jn[None, :],
                      im[:, None] & jm[None, :], 0.0)
-        tl.store(PG + (pid * tl.num_programs(1) + tl.program_id(1)) * R + jn,
-                 tl.sum(out * km.to(tl.float32), 0), jm)
+        slots = tl.arange(0, TM // 16)
+        row = tl.program_id(1) * (TM // 16) + slots
+        tl.store(PG + (pid * tl.cdiv(C, 16) + row[:, None]) * R + jn[None, :],
+                 tl.where(slots[:, None] == 0, tl.sum(out * km.to(tl.float32), 0)[None, :], 0.0),
+                 (row[:, None] < tl.cdiv(C, 16)) & jm[None, :])
         out = _scale(out * tl.load(GT + jn, jm, 0.0)[None, :], dt)
     if KIND >= 3:
         op = OUT + ((bk * G + g) * 2 * C + i[:, None]) * COLS + jn[None, :]
@@ -309,11 +328,12 @@ def _grad(A, BB, ST, D1, OUT, KK, GT, PG,
         op = OUT + (bk * C + i[:, None]) * COLS + jn[None, :]
     tl.store(op, out, im[:, None] & jm[None, :])
 
+@matrix_tuner("dfc")
 @triton.jit
 def _dfc(DO, ST, D1, OUT,
          B: tl.constexpr, K: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
          D: tl.constexpr, G: tl.constexpr,
-         TM: tl.constexpr, TN: tl.constexpr, TW: tl.constexpr):
+         TM: tl.constexpr, TN: tl.constexpr, TW: tl.constexpr, DEV: tl.constexpr):
     """Read-code gradient in the compact layout: dc1 and dc2 from one pass."""
     H: tl.constexpr = R // 2
     WID: tl.constexpr = D // G
@@ -351,10 +371,12 @@ def _dfc(DO, ST, D1, OUT,
     tl.store(ptr + H, _scale(a2, dt), keep)
 
 
+@matrix_tuner("k2")
 @triton.jit
 def _k2(FC, KK, DK2, OUT,
         K: tl.constexpr, C: tl.constexpr, R: tl.constexpr, G: tl.constexpr,
-        MODE: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr):
+        MODE: tl.constexpr, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr,
+        B: tl.constexpr, DEV: tl.constexpr):
     """Causal intra-chunk kernel K2 = Fq Kk^T and its two adjoints.
 
     MODE 0 builds K2 from the compact codes into OUT, 1 accumulates dFc and 2
@@ -454,3 +476,21 @@ def _scaled(X, OUT, N, SCALE, BLK: tl.constexpr):
     i = tl.program_id(0) * BLK + tl.arange(0, BLK)
     m = i < N
     tl.store(OUT + i, (tl.load(X + i, m, 0.0) * SCALE).to(OUT.dtype.element_ty), m)
+
+
+# Separate single-config entry points for tiny shapes avoid expensive tuning.
+# Keep restore_value intact under Inductor; see triton_scan_tune.py.
+_fwd_small = scan_tuner("fwd", small=True)(_fwd.fn)
+_bwd_small = scan_tuner("bwd", small=True)(_bwd.fn)
+_bwd2_small = scan_tuner("bwd2", small=True)(_bwd2.fn)
+_grad_small = matrix_tuner("grad", small=True)(_grad.fn)
+_grad0 = matrix_tuner("grad0", fp32=True)(_grad.fn)
+_dfc_small = matrix_tuner("dfc", small=True)(_dfc.fn)
+_k2_small = matrix_tuner("k2", small=True)(_k2.fn)
+
+_fwd_fp32 = scan_tuner("fwd", fp32=True)(_fwd.fn)
+_bwd_fp32 = scan_tuner("bwd", fp32=True)(_bwd.fn)
+_bwd2_fp32 = scan_tuner("bwd2", fp32=True)(_bwd2.fn)
+_grad_fp32 = matrix_tuner("grad", fp32=True)(_grad.fn)
+_dfc_fp32 = matrix_tuner("dfc", fp32=True)(_dfc.fn)
+_k2_fp32 = matrix_tuner("k2", fp32=True)(_k2.fn)

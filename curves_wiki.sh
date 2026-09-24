@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 set -u
-LOG=runs/long16h_t2048.jsonl
+LOG=runs/wiki.jsonl
+# Append any new gate ablation data
+[ -s runs/wiki_gate.jsonl ] && cat runs/wiki_gate.jsonl >> "$LOG" && : > runs/wiki_gate.jsonl
 [ -s "$LOG" ] || { echo "no evals yet"; exit 0; }
+
 REF=$(python -c '
 import json, sys
 seen = []
 for l in open(sys.argv[1]):
     m = json.loads(l)["model"]
     if m not in seen: seen.append(m)
-print("t2048_gdn" if "t2048_gdn" in seen else seen[0])
+print("wiki_gdn" if "wiki_gdn" in seen else seen[0])
 ' "$LOG")
-# The mixer-size sweep (dv=Mc=128/256/384) plus the references.
-# t2048_dv384 (partial, 43 evals) is superseded by t2048_Mdv384.
-SHOW="t2048_gdn,t2048_gdngate,t2048_initv2_v,t2048_initv2_kv,t2048_Mdv384,t2048_dv128"
 
-python plot_lm.py "$LOG" --ref "$REF" --out plot/long16h_t2048.png --only "$SHOW" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+python plot_lm.py "$LOG" --ref "$REF" --out plot/wiki.png 2>&1 | grep -vE "UserWarning|ax2\.axhline"
 echo
-python plot_lm.py "$LOG" --ref "$REF" --out plot/long16h_t2048_wallclock.png --wallclock --only "$SHOW" 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+python plot_lm.py "$LOG" --ref "$REF" --out plot/wiki_wallclock.png --wallclock 2>&1 | grep -vE "UserWarning|ax2\.axhline"
+
 echo
 python -c '
 import json, sys
@@ -30,7 +31,8 @@ for k, v in rows.items():
     left = max(0.0, budget - e["train_s"])
     print("  %-16s %5d %7.0fM %7.4f %8d %7.0fm %6.0fm"
           % (k, len(v), e["tokens"]/1e6, e["val"], e["tok_s"], e["train_s"]/60, left/60))
-' "$LOG" 57600
+' "$LOG" "${SECONDS_BUDGET:-7200}"
+
 for p in $(pgrep -x python); do
   c=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
   case "$c" in *pretrain.py*) echo "  running:$(echo "$c" | grep -o -- ' --label [^ ]*')";; esac

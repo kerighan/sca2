@@ -100,61 +100,124 @@ harness's bf16 tolerance of 0.06.
 Raw per-round data is in
 [`lapa/benchmarks/results/triton_scan_gb10_20260915.json`](lapa/benchmarks/results/triton_scan_gb10_20260915.json).
 
-### NEW PRIORITY: dv=384 support (2026-09-21)
+### Shape-specific tuning and fused convolution (2026-09-21)
 
-The training configuration has moved from dv=256 to **dv=384 ff=5800** (the
-"proportional scaling" arm that matches GDN's 157M params). With dv=384 and
-no kv_dk, the value width `D = dv = 384` is NOT a power of two. The current
-`triton_scan` kernels were tuned for D=272 (256+16) at dv=256 with kv_dk=16,
-and the gain collapses:
+`triton_scan` now tunes forward, both reverse kernels, matrix gradients and
+compact-code products. `lapa/triton_scan_tune.py` retains the historical TUNE,
+GTUNE, KTUNE and FTUNE settings among the candidates. Selection depends on
+B/K/C/R/D/G, dtype, device, training/inference and operation kind where relevant.
+The grids follow the selected tiles; all tiles are powers of two and the
+existing masks handle widths such as 272, 384 and 512 without padding the
+whole value/state tensors. Tiny shapes use conservative single-config kernels; fp32/tf32x3 uses a smaller
+resource-appropriate candidate set than bf16.
 
+There was no requirement for D itself to be a power of two: D=272 was already
+non-power-of-two. The old forward actually used BN=64, TK=32. With NG=1,
+D=384 has six full column tiles; with NG=2, D=272 has three tiles per group.
+Both yield 48 programs at B=8. Changing T from 1024 to 2048 also doubles the
+sequential chunk count, so width alone does not explain the timing difference.
+
+The forward stores its r/h intermediates immediately after the solve and delays
+K2@e until after the mode loop, shortening register lifetimes. Gradient scratch
+layouts use fixed 16-column/16-row slots; each chosen tile writes its partial
+and zeros the remaining slots it owns. No stale partials survive a change of
+configuration, and no atomic reductions or whole-tensor reset passes are needed.
+Both decay gradients are computed in the mode-parallel reverse kernel, sharing
+the same saved-state load instead of reading it again in the reducing kernel.
+
+Autotuning benchmarks restore the live state (`ST`), state adjoint (`DSR`) and
+accumulated code gradients (`OUT`). **Do not use `early_config_prune` with these
+kernels on PyTorch 2.9**: its Triton wrapper rebuilds the autotuner after pruning
+without forwarding `restore_value`. A compiled 16-chunk correctness test exposed
+this as a large output error. Separate single-config entry points handle tiny
+shapes without that reconstruction. See also the
+[Triton autotune API](https://triton-lang.org/main/python-api/generated/triton.autotune.html).
+
+The first use of a new shape benchmarks/compiles candidates; subsequent calls
+use cached choices. Eager uses Triton's disk cache; compiled execution uses
+Inductor's cache. `SCA2_SCAN_AUTOTUNE=0` (set **before import**) selects historical
+tiles for comparisons, with the new scratch layout and forward scheduling.
+It is not a switch back to the entire old implementation.
+
+#### `conv_silu`: preserve the model's ordering
+
+`phase_codes` receives **K(z)**, and conv_silu computes **K(silu(conv(z)))**.
+Applying SiLU inside phase construction would instead compute silu(K(conv(z)))
+and leave V, gates and the short head inconsistent. The fusion therefore lives
+in `lapa/triton_conv.py`, at the causal convolution's epilogue, and is selected
+by the `triton_scan` layer path. It supports both values of `LaplaceConfig.conv_silu`.
+It emits contiguous [B,T,d] tensors, avoiding layout copies before projections.
+Backward recomputes the activation inside the input/weight-gradient kernels.
+There is no separate SiLU tensor/pass. bf16 autocast rounds at the same conv,
+activation and gradient boundaries as the reference; accumulation stays fp32.
+
+The fast convolution handles CUDA fp32/bf16 and widths 1..8. Other convolution
+settings and fp64 keep the PyTorch reference. Decode remains the reference
+single-token operation, with the same state/history representation.
+
+#### Reproduce the comparisons
+
+The benchmark's old defaults are preserved (dv=256, kv_dk=16, T=1024, NG=2).
+For the new training setup, supply the shape explicitly:
+
+```bash
+OMP_NUM_THREADS=1 python -m unittest lapa.test_triton_scan -v
+OMP_NUM_THREADS=1 SCA2_CTX_CHUNK=8 SCA2_LONG_PATH=triton_scan \
+  python -m sca2.iso lapa --self --fast --device cuda
+
+# dv=384, D=384; full current layer configuration
+OMP_NUM_THREADS=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+  python -m lapa.benchmarks.triton --paths batched,triton_scan \
+  --tokens 2048 --dv 384 --kv-dk 0 --groups 1 --ff 5800 \
+  --short-window 128 --gdn-gate
+# Add --conv-silu to measure the activation-enabled arm.
+
+# Historical dv=256 / D=272 configuration
+OMP_NUM_THREADS=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+  python -m lapa.benchmarks.triton --paths batched,triton_scan
+# D=512 uses the same selector: --dv 512 --kv-dk 0 --groups 1.
 ```
-dv=256 (D=272):  batched 37.1 ms → triton_scan 32.1 ms  (+15.6%)
-dv=384 (D=384):  batched 89.9 ms → triton_scan 88.1 ms  (+2.0%)
-```
 
-The problem is structural:
-- `BN` (the column tile) is `min(TUNE, next_power_of_2(D//G))`. D=384 rounds to
-  512, but `BN = min(32, 512) = 32`, so 384/32 = 12 tiles per column with padding
-  in the last tile. D=272 gave 272/32 = 8.5 tiles — similar padding ratio.
-- Non-power-of-2 BN (48, 96) crashes Triton.
-- Larger BN (64, 128) increases register pressure and is slower.
-- The REAL issue: the kernel was designed and measured at D=272, and the tile
-  shapes, pipeline stages, and warp counts are all calibrated for that width.
-  D=384 needs its own tuning pass.
+The dedicated suite includes fp32 and compiled bf16 at D=256/384/512 without
+key verification, alongside the old D=272 tests, grouped reads, ragged tails,
+independent input gradients, decay-ceiling stress and fallbacks. Convolution
+checks cover SiLU on/off, widths 1/4/8, fp32/bf16, compiled adjoints and carried
+history. Architectural hypotheses are in [IDEAS.md](IDEAS.md).
 
-**Also requested: conv_silu support.** The training config optionally applies
-`silu` after the causal conv (`--conv-silu`). This means the input `z` to the
-long head is no longer the raw conv output but `silu(conv(z))`. The kernel
-receives the post-activation `z` so no kernel change is needed — the silu is
-applied by PyTorch before the kernel is called. However, if the silu were to
-be fused INTO the code construction kernel (phase_codes), it would save one
-elementwise pass over the (B, T, d) input.
+#### Measured outcome (GB10, 2026-09-21)
 
-**Target shapes for dv=384 (the new training config):**
-```
-B=8, T=2048, M=256, dv=384, dk=0, D=384, C=128, K=16, NG=1
-Code blocks:  Kk (B, K, C, 2M) = (8, 16, 128, 512) bf16
-              Qk same
-              Fc (B, K, C, 2M) = (8, 16, 128, 512) bf16   [compact]
-State:        s  (B, 2M, D) = (8, 512, 384) fp32
-Values:       v  (B, K, C, D) = (8, 16, 128, 384) fp32
-Output:       o  (B, K, 2C, D) = (8, 16, 256, 384) fp32
-```
+Same paired protocol as above: five warmups, 20 alternating rounds of ten
+iterations, bf16 autocast and fullgraph compilation. First-use compilation and
+autotuning are excluded. The full-layer D=384 configuration is the command
+above (T=2048, ff=5800, short window=128, GDN gate); D=272 retains the historical
+T=1024, ff=4096, short window=64 configuration. Compare paths within each row,
+not absolute timings between widths or between separate SiLU runs.
 
-Note K=16 at T=2048 (vs K=8 at T=1024): twice as many chunks in the sequential
-loop, so the scan kernel's launch count matters more.
+| D / NG | Scope | batched | triton_scan | Paired throughput gain | scan tok/s |
+|---|---|---:|---:|---:|---:|
+| 384 / 1 | Long head, fwd+bwd | 32.163 ms | 24.721 ms | +30.5% | 662.8k |
+| 384 / 1 | Full layer, fwd+bwd | 89.306 ms | 81.376 ms | +9.5% | 201.3k |
+| 384 / 1 | Full layer, fwd+bwd+AdamW | 91.076 ms | 83.420 ms | +10.2% | 196.4k |
+| 272 / 2 | Full layer, fwd+bwd | 34.151 ms | 29.083 ms | +17.6% | 281.7k |
+| 272 / 2 | Full layer, fwd+bwd+AdamW | 36.342 ms | 30.733 ms | +18.3% | 266.6k |
+| 384 / 1 + SiLU | Full layer, fwd+bwd | 96.053 ms | 87.921 ms | +9.5% | 186.3k |
+| 384 / 1 + SiLU | Full layer, fwd+bwd+AdamW | 94.155 ms | 84.635 ms | +11.1% | 193.6k |
 
-Next useful target after dv=384: the forward scan, now the single largest kernel
-at about 1.7 ms/iter. It runs at roughly 7 TFLOP/s because its grid is only
-`B x NG x ceil(D/NG/BN)` programs at the tuned block width, so the
-machine is at about an eighth of its warp slots and the chunk's read -> solve ->
-write chain has little to overlap with. Splitting it the way the reverse scan
-was split does not help: the state write is the only mode-parallel piece, and
-pulling it out doubles the state traffic it currently shares with the output
-pass. What would help is more parallelism per chunk, which needs the C-axis
-reductions (`e = W h`, `o = K2 e`) to tolerate a row split -- that is a
-cross-program sync, so it needs a different decomposition rather than tuning.
+**The 77 ms / approximately 213k tok/s target is not reached.** D=384 full-layer
+training measures 81.376 ms (201.3k tok/s), versus 89.306 ms for batched. The
+long head improves more than the whole layer; this result does not establish
+that further tile tuning alone can close the remaining approximately 4.4 ms.
+D=272 retains its historical throughput advantage. D=512 passes correctness
+and compiled-gradient checks, but has no end-to-end performance claim here.
+
+All 12 scan/convolution tests pass. A further B=8, M=256, D=384, C=128,
+16-chunk compiled bf16 check, including a three-token ragged tail, passes all
+output/state/input/parameter-gradient comparisons; worst normalized output
+error is 0.006874 against tolerance 0.06. GPU iso also passes (0 failing checks).
+
+Raw per-round timings, configuration arguments, source hashes and validation
+results are recorded in
+[`triton_scan_widths_gb10_20260921.json`](lapa/benchmarks/results/triton_scan_widths_gb10_20260921.json).
 
 ### The scan path: the whole chunked form as one graph node
 

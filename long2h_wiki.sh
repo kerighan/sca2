@@ -9,7 +9,7 @@ export SCA2_CTX_CHUNK=128 SCA2_LONG_PATH=triton_scan
 LOG=runs/wiki.jsonl
 : > "$LOG"  # fresh log
 
-LAPA="--variant lapa_cc --Mc 256 --dv 256 --Ls 64 --theta-scale 0.02
+LAPA="--variant lapa_cc --Mc 256 --dv 256 --Ls 128 --theta-scale 0.02
       --rope-base 1000 --slow-frac 0.25 --conv 4
       --layer-scale --lam-free --damp-mem 4,20000 --gdn-gate"
 

@@ -220,14 +220,18 @@ def run(name, m, tr, va, a, device, log, V=None):
                                      cls_tab=CLS_TAB)
             rec = {"model": name, "seed": a.seed, "step": step, "train_s": round(spent, 1),
                    "tokens": seen, "train": round(loss.item(), 5), "val": round(vl, 5),
-                   "tok_s": round(seen / spent)}
+                   "tok_s": round(seen / spent),
+                   # Peak over the whole run so far, not the instant: what decides
+                   # whether a batch size fits is the worst moment, and on a rented
+                   # card an OOM at hour 12 costs the hours already paid for.
+                   "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2)}
             if prof:
                 rec["pos"] = [round(v, 5) for v in prof]
             if cls:
                 rec["cls"] = cls
             print(f"  {name} t={rec['train_s']:6.0f}s step {step:6d} "
                   f"{seen/1e6:6.1f}M tok  train {rec['train']:.4f}  val {rec['val']:.4f}  "
-                  f"{rec['tok_s']} tok/s"
+                  f"{rec['tok_s']} tok/s  {rec['peak_gb']:.1f} GB"
                   + (f"  pos {prof[0]:.3f}->{prof[-1]:.3f}" if prof else "")
                   + (f"  new {cls['word_new']:.3f} rep {cls['word_rep']:.3f}" if cls else ""),
                   flush=True)
