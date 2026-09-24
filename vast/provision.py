@@ -47,14 +47,20 @@ IMAGE = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel"
 # uint16) and each arm saves a ~0.5 GB checkpoint five times.
 DISK_GB = 100
 
-# Two families are acceptable. Ada (4090) has more dense bf16 than Blackwell
-# consumer (5090) but a third of its bandwidth; the layer is launch-bound on
-# the GB10 rather than roofline-bound, so neither spec predicts our throughput
-# and the choice is made on price. cuda_max_good>=12.8 keeps the toolchain able
-# to build for both.
+# 5090 only, and gpu_ram>=30. The earlier query took either family at
+# gpu_ram>=24, which was written before the batch size was measured: at B=6
+# T=4096 every arm peaks at 22.2-22.3 GiB allocated, and a 24 GB 4090 has 23.99
+# GiB total. Subtract the CUDA context and the allocator's fragmentation and it
+# does not fit -- for ANY arm, since the peak is set by the residual and the
+# FFN, which are identical across them. A rented 4090 would OOM hours in, after
+# the corpus was built on it.
+#
+# It also keeps the pool homogeneous. Comparing arms at equal wall clock across
+# a 4090 (sm 8.9) and a 5090 (sm 12.0) would lean on `vast.calibrate` to
+# normalise a gap far larger than the few percent it is meant for.
 QUERY = (
     "rentable=true verified=true num_gpus=1 "
-    "gpu_name in [RTX_4090,RTX_5090] gpu_ram>=24 "
+    "gpu_name=RTX_5090 gpu_ram>=30 "
     "reliability>0.98 inet_down>=500 inet_up>=100 "
     "cuda_max_good>=12.8 disk_space>=120"
 )

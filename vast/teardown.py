@@ -21,7 +21,7 @@ import json
 import sys
 import time
 
-from .common import RUNTIME, instances, vast
+from .common import RUNTIME, instances, save_instances, vast
 
 
 def _destroy(instance_id: int, attempts: int = 6) -> None:
@@ -57,12 +57,40 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--yes", action="store_true",
                         help="actually destroy; without it this only reports")
+    parser.add_argument("--slots", default=None,
+                        help="comma list of slot numbers; default every recorded "
+                             "instance. Selecting by SLOT, never by a property: "
+                             "an ad-hoc filter on gpu name destroyed a whole pool "
+                             "because the field reads 'RTX 5090' and the filter "
+                             "said 'RTX_5090', so it matched everything.")
     args = parser.parse_args()
 
     try:
-        recorded = [int(i["id"]) for i in instances()]
+        pool = list(instances())
     except RuntimeError:
-        recorded = []
+        pool = []
+    if args.slots is not None:
+        want = {int(s) for s in args.slots.split(",") if s.strip()}
+        unknown = want - {int(p["slot"]) for p in pool}
+        if unknown:
+            raise SystemExit(f"no such slot: {sorted(unknown)}; "
+                             f"recorded slots are {[p['slot'] for p in pool]}")
+        chosen = [p for p in pool if int(p["slot"]) in want]
+    else:
+        chosen = pool
+    recorded = [int(p["id"]) for p in chosen]
+
+    # Say what is about to be destroyed, every time, including under --yes.
+    # Destruction is irreversible and the corpus on a host is hours of work.
+    print(f"{len(chosen)} of {len(pool)} recorded instance(s) selected:")
+    for p in chosen:
+        print(f"  slot {p['slot']}  {p['id']}  {p.get('gpu')}  "
+              f"${float(p.get('dph', 0)):.3f}/h")
+    kept = [p for p in pool if p not in chosen]
+    for p in kept:
+        print(f"  KEEPING slot {p['slot']}  {p['id']}  {p.get('gpu')}")
+    if not args.yes:
+        print("\nreport only; pass --yes to destroy the selected instances")
 
     if args.yes:
         for iid in recorded:
@@ -72,6 +100,16 @@ def main() -> int:
             except Exception as exc:                          # noqa: BLE001
                 print(f"  FAILED: {exc}")
             print(f"  {'gone' if _gone(iid) else 'STILL PRESENT'}")
+
+    if args.yes and kept:
+        # A partial teardown must leave the survivors tracked: dropping them
+        # from the pool file would not stop them, it would only hide them.
+        for i, p in enumerate(kept):
+            p["slot"] = i
+        save_instances(kept)
+        print(f"\npool is now {len(kept)} instance(s); "
+              f"they are STILL RUNNING and still billing")
+        return 0
 
     surviving = []
     live_instances = vast("show", "instances") or []
