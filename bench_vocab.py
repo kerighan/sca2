@@ -39,12 +39,12 @@ ARMS = {
 }
 
 
-def build(name: str, V: int, d: int, layers: int, T: int):
+def build(name: str, V: int, d: int, layers: int, T: int, tie: bool = True):
     kw = dict(ARMS[name])
     variant = kw.pop("variant")
     cfg = LayerCfg(d=d, Md=4, G=8, max_len=T, **kw)
     torch.manual_seed(0)
-    m = SCA2(V, cfg, variant, "cuda", layers).cuda()
+    m = SCA2(V, cfg, variant, "cuda", layers, tie_embed=tie).cuda()
     n = sum(p.numel() for p in m.parameters())
     return torch.compile(m, dynamic=False), n
 
@@ -55,7 +55,8 @@ def main() -> None:
     p.add_argument("--arms", default="dv128,dv256,dv384,gdn")
     p.add_argument("--d", type=int, default=1024)
     p.add_argument("--layers", type=int, default=8)
-    p.add_argument("--block", type=int, default=2048)
+    p.add_argument("--blocks", default="2048")
+    p.add_argument("--untied", action="store_true")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument("--iters", type=int, default=3)
@@ -63,48 +64,51 @@ def main() -> None:
 
     torch._dynamo.config.cache_size_limit = 256
     vocabs = [int(v) for v in a.vocabs.split(",")]
+    blocks = [int(b) for b in a.blocks.split(",")]
     names = a.arms.split(",")
-    B, T = a.batch, a.block
+    B = a.batch
 
     for V in vocabs:
-        models, params = {}, {}
-        for n in names:
-            models[n], params[n] = build(n, V, a.d, a.layers, T)
-        x = torch.randint(0, V, (B, T), device="cuda")
+      for T in blocks:
+          models, params = {}, {}
+          for n in names:
+              models[n], params[n] = build(n, V, a.d, a.layers, T, not a.untied)
+          x = torch.randint(0, V, (B, T), device="cuda")
 
-        def step(m):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                y = m(x)
-            y.float().square().mean().backward()
+          def step(m):
+              with torch.autocast("cuda", dtype=torch.bfloat16):
+                  y = m(x)
+              y.float().square().mean().backward()
 
-        for n in names:                                   # warmup + compile
-            for _ in range(3):
-                step(models[n])
-        torch.cuda.synchronize()
+          for n in names:                                   # warmup + compile
+              for _ in range(3):
+                  step(models[n])
+          torch.cuda.synchronize()
 
-        per = {n: [] for n in names}
-        for _ in range(a.rounds):
-            for n in names:                               # every arm inside every round
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                for _ in range(a.iters):
-                    step(models[n])
-                torch.cuda.synchronize()
-                per[n].append((time.perf_counter() - t0) / a.iters)
+          per = {n: [] for n in names}
+          for _ in range(a.rounds):
+              for n in names:                               # every arm inside every round
+                  torch.cuda.synchronize()
+                  t0 = time.perf_counter()
+                  for _ in range(a.iters):
+                      step(models[n])
+                  torch.cuda.synchronize()
+                  per[n].append((time.perf_counter() - t0) / a.iters)
 
-        base = names[-1]                                  # gdn is the reference
-        print(f"\nV={V}  d={a.d} L={a.layers} B={B} T={T}  (fwd+bwd, compiled)")
-        print(f"  {'arm':8s} {'params':>12} {'ms':>8} {'tok/s':>10} {'vs '+base:>9} "
-              f"{'tokens in 64 h':>15}")
-        for n in names:
-            ms = statistics.median(per[n]) * 1e3
-            tps = B * T / (statistics.median(per[n]))
-            ratio = statistics.median([per[base][r] / per[n][r] for r in range(a.rounds)])
-            print(f"  {n:8s} {params[n]:12,} {ms:8.1f} {tps:10,.0f} {ratio:8.3f}x "
-                  f"{tps*64*3600/1e9:14.1f}B")
-        for n in names:
-            del models[n]
-        torch.cuda.empty_cache()
+          base = names[-1]                                  # gdn is the reference
+          print(f"\nV={V}  d={a.d} L={a.layers} B={B} T={T}  "
+                f"{'untied' if a.untied else 'TIED'}  (fwd+bwd, compiled)")
+          print(f"  {'arm':8s} {'params':>12} {'ms':>8} {'tok/s':>10} {'vs '+base:>9} "
+                f"{'tokens in 64 h':>15}")
+          for n in names:
+              ms = statistics.median(per[n]) * 1e3
+              tps = B * T / (statistics.median(per[n]))
+              ratio = statistics.median([per[base][r] / per[n][r] for r in range(a.rounds)])
+              print(f"  {n:8s} {params[n]:12,} {ms:8.1f} {tps:10,.0f} {ratio:8.3f}x "
+                    f"{tps*64*3600/1e9:14.1f}B")
+          for n in names:
+              del models[n]
+          torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

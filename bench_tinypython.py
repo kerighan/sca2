@@ -105,7 +105,7 @@ class SCA2(nn.Module):
     """Embedding + one SCA2 layer (from the sca2 package) + LM head."""
 
     def __init__(self, V, cfg: LayerCfg, variant=None, device="cpu", layers=1,
-                 ple_dim=0):
+                 ple_dim=0, tie_embed=False):
         super().__init__()
         self.e = nn.Embedding(V, cfg.d)
         # variant=None -> the version selected by SCA2_VERSION (default: latest);
@@ -116,6 +116,18 @@ class SCA2(nn.Module):
         self.layer = self.layers[0]          # back-compat for single-layer paths
         self.on = nn.LayerNorm(cfg.d)
         self.o = nn.Linear(cfg.d, V)
+        # Weight tying: one V x d matrix instead of two. Standard since GPT-2 and
+        # used by Llama and Mistral, and it matters here for what the loss
+        # MEASURES: untied at V=32000 and d=1024 the two matrices are 65.5M
+        # parameters, 46% of the smallest arm, so the comparison is diluted by a
+        # softmax that no mixer touches. Tied, that drops to 30%. It removes the
+        # same 32.8M from every arm, so it does not move the comparison -- it
+        # stops hiding it. Off by default: a tied checkpoint has one fewer tensor
+        # and will not load into an untied model, so the earlier runs stay
+        # reproducible.
+        self.tie_embed = tie_embed
+        if tie_embed:
+            self.o.weight = self.e.weight
         # PLE: per-layer embedding. One shared (V, ple_dim * layers) lookup, sliced
         # per layer and projected to d. Each layer gets its own token-identity signal
         # directly, bypassing the residual stream. 0 = off.

@@ -319,6 +319,10 @@ def main(argv=None):
                         "Cost: V*ple_dim*L + ple_dim*d*L params.")
     p.add_argument("--mamba-expand", type=int, default=1, dest="mamba_expand",
                    help="Mamba2 expand factor (1 or 2)")
+    p.add_argument("--tie-embed", action="store_true", dest="tie_embed",
+                   help="share the embedding and the LM head (one V x d matrix). "
+                        "At V=32000 d=1024 untied they are 65.5M params, 46%% of the "
+                        "smallest arm; tied, 30%%.")
     p.add_argument("--init-v2", action="store_true", dest="init_v2",
                    help="calibrated init from converged checkpoints: every parameter starts "
                         "where the model ends up, not at the standard default")
@@ -440,7 +444,7 @@ def main(argv=None):
         torch.manual_seed(a.seed)
         nm = a.label or "SCA2"
         models[nm] = run(nm, SCA2(V, cfg, a.variant, device, a.layers,
-                                  ple_dim=a.ple_dim),
+                                  ple_dim=a.ple_dim, tie_embed=a.tie_embed),
                          tr, va, a, device, log, V)
     if a.only != "sca2":
         torch.manual_seed(a.seed)
