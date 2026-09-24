@@ -88,11 +88,18 @@ def main() -> None:
         raise SystemExit("a pretrain.py is already running on this host; "
                          "arms are queued one at a time on a single GPU")
 
+    # Separated by `;`, not `&&`. In `A && B && nohup C & echo $!` the `&`
+    # applies to the WHOLE chain, so bash backgrounds a subshell that still
+    # holds ssh's stdout and stderr open -- ssh then waits for the job to end
+    # instead of returning, the submit times out, and no PID is ever recorded
+    # while the job runs on regardless. With `;` the `&` binds to the nohup
+    # alone, whose streams are redirected, and ssh returns at once.
     remote = (
-        f"cd {REMOTE} && mkdir -p runs && "
+        f"cd {REMOTE}; mkdir -p runs; "
         f"nohup env PYTORCH_ALLOC_CONF=expandable_segments:True "
         f"SCA2_CTX_CHUNK=128 SCA2_LONG_PATH=triton_scan "
-        f"sh -c {json.dumps(command)} > runs/{args.name}.log 2>&1 < /dev/null & echo $!"
+        f"sh -c {json.dumps(command)} > runs/{args.name}.log 2>&1 < /dev/null & "
+        f"echo $!"
     )
     out = run_remote(info, remote, timeout=120)
     pid = out.stdout.strip().splitlines()[-1]
