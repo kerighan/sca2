@@ -113,3 +113,97 @@ def long_step(s, damp, kt, qt, v, beta, block_dv: int = 32, block_m: int = 64):
         INV_M=2.0 / M2,                       # M = M2 / 2
     )
     return out, u.reshape(B, 2 * DV)
+
+
+# =============================================================================
+#  SHORT HEAD: the whole decode step in one launch
+# =============================================================================
+if HAVE_TRITON:
+
+    @triton.jit
+    def _short_step(
+        KH, KZ, VZ, THETA, OMEGA, WR, WI, POS, PTR,
+        CW, SW, EW, OUT,
+        L: tl.constexpr, DV: tl.constexpr,
+        BLOCK_DV: tl.constexpr, EPS,
+    ):
+        b = tl.program_id(0)
+        l = tl.arange(0, L)
+
+        # ---- phases, and the write code for this token --------------------- #
+        pos = tl.load(POS)
+        base = (pos % L).to(tl.float32) * tl.load(OMEGA + l)
+        theta = tl.load(THETA + l)
+        phi = tl.load(KH + b * L + l) * theta + base
+        psi = tl.load(KZ + b * L + l) * theta + base
+
+        # ---- ring write, in place at the pointer --------------------------- #
+        ptr = tl.load(PTR)
+        tl.store(CW + b * L * L + ptr * L + l, tl.cos(phi))
+        tl.store(SW + b * L * L + ptr * L + l, tl.sin(phi))
+        dvj = tl.arange(0, BLOCK_DV)
+        for j0 in range(0, DV, BLOCK_DV):
+            cols = j0 + dvj
+            tl.store(EW + b * L * DV + ptr * DV + cols,
+                     tl.load(VZ + b * DV + cols, mask=cols < DV, other=0.0),
+                     mask=cols < DV)
+
+        # ---- read codes ----------------------------------------------------- #
+        cq, sq = tl.cos(psi), tl.sin(psi)
+        wr, wi = tl.load(WR + l), tl.load(WI + l)
+        c1 = wr * cq + wi * sq
+        c2 = wr * sq - wi * cq
+
+        # ---- kappa over the window: one (W,L) reduction, W = L -------------- #
+        w = tl.arange(0, L)
+        off = b * L * L + w[:, None] * L + l[None, :]
+        cwv = tl.load(CW + off)
+        swv = tl.load(SW + off)
+        k_re = (tl.sum(cwv * c1[None, :], 1) + tl.sum(swv * c2[None, :], 1)) / L
+        k_im = (tl.sum(swv * c1[None, :], 1) - tl.sum(cwv * c2[None, :], 1)) / L
+
+        # ---- contract with the value window, and the RMS over 2*DV ---------- #
+        acc = tl.zeros([], dtype=tl.float32)
+        for j0 in range(0, DV, BLOCK_DV):
+            cols = j0 + dvj
+            cmask = cols < DV
+            e = tl.load(EW + b * L * DV + w[:, None] * DV + cols[None, :],
+                        mask=cmask[None, :], other=0.0)
+            u0 = tl.sum(e * k_re[:, None], 0)
+            u1 = tl.sum(e * k_im[:, None], 0)
+            tl.store(OUT + b * 2 * DV + cols, u0, mask=cmask)
+            tl.store(OUT + b * 2 * DV + DV + cols, u1, mask=cmask)
+            acc += tl.sum(tl.where(cmask, u0 * u0 + u1 * u1, 0.0))
+
+        scale = 1.0 / tl.sqrt(acc / (2 * DV) + EPS)
+        for j0 in range(0, DV, BLOCK_DV):
+            cols = j0 + dvj
+            cmask = cols < DV
+            o0 = tl.load(OUT + b * 2 * DV + cols, mask=cmask, other=0.0)
+            o1 = tl.load(OUT + b * 2 * DV + DV + cols, mask=cmask, other=0.0)
+            tl.store(OUT + b * 2 * DV + cols, o0 * scale, mask=cmask)
+            tl.store(OUT + b * 2 * DV + DV + cols, o1 * scale, mask=cmask)
+
+
+def short_supported(head) -> bool:
+    return (HAVE_TRITON and head.G == 1 and head.wd == torch.float32
+            and not (head.cfg.gdn_gate and head.cfg.gdn_gate_scope == "both"))
+
+
+def short_step(kh, kz, vz, theta, omega, wr, wi, pos, ptr, cw, sw, ew,
+               eps: float = 1e-6, block_dv: int = 64):
+    """One launch for phase + ring write + kappa + read + RMS.
+
+    cw/sw (B,L,L) and ew (B,L,dv) are mutated in place at `ptr`, exactly as the
+    PyTorch ring does. Returns (B, 2*dv), already RMS-normalised.
+    """
+    B, L, _ = cw.shape
+    DV = ew.shape[2]
+    out = torch.empty((B, 2 * DV), device=cw.device, dtype=torch.float32)
+    _short_step[(B,)](
+        kh.contiguous(), kz.contiguous(), vz.contiguous(),
+        theta.contiguous(), omega.contiguous(), wr.contiguous(), wi.contiguous(),
+        pos, ptr, cw, sw, ew, out,
+        L=L, DV=DV, BLOCK_DV=block_dv, EPS=eps,
+    )
+    return out

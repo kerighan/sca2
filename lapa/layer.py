@@ -1057,7 +1057,19 @@ class ShortHead(nn.Module):
         o = torch.cat([o[:, :, :C], o[:, :, C:]], -1).reshape(B, K * C, 2 * self.dv)
         return o[:, :T]
 
+    def _maybe_fast(self):
+        import os
+        if os.environ.get("SCA2_LAPA_DECODE", "auto") == "naive":
+            return None
+        try:
+            from .triton_decode import short_supported, short_step
+        except Exception:                                     # pragma: no cover
+            return None
+        return short_step if short_supported(self) else None
+
     def step(self, z_t, h_t, state: State):
+        if not hasattr(self, "_decode_fast") and z_t.is_cuda:
+            self._decode_fast = self._maybe_fast()
         kh, kz, vz = self.K(h_t), self.K(z_t), self.V(z_t)
         with _no_autocast(z_t.device):
             B = z_t.size(0)
@@ -1088,6 +1100,15 @@ class ShortHead(nn.Module):
                 # clone it, which is the same contract a KV cache carries.
                 cw, sw, ew = state["c"], state["s"], state["e"]
                 ptr = state["ptr"]
+            fast = getattr(self, "_decode_fast", None)
+            if fast is not None:
+                # phase, ring write, kappa, read and the RMS in one launch.
+                out = fast(kh, kz, vz.to(self.wd), self.theta, self.omega,
+                           self.wr, self.wi, state["pos"], ptr, cw, sw, ew)
+                return out.to(z_t.dtype), {
+                    "c": cw, "s": sw, "e": ew,
+                    "ptr": (ptr + 1) % L, "pos": state["pos"] + 1,
+                }
             # A TENSOR index, never a Python int. As an int the pointer is a
             # compile-time constant, so torch.compile respecialises the graph on
             # every token, blows the cache and falls back: measured 407 ms a
