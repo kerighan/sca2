@@ -830,6 +830,21 @@ class LongHead(nn.Module):
             pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,M)
             kt = torch.cat([pw.cos(), pw.sin()], -1)  # (B,2M) write code
             beta = self._beta(bz)
+            fast = getattr(self, "_decode_fast", None)
+            if fast is not None:
+                # One launch for decay + vhat + rank-1 write + read, instead of
+                # four passes over the same 0.5 MB that torch.compile cannot
+                # merge (chained reductions of different shapes). See
+                # lapa/triton_decode.py; the branch below stays the reference.
+                cq, sq = pq.cos(), pq.sin()
+                c1 = self.wr * cq + self.wi * sq
+                c2 = self.wr * sq - self.wi * cq
+                qt = torch.stack([torch.cat([c1, c2], -1),
+                                  torch.cat([-c2, c1], -1)], 1)
+                s, u = fast(state["s"], self._damp(self.lam(), 1), kt, qt,
+                            vz.to(self.wd), beta)
+                return (self._out(u, z_t).to(z_t.dtype),
+                        {"s": s, "pos": state["pos"] + 1})
             ktb = kt * torch.cat([beta, beta], -1) if self.bg > 1 else kt
             vhat = torch.einsum("bm,bmj->bj", ktb, s0) / M
             v = vz.to(self.wd)

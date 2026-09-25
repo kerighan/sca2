@@ -96,6 +96,27 @@ def _load_triton():
 _triton = _load_triton()
 
 
+def _load_triton_recurrent():
+    """fla's fused single-token kernel, for DECODE.
+
+    The chunk kernel above is the training path; `step` had no counterpart and
+    always went through the naive reference, which meant every decode timing of
+    the baseline was of unoptimised PyTorch. That understates GDN, and a
+    comparison that understates the baseline is worth nothing. Same env switch
+    as the chunk path, so "naive" still forces the reference everywhere.
+    """
+    if os.environ.get("SCA2_GDN_KERNEL", "auto") == "naive":
+        return None
+    try:
+        from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+        return fused_recurrent_gated_delta_rule
+    except Exception:
+        return None
+
+
+_triton_recurrent = _load_triton_recurrent()
+
+
 class ShortConv(nn.Module):
     """Depthwise causal conv, kernel 4, with a cache for decode."""
 
@@ -194,8 +215,14 @@ class GatedDeltaNet(nn.Module):
         k = F.normalize(kr.view(B, 1, self.H, self.dk), dim=-1)
         v = vr.view(B, 1, self.H, self.dv)
         g, beta = self._gates(x_t[:, None])
-        o, h = _ref.naive_recurrent_gated_delta_rule(
-            q, k, v, beta, g, initial_state=state["h"].float(), output_final_state=True)
+        if _triton_recurrent is not None:
+            o, h = _triton_recurrent(
+                q, k, v, g=g, beta=beta, initial_state=state["h"].float(),
+                output_final_state=True)
+        else:
+            o, h = _ref.naive_recurrent_gated_delta_rule(
+                q, k, v, beta, g, initial_state=state["h"].float(),
+                output_final_state=True)
         y = self._read(o.to(x_t.dtype), x_t[:, None], B, 1)[:, 0]
         return y, {"h": h.to(x_t.dtype), "cq": cq, "ck": ck, "cv": cv}
 
