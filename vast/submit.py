@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from .common import REMOTE, ROOT, live, run_remote
@@ -75,6 +76,21 @@ def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
             f"{LAPA_FLAGS} {ARMS[arm]}")
 
 
+def unknown_flags(command: str) -> list[str]:
+    """Flags in `command` that pretrain.py does not declare.
+
+    Twice now an arm has been launched with a flag that existed in the config
+    dataclass and not in the CLI -- once for --tie-embed's siblings, once for
+    --post-norm -- and each time the job died seconds after being detached,
+    which reads exactly like a flaky host. argparse is the authority, so ask it
+    rather than the config.
+    """
+    src = (ROOT / "pretrain.py").read_text()
+    declared = set(re.findall(r'add_argument\(\s*"(--[A-Za-z0-9-]+)"', src))
+    used = {w for w in command.split() if w.startswith("--")}
+    return sorted(used - declared)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", nargs="?", default=None,
@@ -95,6 +111,10 @@ def main() -> None:
     command = args.command or build_command(
         args.arm, args.hours, args.corpus, args.block, args.batch, args.log,
         args.bpe)
+
+    bad = unknown_flags(command)
+    if bad:
+        raise SystemExit("pretrain.py does not declare: " + ", ".join(bad))
 
     info = live(args.slot)
     if args.arm:
