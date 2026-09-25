@@ -119,11 +119,37 @@ def main() -> None:
         f"cd {REMOTE}; mkdir -p runs; "
         f"nohup env PYTORCH_ALLOC_CONF=expandable_segments:True "
         f"SCA2_CTX_CHUNK=128 SCA2_LONG_PATH=triton_scan "
-        f"sh -c {json.dumps(command)} > runs/{args.name}.log 2>&1 < /dev/null & "
-        f"echo $!"
+        # `exec` so sh REPLACES itself with python instead of waiting on it.
+        # Without it the launch produces two processes: bash forks a subshell
+        # for the redirections, `$!` names that subshell, and python is its
+        # grandchild. `kill $!` then removes the wrapper and leaves python
+        # orphaned onto init, still training and still holding 25 GiB of the
+        # card -- the liveness check reads "stopped" while the job runs on.
+        f"sh -c {json.dumps('exec ' + command)} "
+        f"> runs/{args.name}.log 2>&1 < /dev/null & "
+        # POLL for the training process rather than sleeping a fixed time and
+        # hoping. `python -u pretrain.py` spends seconds importing torch before
+        # it is visible, and a single `sleep 3` silently fell back to `$!` --
+        # recording the subshell again, two below the PID that matters.
+        f"echo $!; "
+        f"for i in $(seq 1 30); do "
+        f"  p=$(pgrep -f '[p]retrain[.]py' | head -1); "
+        f"  if [ -n \"$p\" ]; then echo JOBPID=$p; break; fi; sleep 2; "
+        f"done"
     )
     out = run_remote(info, remote, timeout=120)
-    pid = out.stdout.strip().splitlines()[-1]
+    lines = [l.strip() for l in out.stdout.strip().splitlines()]
+    # The PID of the training process itself, never the shell that started it:
+    # killing the wrapper leaves python orphaned onto init, still training and
+    # still holding the card, while the liveness check reads "stopped". submit
+    # refuses to run when another pretrain.py is up, so this cannot match
+    # somebody else's job.
+    found = [l[7:] for l in lines if l.startswith("JOBPID=") and l[7:].isdigit()]
+    if not found:
+        raise SystemExit(f"launched but could not resolve the training PID; "
+                         f"check `python -m vast.logs --name {args.name}`:\n"
+                         + "\n".join(lines[-5:]))
+    pid = found[-1]
     RUNTIME.mkdir(parents=True, exist_ok=True)
     (RUNTIME / f"{args.name}.pid").write_text(pid)
     (RUNTIME / f"{args.name}.cmd").write_text(command)
