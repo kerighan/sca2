@@ -686,7 +686,7 @@ class LongHead(nn.Module):
                 # so gw_s = exp(C_s), gq_t = exp(-C_t) and the closed form is unchanged.
                 lam_all = self.lam_t(lz).view(B, K, C, M)            # (B,K,C,M)
                 Ct = lam_all.cumsum(2)                                # inclusive
-                gw, gq = torch.exp(Ct), torch.exp(-Ct)
+                gw = gq = None            # built inside the kernel when it runs
                 dC = gT = torch.exp(-Ct[:, :, -1:])                   # (B,K,1,M)
                 d1 = None                                             # folded into gq
             else:
@@ -704,18 +704,27 @@ class LongHead(nn.Module):
                 # All backends consume gated values. Autograd adds the write
                 # contribution to d beta alongside the existing erase/solve terms.
                 v = beta * v
+            # `di` no longer disqualifies the kernel: it takes the per-token
+            # ramp as Ct. Leaving it out cost the whole code path, not just the
+            # ramp -- decay_input reverted to PyTorch and ran at 0.79x.
             use_codes = (self.cfg.long_path in ("triton_fused", "triton_codes",
                                                 "triton_scan")
                          and kz.is_cuda and self.wd == torch.float32
-                         and gd in (torch.float32, torch.bfloat16) and not di and self.bg == 1)
+                         and gd in (torch.float32, torch.bfloat16) and self.bg == 1)
             if use_codes:
                 from .triton_phase import phase_codes
-                Kk, Qk, Fq = phase_codes(kz, kh, self.theta, self.omega, lam,
+                Kk, Qk, Fq = phase_codes(kz, kh, self.theta, self.omega,
+                                          self.lam() if di else lam,
                                           self.wr, self.wi, st["pos"], C, gd,
-                                          self.cfg.long_path == "triton_scan")
+                                          # the compact layout is only read by
+                                          # the scan, which decay_input skips
+                                          (self.cfg.long_path == "triton_scan") and not di,
+                                          ct=Ct if di else None)
                 if self.NG == 1:
                     Fq = Fq.squeeze(2)
             else:
+                if gw is None:                       # decay_input, kernel off
+                    gw, gq = torch.exp(Ct), torch.exp(-Ct)
                 p = torch.arange(T, device=dev, dtype=self.wd)[:, None] + st["pos"]
                 pw, pq = self._phase(kh, p), self._phase(kz, p)
                 cw, sw, cq, sq = map(ch, (pw.cos(), pw.sin(), pq.cos(), pq.sin()))
@@ -736,7 +745,12 @@ class LongHead(nn.Module):
                     f1 = torch.cat([c1, c2], 3).view(B, K, C, 2 * M, self.NG)
                     f2 = torch.cat([-c2, c1], 3).view(B, K, C, 2 * M, self.NG)
                     Fq = torch.cat([f1, f2], 2).permute(0, 1, 4, 2, 3).to(gd)
-            if use_codes and self.cfg.long_path == "triton_scan":
+            # The scan kernel takes d1/dC/gT as PER-MODE constants; with a
+            # per-token ramp d1 does not exist and dC/gT are per (b, k, m). That
+            # is a separate kernel change, so decay_input takes the codes kernel
+            # and the Gram product but not the fused scan -- still far better
+            # than the all-PyTorch path it had.
+            if use_codes and self.cfg.long_path == "triton_scan" and not di:
                 # Gram, inverse, causal kernel and chunk loop are ONE graph node:
                 # every code gradient is accumulated in place by the node that
                 # produces the next one, so no gradient add pass runs at all.
