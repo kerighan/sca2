@@ -161,6 +161,15 @@ class LaplaceConfig:
     ls_mix_init: float = 1.0   # init value for gs_mix. Two trained checkpoints (lsfree, g2)
     #   converge to a median of ~0.26; starting at 0.25 saves 2h of convergence.
     ls_ff_init: float = 1.0    # init value for gs_ff. Converges to ~0.6 in both runs.
+    read_mix: int = 1          # R read weight vectors instead of one, combined per
+    # token by alpha(z) = softmax(A z). The read is LINEAR in w, so this equals
+    # reading once with w_eff(z_t) = sum_r alpha_r(z_t) w^(r): the kernel becomes
+    # sum_r alpha_r(z_t) kappa_r(t,s), still damped exponentials on the same
+    # modes, with the state, the write and the transform untouched. What stops
+    # being a training-time constant is the SHAPE of the kernel over lag -- the
+    # 16 profiles of a trained 8-layer stack span a rank of 2.82. Unlike
+    # long_groups, which partitions dv and trades width for diversity, every
+    # kernel here reads the full width. See chead_numpy.py.
     decay_softplus: bool = False   # with decay_input: modulate the rate by
     # softplus(lz + b0) instead of exp(lz). See LongHead.lam_t.
     post_norm: bool = False    # RMSNorm on the MIXER OUTPUT before the residual.
@@ -461,6 +470,22 @@ class LongHead(nn.Module):
                 sign = 1.0 - 2.0 * g / (self.NG - 1) if self.NG > 1 else 0.0
                 wr_init[:, g] = 1.0 + sign * nr
                 wi_init[:, g] = sign * ni
+        self.R = max(1, cfg.read_mix)
+        if self.R > 1 and self.NG > 1:
+            raise ValueError("read_mix > 1 with long_groups > 1 is not implemented: "
+                             "they are two different answers to the same question")
+        if self.R > 1:
+            # R copies of the initialised weight, separated by antipodal noise so
+            # the mixture does not start degenerate; alpha starts uniform because
+            # A is zero, so step 0 is identical to the single-weight layer.
+            base_r, base_i = wr_init.clone(), wi_init.clone()
+            nr, ni = 0.05 * torch.randn(self.R, M), 0.05 * torch.randn(self.R, M)
+            nr -= nr.mean(0, keepdim=True)
+            ni -= ni.mean(0, keepdim=True)
+            wr_init = base_r.reshape(1, M).repeat(self.R, 1) + nr
+            wi_init = base_i.reshape(1, M).repeat(self.R, 1) + ni
+            self.alpha_proj = nn.Linear(d, self.R, bias=False)
+            nn.init.zeros_(self.alpha_proj.weight)
         self.wr = nn.Parameter(wr_init)  # spectral read weights, w = wr + i wi
         self.wi = nn.Parameter(wi_init)
         self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
@@ -545,6 +570,19 @@ class LongHead(nn.Module):
             return torch.exp(self.lam_raw.to(self.wd) + lz.to(self.wd)).clamp(max=self.lam_ceil)
         return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd) + lz.to(self.wd))
 
+    def w_eff(self, z):
+        """(wr, wi) for this token: a point in the span of the R learned weights.
+
+        Mixing the WEIGHTS and mixing the R separate READS are the same thing --
+        the read is linear in w -- so doing it here costs one (.., R) x (R, M)
+        product and leaves the read GEMM untouched. Doing it the other way would
+        have cost R times the read. chead_numpy.py checks the equivalence.
+        """
+        if self.R == 1:
+            return self.wr, self.wi
+        a = F.softmax(self.alpha_proj(z.to(self.wd)), -1)        # (..., R)
+        return a @ self.wr.to(self.wd), a @ self.wi.to(self.wd)  # (..., M)
+
     def lam(self) -> torch.Tensor:
         if self.cfg.lam_free:
             return torch.exp(self.lam_raw.to(self.wd)).clamp(max=self.lam_ceil)
@@ -602,7 +640,7 @@ class LongHead(nn.Module):
         return torch.exp(-lam * n)[:, None].repeat(2, 1)
 
     # ---- prefill: one chunk against an incoming state ---------------------- #
-    def _chunk(self, kz, kh, vz, bz, lz, st: State):
+    def _chunk(self, kz, kh, vz, bz, lz, mw, st: State):
         B, T, _ = kz.shape
         M = self.M
         dev = kz.device
@@ -624,8 +662,9 @@ class LongHead(nn.Module):
             Kk = torch.cat([cw * gw, sw * gw], -1).to(gd)  # (B,T,2M) keys
             Qk = torch.cat([cw * gq, sw * gq], -1).to(gd)  # (B,T,2M) Gram lhs / read-back
             if self.NG == 1:
-                c1 = (self.wr * cq + self.wi * sq) * gq
-                c2 = (self.wr * sq - self.wi * cq) * gq
+                wr_, wi_ = (self.wr, self.wi) if mw is None else mw
+                c1 = (wr_ * cq + wi_ * sq) * gq
+                c2 = (wr_ * sq - wi_ * cq) * gq
                 Fq = torch.cat([torch.cat([c1, c2], -1),
                                 torch.cat([-c2, c1], -1)], 1).to(gd)  # (B,2T,2M)
             else:
@@ -674,7 +713,7 @@ class LongHead(nn.Module):
         return o, {"s": sn, "pos": st["pos"] + T}
 
     # ---- prefill: all full chunks batched, state loop only ----------------- #
-    def _batched(self, kz, kh, vz, bz, lz, st: State, K: int):
+    def _batched(self, kz, kh, vz, bz, lz, mw, st: State, K: int):
         B, T, _ = kz.shape
         M, dv, C = self.M, self.dvi, self.cfg.chunk
         dev = kz.device
@@ -710,7 +749,9 @@ class LongHead(nn.Module):
             use_codes = (self.cfg.long_path in ("triton_fused", "triton_codes",
                                                 "triton_scan")
                          and kz.is_cuda and self.wd == torch.float32
-                         and gd in (torch.float32, torch.bfloat16) and self.bg == 1)
+                         and gd in (torch.float32, torch.bfloat16) and self.bg == 1
+                         # per-token read weights are a further kernel change
+                         and mw is None)
             if use_codes:
                 from .triton_phase import phase_codes
                 Kk, Qk, Fq = phase_codes(kz, kh, self.theta, self.omega,
@@ -734,8 +775,10 @@ class LongHead(nn.Module):
                 if self.bg > 1:
                     Qk = Qk * torch.cat([beta, beta], -1).to(gd)
                 if self.NG == 1:
-                    c1 = (self.wr * cq + self.wi * sq) * gq
-                    c2 = (self.wr * sq - self.wi * cq) * gq
+                    wr_, wi_ = (self.wr, self.wi) if mw is None else (
+                        ch(mw[0]), ch(mw[1]))
+                    c1 = (wr_ * cq + wi_ * sq) * gq
+                    c2 = (wr_ * sq - wi_ * cq) * gq
                     Fq = torch.cat([torch.cat([c1, c2], -1),
                                     torch.cat([-c2, c1], -1)], 2).to(gd)
                 else:
@@ -853,6 +896,9 @@ class LongHead(nn.Module):
         # second d x M projection and the (B,T,d) shifted copy of z both disappear.
         kz, vz, bz, gate = self._project(z)
         lz = self.lam_proj(z) if self.cfg.decay_input else None
+        # Per-token read weights, threaded exactly like lz: one (.., R) x (R, M)
+        # product for the whole sequence, then sliced per chunk.
+        mw = self.w_eff(z) if self.R > 1 else None
         kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
         if self.dk:
             # the stored key is Kv(h_s) = Kv of the PREVIOUS token; Kv is linear, so the
@@ -862,7 +908,8 @@ class LongHead(nn.Module):
         C = self.cfg.chunk
         K = T // C
         cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b],
-                            lz[:, a:b] if lz is not None else None)
+                            lz[:, a:b] if lz is not None else None,
+                            None if mw is None else (mw[0][:, a:b], mw[1][:, a:b]))
         if K >= 2 and self.cfg.long_path in ("batched", "triton", "triton_fused",
                                             "triton_codes", "triton_scan"):
             o, st = self._batched(*cut(0, K * C), st, K)
@@ -921,7 +968,7 @@ class LongHead(nn.Module):
             pw, pq = self._phase(kh, p), self._phase(kz, p)  # (B,M)
             kt = torch.cat([pw.cos(), pw.sin()], -1)  # (B,2M) write code
             beta = self._beta(bz)
-            fast = getattr(self, "_decode_fast", None)
+            fast = getattr(self, "_decode_fast", None) if self.R == 1 else None
             if fast is not None:
                 # One launch for decay + vhat + rank-1 write + read, instead of
                 # four passes over the same 0.5 MB that torch.compile cannot
@@ -948,8 +995,9 @@ class LongHead(nn.Module):
             e = v - (vhat if self.bg > 1 else beta * vhat)
             s = torch.addcmul(s0, e[:, None, :], kt[:, :, None])
             cq, sq = pq.cos(), pq.sin()
+            wr_, wi_ = self.w_eff(z_t)
             if self.NG == 1:
-                c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
+                c1, c2 = wr_ * cq + wi_ * sq, wr_ * sq - wi_ * cq
             else:
                 cg, sg_ = cq[..., None], sq[..., None]               # (B,M,1)
                 c1 = self.wr * cg + self.wi * sg_                     # (B,M,NG)

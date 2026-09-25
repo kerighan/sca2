@@ -137,17 +137,18 @@ if HAVE_TRITON:
         phi = tl.load(KH + b * L + l) * theta + base
         psi = tl.load(KZ + b * L + l) * theta + base
 
-        # ---- ring write, in place at the pointer --------------------------- #
+        # ---- the current token's row, kept in REGISTERS ---------------------- #
+        # NOT stored-then-read-back. Writing the ring and loading it again inside
+        # one kernel is a read-after-write with no fence: nothing orders the
+        # store before the load, and it silently returned the STALE row. It cost
+        # 3.44 on an output of magnitude 3.44 -- the kernel read zeros -- and
+        # only from a cold state, because at every later step the stale row
+        # happened to be close enough to hide it. tl.debug_barrier() fixes it
+        # too; keeping the row in registers removes the hazard instead of
+        # ordering it, and skips a round trip.
         ptr = tl.load(PTR)
-        tl.store(CW + b * L * L + ptr * L + l, tl.cos(phi).to(CW.dtype.element_ty))
-        tl.store(SW + b * L * L + ptr * L + l, tl.sin(phi).to(SW.dtype.element_ty))
-        dvj = tl.arange(0, BLOCK_DV)
-        for j0 in range(0, DV, BLOCK_DV):
-            cols = j0 + dvj
-            tl.store(EW + b * L * DV + ptr * DV + cols,
-                     tl.load(VZ + b * DV + cols, mask=cols < DV,
-                             other=0.0).to(EW.dtype.element_ty),
-                     mask=cols < DV)
+        w = tl.arange(0, L)
+        is_cur = w == ptr
 
         # ---- read codes ----------------------------------------------------- #
         cq, sq = tl.cos(psi), tl.sin(psi)
@@ -156,20 +157,30 @@ if HAVE_TRITON:
         c2 = wr * sq - wi * cq
 
         # ---- kappa over the window: one (W,L) reduction, W = L -------------- #
-        w = tl.arange(0, L)
-        off = b * L * L + w[:, None] * L + l[None, :]
-        cwv = tl.load(CW + off).to(tl.float32)
-        swv = tl.load(SW + off).to(tl.float32)
+        off_r = b * L * L + w[:, None] * L + l[None, :]
+        cwv = tl.where(is_cur[:, None], tl.cos(phi)[None, :],
+                       tl.load(CW + off_r).to(tl.float32))
+        swv = tl.where(is_cur[:, None], tl.sin(phi)[None, :],
+                       tl.load(SW + off_r).to(tl.float32))
         k_re = (tl.sum(cwv * c1[None, :], 1) + tl.sum(swv * c2[None, :], 1)) / L
         k_im = (tl.sum(swv * c1[None, :], 1) - tl.sum(cwv * c2[None, :], 1)) / L
+
+        # the ring itself is written once, at the end, for the NEXT call
+        tl.store(CW + b * L * L + ptr * L + l, tl.cos(phi).to(CW.dtype.element_ty))
+        tl.store(SW + b * L * L + ptr * L + l, tl.sin(phi).to(SW.dtype.element_ty))
+        dvj = tl.arange(0, BLOCK_DV)
 
         # ---- contract with the value window, and the RMS over 2*DV ---------- #
         acc = tl.zeros([], dtype=tl.float32)
         for j0 in range(0, DV, BLOCK_DV):
             cols = j0 + dvj
             cmask = cols < DV
-            e = tl.load(EW + b * L * DV + w[:, None] * DV + cols[None, :],
-                        mask=cmask[None, :], other=0.0).to(tl.float32)
+            vzc = tl.load(VZ + b * DV + cols, mask=cmask, other=0.0)
+            e = tl.where(is_cur[:, None], vzc[None, :],
+                         tl.load(EW + b * L * DV + w[:, None] * DV + cols[None, :],
+                                 mask=cmask[None, :], other=0.0).to(tl.float32))
+            tl.store(EW + b * L * DV + ptr * DV + cols,
+                     vzc.to(EW.dtype.element_ty), mask=cmask)
             u0 = tl.sum(e * k_re[:, None], 0)
             u1 = tl.sum(e * k_im[:, None], 0)
             tl.store(OUT + b * 2 * DV + cols, u0, mask=cmask)
