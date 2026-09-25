@@ -249,3 +249,108 @@ print("  -> the key that comes back agrees most with the query where a matching 
       "     read returns the keys of PARTIAL matches too (theta = 0 gives ~0 there) -- that is the mechanism, not a\n"
       "     bug; at d = 128 the accidental similarity is far smaller.  Trained (diag_gate.py, layer 1 of the\n"
       "     combo): g = 0.59 on repeated words, 0.35 on new ones.")
+
+
+# =============================================================================
+# MIXTURE OF LAPLACE KERNELS: R read weights, chosen per token      (PROPOSED)
+# =============================================================================
+# WHAT LIMITS THE LAYER TODAY is not the write and not the state -- it is that
+# ONE complex w gives ONE temporal kernel, shared by every one of the dv output
+# channels and by every token. Composing the write and the read gives
+#
+#     kappa(t,s) = (1/M) sum_m w_m e^{-lambda_m (t-s)} e^{i[theta_m (K h_s - K z_t)_m + (s-t) omega_m]}
+#
+# and the only thing that varies with the token is the PHASE, through K z_t.
+# The SHAPE of the kernel over lag -- how far back the layer looks, and with
+# what profile -- is fixed at training time. Measured on the trained stack, the
+# 16 profiles of an 8-layer model span a rank of 2.82: the layers learn nearly
+# the same shape.
+#
+# The proposal keeps the state, the write, the transform and the complex
+# structure exactly as they are, and changes only WHICH CONTOUR the read
+# inverts along: R weight vectors instead of one, combined by coefficients the
+# token itself produces.
+#
+#     o_t = sum_r alpha_r(z_t) * [ (w^(r) * q_t) @ S / M ]
+#
+# Because the read is linear in w, this is identical to reading once with an
+# effective weight  w_eff(z_t) = sum_r alpha_r(z_t) w^(r)  -- a token-chosen
+# point in the R-dimensional span of the learned weights. The kernel becomes
+#
+#     kappa_t(t,s) = sum_r alpha_r(z_t) kappa_r(t,s)
+#
+# still a sum of damped exponentials on the SAME modes: a mixture of Laplace
+# kernels, not a departure from the transform. The state is untouched, which is
+# the whole point -- 2M*dv floats whatever R is.
+#
+# Cost, measured at the campaign's shapes on a GB10: the read GEMM is 1.01% of
+# a layer's forward, so R=4 is +3.0% of compute, R*M extra weights plus a d->R
+# projection (+0.3% of parameters), and ZERO extra state.
+R = 4
+p3 = dict(p, w=None)                                  # same K, V, theta, beta as the long head
+W = rng.normal(size=(R, M)) + 1j * rng.normal(size=(R, M))   # R read weights      (R, M)
+A = rng.normal(size=(d, R)) / np.sqrt(d)              # alpha projection            (d, R)
+
+S3 = np.zeros((M, dv), complex)                       # SAME state as the long head (M, dv)
+E3, ALPHA = [], []
+out_mix = np.zeros((T, 2 * dv))
+
+for t in range(T):
+    z, h = Z[t], H[t]
+    phi = h @ p3["K"] * p3["theta"] + t * omega_long  # write phase, unchanged      (M,)
+    c = np.exp(1j * phi)
+    v = z @ p3["V"]
+    vhat = (np.conj(c) @ S3).real / M                 # delta rule, unchanged       (dv,)
+    beta = sig(p3["b"] @ z + p3["b0"])
+    e = v - beta * vhat
+    S3 = S3 + np.outer(c, e)                          # write, unchanged            (M, dv)
+    E3.append(e)
+
+    # --- the ONLY change: R reads, mixed by weights the token chooses
+    a = np.exp(A.T @ z - (A.T @ z).max())
+    alpha = a / a.sum()                               # softmax over R              (R,)
+    ALPHA.append(alpha)
+    psi = z @ p3["K"] * p3["theta"] + t * omega_long
+    q = np.exp(-1j * psi)                             # read code, unchanged        (M,)
+    o = ((alpha @ W) * q) @ S3 / M                    # == sum_r alpha_r (W_r*q)@S3 (dv,)
+    out_mix[t] = np.concatenate([o.real, o.imag])
+
+# check 1: mixing the WEIGHTS equals mixing the R separate READS (linearity)
+t = T - 1
+z = Z[t]
+q = np.exp(-1j * (z @ p3["K"] * p3["theta"] + t * omega_long))
+per_r = np.stack([(W[r] * q) @ S3 / M for r in range(R)])          # (R, dv)
+assert np.allclose(ALPHA[t] @ per_r, (ALPHA[t] @ W * q) @ S3 / M), "mixture != R separate reads"
+
+# check 2: the closed form is the SAME sum over the past, with a per-token kernel
+def kernel_w(w, t, s, zt, hs):
+    phi = hs @ p3["K"] * p3["theta"] + s * omega_long
+    psi = zt @ p3["K"] * p3["theta"] + t * omega_long
+    return (w * np.exp(1j * (phi - psi))).sum() / M
+ref = sum(kernel_w(ALPHA[t] @ W, t, s, Z[t], H[s]) * E3[s] for s in range(t + 1))
+assert np.allclose(out_mix[t], np.concatenate([ref.real, ref.imag])), "mixture != closed form"
+
+# check 3: what it buys, isolated. A single w ALREADY varies with the token --
+# through the phase theta_m (K h_s - K z_t)_m -- so comparing at theta != 0
+# shows nothing: both look token-dependent. Set theta = 0 and the phase term
+# collapses to (s-t) omega, identical for every token; then a single w gives
+# ONE fixed shape over lag and the only remaining source of variation is the
+# mixture. Centred rank 0 against R-1 is the whole claim.
+lags = np.arange(12)
+theta_keep = p3["theta"].copy()
+p3["theta"] = np.zeros(M)                             # phase now content-free
+def shapes_for(wfn):
+    return np.stack([[kernel_w(wfn(t), t, t - n, Z[t], H[t - n]).real for n in lags]
+                     for t in range(20, T)])          # (tokens, lags)
+mix_shapes = shapes_for(lambda t: ALPHA[t] @ W)
+one_shapes = shapes_for(lambda t: W[0])
+r_mix = np.linalg.matrix_rank(mix_shapes - mix_shapes.mean(0), tol=1e-8)
+r_one = np.linalg.matrix_rank(one_shapes - one_shapes.mean(0), tol=1e-8)
+p3["theta"] = theta_keep
+assert r_one == 0, "a single w must give one fixed shape once the phase is content-free"
+print(f"MIXTURE head: state {S3.shape} complex = {2*S3.size} floats -- IDENTICAL to the long head's")
+print(f"              mixing weights == mixing reads OK; closed form OK")
+print(f"              at theta=0, centred rank of the lag-kernels: single w {r_one}, "
+      f"R={R} mixture {r_mix} (<= R-1 = {R-1})")
+print("  -> the state, the write and the transform are untouched; what the token now chooses is WHICH")
+print("     Laplace kernel to invert along. The shape over lag stops being a training-time constant.")
