@@ -808,7 +808,28 @@ class LongHead(nn.Module):
         return self._out(o, z, gate).to(z.dtype), st
 
     # ---- decode: one token, all float32 ------------------------------------ #
+    def _maybe_fast(self):
+        """Attach the fused decode kernel once, if it implements this head.
+
+        Lazy rather than in __init__ so importing the layer never needs Triton,
+        and so a head built on CPU still works. $SCA2_LAPA_DECODE=naive forces
+        the PyTorch path back, which is how the two are compared.
+        """
+        import os
+        if os.environ.get("SCA2_LAPA_DECODE", "auto") == "naive":
+            return None
+        try:
+            from .triton_decode import supported, long_step
+        except Exception:                                     # pragma: no cover
+            return None
+        if not supported(self):
+            return None
+        import functools
+        return functools.partial(long_step, block_dv=64, block_m=128)
+
     def step(self, z_t, h_t, state: State):
+        if not hasattr(self, "_decode_fast") and z_t.is_cuda:
+            self._decode_fast = self._maybe_fast()
         vz = self.V(z_t)
         if self.cfg.v_silu:
             vz = F.silu(vz)
@@ -1042,21 +1063,52 @@ class ShortHead(nn.Module):
             B = z_t.size(0)
             p = state["pos"].expand(B)
             phi = self._phase(kh, p)
-            cw = torch.cat([state["c"], phi.cos()[:, None]], 1)
-            sw = torch.cat([state["s"], phi.sin()[:, None]], 1)
-            e = torch.cat([state["e"], vz.to(self.wd)[:, None]], 1)
             psi = self._phase(kz, p)
+            # RING BUFFER, not concat-then-slice. The window used to be built by
+            # `cat([state, new])` and stored back as `[:, 1:]`, which copies the
+            # whole window TWICE per token -- 512 KB a layer, 4 MB a token over
+            # 8 layers, purely to shift it by one.
+            #
+            # It is avoidable exactly, not approximately. The read sums over the
+            # window index w with cw[w] and e[w] always paired, so applying the
+            # same permutation to both leaves u unchanged; a ring with a moving
+            # write pointer applies exactly that permutation.
+            L = self.L
+            if state["c"].shape[1] != L:                      # from prefill/init
+                pad = (0, 0, 0, 1)
+                cw = F.pad(state["c"], pad)
+                sw = F.pad(state["s"], pad)
+                ew = F.pad(state["e"], pad)
+                ptr = torch.full((), L - 1, device=z_t.device, dtype=torch.long)
+            else:
+                # In place: the ring is a buffer THIS layer allocated in the
+                # branch above, so no caller holds it expecting it unchanged --
+                # the prefill state was padded into a fresh tensor, not aliased.
+                # A caller that forks decode from one state (beam search) must
+                # clone it, which is the same contract a KV cache carries.
+                cw, sw, ew = state["c"], state["s"], state["e"]
+                ptr = state["ptr"]
+            # A TENSOR index, never a Python int. As an int the pointer is a
+            # compile-time constant, so torch.compile respecialises the graph on
+            # every token, blows the cache and falls back: measured 407 ms a
+            # token against 3.5, a 100x regression from what reads like a
+            # harmless `cw[:, ptr] = ...`.
+            i = ptr[None]
+            cw.index_copy_(1, i, phi.cos()[:, None])
+            sw.index_copy_(1, i, phi.sin()[:, None])
+            ew.index_copy_(1, i, vz.to(self.wd)[:, None])
             u = self._read(
                 psi.cos()[:, None],
                 psi.sin()[:, None],
                 cw[:, None],
                 sw[:, None],
-                e[:, None],
+                ew[:, None],
             )[:, 0]
         return _rms(u).to(z_t.dtype), {
-            "c": cw[:, 1:],
-            "s": sw[:, 1:],
-            "e": e[:, 1:],
+            "c": cw,
+            "s": sw,
+            "e": ew,
+            "ptr": (ptr + 1) % L,   # stays a tensor
             "pos": state["pos"] + 1,
         }
 
