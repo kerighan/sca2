@@ -85,6 +85,49 @@ def state_bytes(m, cfg, device) -> int:
     return total
 
 
+PROMPTS = [
+    "The main difference between a recurrent model and a transformer is",
+    "In 1892, the city council decided to",
+    "def compute_loss(model, batch):",
+    "The recipe calls for three cups of",
+    "According to the report published last week,",
+    "She opened the door and saw",
+    "The patient presented with a persistent",
+    "import numpy as np\n\ndef",
+    "Q: What is the capital of Australia?\nA:",
+    "1. First, gather the materials.\n2.",
+]
+
+
+def rep_metrics(ids: list[int], n: int = 4):
+    """(rep-n, distinct-3, distinct-1, H1, top10) over ONE continuation.
+
+    rep-n is the fraction of n-grams that occur more than once: 0 for text that
+    never repeats itself, approaching 1 for a loop. distinct-3 is unique
+    trigrams over total, so it falls as the text degenerates. Both read the
+    token ids, not the text, so tokenisation cannot flatter either arm.
+    """
+    def grams(k):
+        return [tuple(ids[i:i + k]) for i in range(len(ids) - k + 1)]
+    g = grams(n)
+    if not g:
+        return 0.0, 1.0, 1.0, 0.0, 1.0
+    from collections import Counter
+    import math as _m
+    c = Counter(g)
+    repeated = sum(v for v in c.values() if v > 1)
+    g3 = grams(3)
+    # VOCABULARY, not n-grams. A model can repeat few 4-grams while recycling
+    # the same twenty words forever; distinct-1 and the unigram entropy see
+    # that, rep-4 does not.
+    u = Counter(ids)
+    tot = len(ids)
+    h1 = -sum((v / tot) * _m.log(v / tot) for v in u.values())
+    top10 = sum(v for _, v in u.most_common(10)) / tot
+    return (repeated / len(g), len(set(g3)) / max(len(g3), 1),
+            len(u) / tot, h1, top10)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", nargs="+", required=True)
@@ -95,6 +138,9 @@ def main() -> None:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=40, dest="top_k")
     p.add_argument("--bench", action="store_true")
+    p.add_argument("--rep", type=int, default=0,
+                   help="N seeds per prompt: measure degenerate repetition, which "
+                        "the loss averages over and three samples cannot settle")
     p.add_argument("--bench-tokens", type=int, default=64, dest="bench_tokens")
     p.add_argument("--device", default="cuda")
     a = p.parse_args()
@@ -122,6 +168,37 @@ def main() -> None:
                                temperature=a.temperature, top_k=a.top_k)
                 print(f"\n--- {k+1} ---\n[PROMPT] {text}\n"
                       f"[CONT]   {tk.decode(out.tolist())}", flush=True)
+
+        if a.rep:
+            import statistics
+            from collections import Counter
+            reps, dis, worst = [], [], (0.0, "")
+            d1s, h1s, t10s = [], [], []
+            for pi, text in enumerate(PROMPTS):
+                ids = torch.tensor(tk.encode(text).ids, dtype=torch.long)
+                for sd in range(a.rep):
+                    # PAIRED: the same (prompt, seed) is used for every arm, so a
+                    # difference is the model and not the sampler.
+                    torch.manual_seed(1000 * pi + sd)
+                    out = generate(m, ids, a.tokens, a.device,
+                                   temperature=a.temperature, top_k=a.top_k)
+                    r, d, d1, h1, t10 = rep_metrics(out.tolist())
+                    reps.append(r)
+                    dis.append(d)
+                    d1s.append(d1); h1s.append(h1); t10s.append(t10)
+                    if r > worst[0]:
+                        worst = (r, tk.decode(out.tolist())[:90])
+            print(f"\n{name}  ({len(reps)} generations of {a.tokens} tokens, "
+                  f"{len(PROMPTS)} prompts x {a.rep} seeds)")
+            print(f"  rep-4      median {statistics.median(reps):.3f}  "
+                  f"mean {statistics.mean(reps):.3f}  "
+                  f"frac > 0.5 {sum(r > 0.5 for r in reps)/len(reps):.2f}")
+            print(f"  distinct-3 median {statistics.median(dis):.3f}  "
+                  f"mean {statistics.mean(dis):.3f}")
+            print(f"  distinct-1 median {statistics.median(d1s):.3f}   "
+                  f"unigram H {statistics.median(h1s):.3f} nats   "
+                  f"top-10 share {statistics.median(t10s):.3f}")
+            print(f"  worst      rep-4 {worst[0]:.3f}  {worst[1]!r}")
 
         if a.bench:
             x = torch.randint(0, V, (1, 256), device=a.device)
