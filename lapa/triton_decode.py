@@ -139,13 +139,14 @@ if HAVE_TRITON:
 
         # ---- ring write, in place at the pointer --------------------------- #
         ptr = tl.load(PTR)
-        tl.store(CW + b * L * L + ptr * L + l, tl.cos(phi))
-        tl.store(SW + b * L * L + ptr * L + l, tl.sin(phi))
+        tl.store(CW + b * L * L + ptr * L + l, tl.cos(phi).to(CW.dtype.element_ty))
+        tl.store(SW + b * L * L + ptr * L + l, tl.sin(phi).to(SW.dtype.element_ty))
         dvj = tl.arange(0, BLOCK_DV)
         for j0 in range(0, DV, BLOCK_DV):
             cols = j0 + dvj
             tl.store(EW + b * L * DV + ptr * DV + cols,
-                     tl.load(VZ + b * DV + cols, mask=cols < DV, other=0.0),
+                     tl.load(VZ + b * DV + cols, mask=cols < DV,
+                             other=0.0).to(EW.dtype.element_ty),
                      mask=cols < DV)
 
         # ---- read codes ----------------------------------------------------- #
@@ -157,8 +158,8 @@ if HAVE_TRITON:
         # ---- kappa over the window: one (W,L) reduction, W = L -------------- #
         w = tl.arange(0, L)
         off = b * L * L + w[:, None] * L + l[None, :]
-        cwv = tl.load(CW + off)
-        swv = tl.load(SW + off)
+        cwv = tl.load(CW + off).to(tl.float32)
+        swv = tl.load(SW + off).to(tl.float32)
         k_re = (tl.sum(cwv * c1[None, :], 1) + tl.sum(swv * c2[None, :], 1)) / L
         k_im = (tl.sum(swv * c1[None, :], 1) - tl.sum(cwv * c2[None, :], 1)) / L
 
@@ -168,7 +169,7 @@ if HAVE_TRITON:
             cols = j0 + dvj
             cmask = cols < DV
             e = tl.load(EW + b * L * DV + w[:, None] * DV + cols[None, :],
-                        mask=cmask[None, :], other=0.0)
+                        mask=cmask[None, :], other=0.0).to(tl.float32)
             u0 = tl.sum(e * k_re[:, None], 0)
             u1 = tl.sum(e * k_im[:, None], 0)
             tl.store(OUT + b * 2 * DV + cols, u0, mask=cmask)

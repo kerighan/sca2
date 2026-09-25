@@ -305,6 +305,22 @@ def _apply_init_v2(layer: "LaplaceAttention"):
         short.wi.copy_(0.3 * torch.randn_like(short.wi))
 
 
+def _ring_dtype() -> torch.dtype:
+    """Storage dtype of the short head's decode window. $SCA2_RING_DTYPE.
+
+    fp16 by default, and NOT bf16. The window holds cosines, sines and a
+    unit-RMS projection, so nothing needs bf16's exponent range -- the largest
+    |e| measured over a trained checkpoint is 65.8 against fp16's 65504, a
+    thousandfold margin -- while fp16's two extra mantissa bits are worth a
+    measured 6.3x on the head's output (7.8e-4 relative against 4.9e-3). The
+    reductions stay fp32; only the storage narrows, because storage is what
+    multiplies by batch.
+    """
+    import os
+    return {"fp32": torch.float32, "fp16": torch.float16,
+            "bf16": torch.bfloat16}[os.environ.get("SCA2_RING_DTYPE", "fp16")]
+
+
 def _rms(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return u * torch.rsqrt(u.square().mean(-1, keepdim=True) + eps)
 
@@ -1088,9 +1104,16 @@ class ShortHead(nn.Module):
             L = self.L
             if state["c"].shape[1] != L:                      # from prefill/init
                 pad = (0, 0, 0, 1)
-                cw = F.pad(state["c"], pad)
-                sw = F.pad(state["s"], pad)
-                ew = F.pad(state["e"], pad)
+                # The ring may be held narrower than the arithmetic. c and s are
+                # cosines and sines and e is a unit-RMS projection, so all three
+                # are bounded and fp16's 10 mantissa bits beat bf16's 8 at the
+                # same size -- bf16 buys range nothing here needs. The window is
+                # read back into fp32 and every reduction stays fp32; only the
+                # STORAGE narrows, which is what multiplies by batch.
+                rd = _ring_dtype()
+                cw = F.pad(state["c"], pad).to(rd)
+                sw = F.pad(state["s"], pad).to(rd)
+                ew = F.pad(state["e"], pad).to(rd)
                 ptr = torch.full((), L - 1, device=z_t.device, dtype=torch.long)
             else:
                 # In place: the ring is a buffer THIS layer allocated in the
@@ -1115,15 +1138,15 @@ class ShortHead(nn.Module):
             # token against 3.5, a 100x regression from what reads like a
             # harmless `cw[:, ptr] = ...`.
             i = ptr[None]
-            cw.index_copy_(1, i, phi.cos()[:, None])
-            sw.index_copy_(1, i, phi.sin()[:, None])
-            ew.index_copy_(1, i, vz.to(self.wd)[:, None])
+            cw.index_copy_(1, i, phi.cos()[:, None].to(cw.dtype))
+            sw.index_copy_(1, i, phi.sin()[:, None].to(sw.dtype))
+            ew.index_copy_(1, i, vz.to(cw.dtype)[:, None])
             u = self._read(
                 psi.cos()[:, None],
                 psi.sin()[:, None],
-                cw[:, None],
-                sw[:, None],
-                ew[:, None],
+                cw[:, None].to(self.wd),
+                sw[:, None].to(self.wd),
+                ew[:, None].to(self.wd),
             )[:, 0]
         return _rms(u).to(z_t.dtype), {
             "c": cw,
