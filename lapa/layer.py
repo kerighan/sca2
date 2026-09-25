@@ -581,6 +581,13 @@ class LongHead(nn.Module):
         if self.R == 1:
             return self.wr, self.wi
         a = F.softmax(self.alpha_proj(z.to(self.wd)), -1)        # (..., R)
+        # Record how much of the mixture is actually used. The failure mode is
+        # alpha collapsing onto one r, which turns this back into a single
+        # weight and makes a null result unreadable: a flat curve would not say
+        # whether the mechanism does not help or was never engaged. Entropy in
+        # nats, ln(R) when uniform, 0 when collapsed. No grad, no sync.
+        with torch.no_grad():
+            self.alpha_entropy = -(a * (a + 1e-9).log()).sum(-1).mean()
         return a @ self.wr.to(self.wd), a @ self.wi.to(self.wd)  # (..., M)
 
     def lam(self) -> torch.Tensor:
@@ -749,14 +756,13 @@ class LongHead(nn.Module):
             use_codes = (self.cfg.long_path in ("triton_fused", "triton_codes",
                                                 "triton_scan")
                          and kz.is_cuda and self.wd == torch.float32
-                         and gd in (torch.float32, torch.bfloat16) and self.bg == 1
-                         # per-token read weights are a further kernel change
-                         and mw is None)
+                         and gd in (torch.float32, torch.bfloat16) and self.bg == 1)
             if use_codes:
                 from .triton_phase import phase_codes
+                wr_k, wi_k = ((self.wr, self.wi) if mw is None else mw)
                 Kk, Qk, Fq = phase_codes(kz, kh, self.theta, self.omega,
                                           self.lam() if di else lam,
-                                          self.wr, self.wi, st["pos"], C, gd,
+                                          wr_k, wi_k, st["pos"], C, gd,
                                           # the compact layout is only read by
                                           # the scan, which decay_input skips
                                           (self.cfg.long_path == "triton_scan") and not di,

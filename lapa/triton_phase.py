@@ -33,6 +33,7 @@ def _codes(
     BM: tl.constexpr,
     COMPACT: tl.constexpr,
     HAS_CT: tl.constexpr,
+    PER_TOKEN_W: tl.constexpr,
 ):
     bk = tl.program_id(0) // tl.cdiv(C, BT)
     tile = tl.program_id(0) % tl.cdiv(C, BT)
@@ -73,10 +74,18 @@ def _codes(
     tl.store(QK + dest + M, sw * gq, mask)
     ROWS: tl.constexpr = C if COMPACT else 2 * C
     for g in tl.static_range(G):
-        wr = tl.load(WR + m * G + g, m < M, 0)
-        wi = tl.load(WI + m * G + g, m < M, 0)
-        a = (wr[None, :] * cq + wi[None, :] * sq) * gq
-        z = (wr[None, :] * sq - wi[None, :] * cq) * gq
+        if PER_TOKEN_W:
+            # read_mix: w is a per-token point in the span of the R learned
+            # weights, so it is (B, T, M) and indexes like kz, not (M,).
+            wr2 = tl.load(WR + off, mask, 0).to(tl.float32)
+            wi2 = tl.load(WI + off, mask, 0).to(tl.float32)
+            a = (wr2 * cq + wi2 * sq) * gq
+            z = (wr2 * sq - wi2 * cq) * gq
+        else:
+            wr = tl.load(WR + m * G + g, m < M, 0)
+            wi = tl.load(WI + m * G + g, m < M, 0)
+            a = (wr[None, :] * cq + wi[None, :] * sq) * gq
+            z = (wr[None, :] * sq - wi[None, :] * cq) * gq
         dest = ((bk * G + g) * ROWS + t[:, None]) * (2 * M) + m[None, :]
         tl.store(FQ + dest, a, mask)
         tl.store(FQ + dest + M, z, mask)
@@ -105,6 +114,8 @@ def _codes_backward(
     PART,
     CT,
     DCT,
+    DWR,
+    DWI,
     K: tl.constexpr,
     C: tl.constexpr,
     M: tl.constexpr,
@@ -114,6 +125,7 @@ def _codes_backward(
     BM: tl.constexpr,
     COMPACT: tl.constexpr,
     HAS_CT: tl.constexpr,
+    PER_TOKEN_W: tl.constexpr,
 ):
     pid = tl.program_id(0)
     bk = pid // tl.cdiv(C, BT)
@@ -156,27 +168,39 @@ def _codes_backward(
     dsq = tl.full((BT, BM), 0, tl.float32)
     ROWS: tl.constexpr = C if COMPACT else 2 * C
     for g in tl.static_range(G):
-        wr = tl.load(WR + m * G + g, m < M, 0)
-        wi = tl.load(WI + m * G + g, m < M, 0)
+        if PER_TOKEN_W:
+            wr = tl.load(WR + off, mask, 0).to(tl.float32)
+            wi = tl.load(WI + off, mask, 0).to(tl.float32)
+        else:
+            wr = tl.load(WR + m * G + g, m < M, 0)
+            wi = tl.load(WI + m * G + g, m < M, 0)
         dest = ((bk * G + g) * ROWS + t[:, None]) * (2 * M) + m[None, :]
         da = tl.load(DF + dest, mask, 0).to(tl.float32)
         dz = tl.load(DF + dest + M, mask, 0).to(tl.float32)
         if not COMPACT:
             da += tl.load(DF + dest + C * 2 * M + M, mask, 0).to(tl.float32)
             dz -= tl.load(DF + dest + C * 2 * M, mask, 0).to(tl.float32)
-        dgq += da * (wr[None, :] * cq + wi[None, :] * sq) + dz * (
-            wr[None, :] * sq - wi[None, :] * cq
-        )
+        wrb = wr if PER_TOKEN_W else wr[None, :]
+        wib = wi if PER_TOKEN_W else wi[None, :]
+        dgq += da * (wrb * cq + wib * sq) + dz * (wrb * sq - wib * cq)
         da = da * gq
         dz = dz * gq
-        dcq += da * wr[None, :] - dz * wi[None, :]
-        dsq += da * wi[None, :] + dz * wr[None, :]
-        tl.store(
-            PART + ((4 + g) * P + pid) * M + m, tl.sum(da * cq + dz * sq, 0), m < M
-        )
-        tl.store(
-            PART + ((4 + G + g) * P + pid) * M + m, tl.sum(da * sq - dz * cq, 0), m < M
-        )
+        dcq += da * wrb - dz * wib
+        dsq += da * wib + dz * wrb
+        if PER_TOKEN_W:
+            # elementwise, like DCT: the weight is a per-token tensor, so its
+            # gradient is not reduced over t and comes back on that tensor.
+            tl.store(DWR + off, da * cq + dz * sq, mask)
+            tl.store(DWI + off, da * sq - dz * cq, mask)
+            tl.store(PART + ((4 + g) * P + pid) * M + m, tl.zeros((BM,), tl.float32), m < M)
+            tl.store(PART + ((4 + G + g) * P + pid) * M + m, tl.zeros((BM,), tl.float32), m < M)
+        else:
+            tl.store(
+                PART + ((4 + g) * P + pid) * M + m, tl.sum(da * cq + dz * sq, 0), m < M
+            )
+            tl.store(
+                PART + ((4 + G + g) * P + pid) * M + m, tl.sum(da * sq - dz * cq, 0), m < M
+            )
     dpq = dsq * cq - dcq * sq
     tl.store(DZ + off, dpq * theta[None, :], mask)
     tl.store(DH + off, dpw * theta[None, :], mask)
@@ -203,7 +227,7 @@ class _Codes(torch.autograd.Function):
     def forward(ctx, kz, kh, theta, omega, lam, wr, wi, pos, c, dtype, compact, ct):
         b, t, m = kz.shape
         k = t // c
-        g = 1 if wr.ndim == 1 else wr.shape[1]
+        g = wr.shape[1] if wr.ndim == 2 else 1   # (M, G) groups; (B,T,M) is one
         kk = torch.empty((b, k, c, 2 * m), device=kz.device, dtype=dtype)
         qk = torch.empty_like(kk)
         rows = c if compact else 2 * c
@@ -229,6 +253,7 @@ class _Codes(torch.autograd.Function):
             BM=64,
             COMPACT=compact,
             HAS_CT=ct is not None,
+            PER_TOKEN_W=wr.ndim == 3,
             enable_fp_fusion=False,
         )
         ctx.save_for_backward(kz, kh, theta, omega, lam, wr, wi, pos)
@@ -243,13 +268,16 @@ class _Codes(torch.autograd.Function):
         b, t, m = kz.shape
         c = ctx.c
         k = t // c
-        g = 1 if wr.ndim == 1 else wr.shape[1]
+        g = wr.shape[1] if wr.ndim == 2 else 1   # (M, G) groups; (B,T,M) is one
         p = b * k * triton.cdiv(c, 16)
         part = torch.empty((4 + 2 * g, p, m), device=kz.device, dtype=torch.float32)
         dz = torch.empty_like(kz)
         dh = torch.empty_like(kh)
         ct = ctx.ct
         dct = torch.empty_like(ct) if ct is not None else None
+        per_tok = wr.ndim == 3
+        dwr = torch.empty_like(wr) if per_tok else None
+        dwi = torch.empty_like(wi) if per_tok else None
         _codes_backward[(p, triton.cdiv(m, 64))](
             kz,
             kh,
@@ -267,6 +295,8 @@ class _Codes(torch.autograd.Function):
             part,
             ct,
             dct,
+            dwr if per_tok else wr,
+            dwi if per_tok else wi,
             K=k,
             C=c,
             M=m,
@@ -276,6 +306,7 @@ class _Codes(torch.autograd.Function):
             BM=64,
             COMPACT=ctx.compact,
             HAS_CT=ct is not None,
+            PER_TOKEN_W=wr.ndim == 3,
             enable_fp_fusion=False,
         )
         grad = part.sum(1)
@@ -285,8 +316,8 @@ class _Codes(torch.autograd.Function):
             grad[0],
             grad[2],
             None if ct is not None else grad[1],
-            grad[4 : 4 + g].T.reshape_as(wr),
-            grad[4 + g :].T.reshape_as(wi),
+            dwr if per_tok else grad[4 : 4 + g].T.reshape_as(wr),
+            dwi if per_tok else grad[4 + g :].T.reshape_as(wi),
             grad[3].sum().reshape_as(pos),
             None,
             None,
@@ -302,6 +333,12 @@ def phase_codes(kz, kh, theta, omega, lam, wr, wi, pos, c, dtype, compact=False,
     `ct` (B, K, C, M) replaces the idx * lam ramp with a per-token cumulative
     decay, which is what --decay-input needs. Passing it makes lam unused and
     ungradiented; the gradient comes back on ct instead.
+
+    `wr`/`wi` with ndim 3 are PER-TOKEN read weights (B, T, M), which is what
+    --read-mix needs: one point per token in the span of the R learned weights.
+    Their gradient is then elementwise and comes back on those tensors. Falling
+    back to PyTorch instead costs 21-27% of the arm's throughput, which is more
+    than either mechanism is worth.
     """
     return _Codes.apply(
         kz.contiguous(), kh.contiguous(), theta, omega, lam, wr, wi, pos, c, dtype,

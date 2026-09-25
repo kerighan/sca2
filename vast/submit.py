@@ -37,6 +37,8 @@ EXTRA = {
     "dsoft":    "--decay-input --decay-softplus",   # GDN's actual gate form
     "dexp":     "--decay-input",                    # the exp() form that was dropped
     "postnorm": "--post-norm",                      # RMSNorm on the mixer output
+    "mix4":     "--read-mix 4 --post-norm",         # mixture of Laplace kernels
+    "mix4only": "--read-mix 4",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"

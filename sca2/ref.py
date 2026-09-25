@@ -325,6 +325,9 @@ class LayerCfg:
     gdn_gate_scope: str = 'long'  # long | both | concat | mix: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
+    read_mix: int = 1            # R read weights combined per token by softmax(A z): the
+    #   kernel becomes sum_r alpha_r(z_t) kappa_r(t,s), same state, same write, same modes.
+    #   See chead_numpy.py and LongHead.w_eff.
     decay_softplus: bool = False  # with decay_input: rate = exp(a) * softplus(lz + b0), which
     #   is GDN's actual form. The exp(a + lz) it replaces runs into the clamp, and a clamped
     #   rate has no gradient -- 32% of the modes pinned at lz=+3. See LongHead.lam_t.

@@ -225,6 +225,14 @@ def run(name, m, tr, va, a, device, log, V=None):
                    # whether a batch size fits is the worst moment, and on a rented
                    # card an OOM at hour 12 costs the hours already paid for.
                    "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2)}
+            # --read-mix: how much of the mixture is used, in nats. ln(R) means
+            # every kernel contributes, 0 means alpha collapsed onto one and the
+            # arm is really running a single weight -- which is what tells a null
+            # result apart from a mechanism that was never engaged.
+            ent = [m_.alpha_entropy.item() for m_ in m.modules()
+                   if hasattr(m_, "alpha_entropy")]
+            if ent:
+                rec["alpha_H"] = [round(e, 4) for e in ent]
             if prof:
                 rec["pos"] = [round(v, 5) for v in prof]
             if cls:
@@ -341,6 +349,10 @@ def main(argv=None):
                    choices=["long", "both", "concat", "mix"],
                    help="where the gdn-gate applies: long (default), both (long+short), "
                         "concat (after cat before mix), mix (after mix before residual)")
+    p.add_argument("--read-mix", type=int, default=1, dest="read_mix",
+                   help="R read weight vectors mixed per token (mixture of Laplace "
+                        "kernels): same state, same write, kernel shape becomes "
+                        "token-chosen. See chead_numpy.py")
     p.add_argument("--decay-softplus", action="store_true", dest="decay_softplus",
                    help="with --decay-input: modulate the rate by softplus(lz+b0) "
                         "instead of exp(lz), which is GDN's actual form and does "
@@ -437,7 +449,7 @@ def main(argv=None):
                    persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    short_groups=a.short_groups, long_groups=a.long_groups,
-                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus,
+                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus, read_mix=a.read_mix,
                    beta_write=a.beta_write,
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
