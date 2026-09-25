@@ -325,6 +325,10 @@ class LayerCfg:
     gdn_gate_scope: str = 'long'  # long | both | concat | mix: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
+    decay_softplus: bool = False  # with decay_input: rate = exp(a) * softplus(lz + b0), which
+    #   is GDN's actual form. The exp(a + lz) it replaces runs into the clamp, and a clamped
+    #   rate has no gradient -- 32% of the modes pinned at lz=+3. See LongHead.lam_t.
+    post_norm: bool = False      # RMSNorm on the mixer output before the residual
     beta_init: float = -2.0      # erase-gate bias: sigmoid(-2) = 0.12 at init. GDN's b has
     #   NO bias, so its erase gate starts at sigmoid(0) = 0.5 -- 4x bolder than ours, and its
     #   delta rule ablates 3x heavier (+4.51 vs our +1.42).

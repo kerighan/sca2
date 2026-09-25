@@ -43,6 +43,8 @@ def config_from(cfg) -> LaplaceConfig:
         beta_init=cfg.beta_init,
         beta_write=cfg.beta_write,
         decay_input=cfg.decay_input,
+        decay_softplus=cfg.decay_softplus,
+        post_norm=cfg.post_norm,
         layer_scale=cfg.layer_scale,
         ls_mix_init=cfg.ls_mix_init,
         ls_ff_init=cfg.ls_ff_init,

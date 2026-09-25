@@ -161,6 +161,19 @@ class LaplaceConfig:
     ls_mix_init: float = 1.0   # init value for gs_mix. Two trained checkpoints (lsfree, g2)
     #   converge to a median of ~0.26; starting at 0.25 saves 2h of convergence.
     ls_ff_init: float = 1.0    # init value for gs_ff. Converges to ~0.6 in both runs.
+    decay_softplus: bool = False   # with decay_input: modulate the rate by
+    # softplus(lz + b0) instead of exp(lz). See LongHead.lam_t.
+    post_norm: bool = False    # RMSNorm on the MIXER OUTPUT before the residual.
+    # The inputs of `mix` are normalised (o_norm on the long head, _rms on the
+    # short one); its output is a bare Linear, and a single learned scalar has
+    # to absorb whatever scale it lands on. Trained checkpoints show the
+    # optimiser spending that scalar on damping: gs_mix falls to 0.048, BELOW
+    # its 0.1 init, in the middle layers, while gs_ff climbs to 0.445 -- the one
+    # component that moves information between positions contributes a twentieth
+    # of the residual. This gives the branch a per-channel scale of its own, at
+    # d parameters a layer (8192 for the stack, 0.007%), and keeps gs_mix for
+    # the overall magnitude. The pattern is Gemma 2's and NormFormer's; neither
+    # this layer nor the GDN baseline has it.
     ls_mix_per_channel: bool = False  # gs_mix shape (d,) instead of (): lets each branch
     #   choose WHERE in the residual stream it writes, not just how much.
     #   Measured on the trained 10-layer model: the residual stream grows 29x from layer 0 to
@@ -509,11 +522,26 @@ class LongHead(nn.Module):
     def wd(self) -> torch.dtype:
         return _wd(self.wr)
 
+    # softplus(log(e-1)) == 1 exactly, so the modulation starts as a no-op and a
+    # decay_softplus run is identical to a static-decay run at step 0.
+    _SP_B0 = math.log(math.e - 1.0)
+
     def lam_t(self, lz):
         """(...,M) per-token decay from the ALREADY-PROJECTED lam_proj(z)."""
         if self.cfg.lam_free:
-            # exp(a + lz) = exp(a) * exp(lz): a MULTIPLICATIVE rate modulation, which is
-            # exactly GDN's g = -exp(A_log) * softplus(a(x) + dt_bias) form.
+            if self.cfg.decay_softplus:
+                # GDN's actual form: rate = exp(A_log) * softplus(a(x) + bias).
+                # The exp(a + lz) branch below claimed to be this and is not, and
+                # the difference is not cosmetic. exp() grows exponentially into
+                # the clamp, and a clamped rate has NO GRADIENT: at lz = +2,
+                # 18% of the modes are pinned and lam_proj stops learning for
+                # them; at +3, 32%. It bites the FAST modes first -- memory 4
+                # saturates at lz > 0.54 while memory 20000 never does -- which
+                # are exactly the ones an input-dependent forget gate is for.
+                # softplus grows linearly, so the clamp is reached far later and
+                # the gradient survives up to it.
+                return (torch.exp(self.lam_raw.to(self.wd))
+                        * F.softplus(lz.to(self.wd) + self._SP_B0)).clamp(max=self.lam_ceil)
             return torch.exp(self.lam_raw.to(self.wd) + lz.to(self.wd)).clamp(max=self.lam_ceil)
         return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd) + lz.to(self.wd))
 
@@ -1200,6 +1228,7 @@ class LaplaceAttention(nn.Module):
         elif cfg.gdn_gate and cfg.gdn_gate_scope == "mix":
             self.gate_norm = nn.LayerNorm(d)
             self.gate_proj = nn.Linear(d, d)
+        self.mix_norm = nn.RMSNorm(d) if cfg.post_norm else None
         if cfg.layer_scale:
             mix_shape = (d,) if cfg.ls_mix_per_channel else ()
             self.gs_mix = nn.Parameter(torch.full(mix_shape, cfg.ls_mix_init))
@@ -1269,6 +1298,8 @@ class LaplaceAttention(nn.Module):
         mixer_out = self.mix(cat)
         if scope == "mix":
             mixer_out = self.gate_norm(mixer_out) * F.silu(self.gate_proj(z))
+        if self.mix_norm is not None:
+            mixer_out = self.mix_norm(mixer_out)
         if self.cfg.layer_scale:
             x = x + self.gs_mix * mixer_out
             x = x + self.gs_ff * self.ff(self.fn(x))
@@ -1292,6 +1323,8 @@ class LaplaceAttention(nn.Module):
         mixer_out = self.mix(cat)
         if scope == "mix":
             mixer_out = self.gate_norm(mixer_out) * F.silu(self.gate_proj(z))
+        if self.mix_norm is not None:
+            mixer_out = self.mix_norm(mixer_out)
         if self.cfg.layer_scale:
             y = x_t + self.gs_mix * mixer_out
             y = y + self.gs_ff * self.ff(self.fn(y))

@@ -32,6 +32,12 @@ ARMS = {
 LAPA_FLAGS = ("--variant lapa_cc --Ls 128 --theta-scale 0.02 --rope-base 2048 "
               "--slow-frac 0.25 --conv 4 --layer-scale --lam-free --damp-mem 4,20000 "
               "--gdn-gate --v-silu --init-v2")
+# Experimental arms, all dv256 so the control is the dv256 already running.
+EXTRA = {
+    "dsoft":    "--decay-input --decay-softplus",   # GDN's actual gate form
+    "dexp":     "--decay-input",                    # the exp() form that was dropped
+    "postnorm": "--post-norm",                      # RMSNorm on the mixer output
+}
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"
 
@@ -57,8 +63,12 @@ def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
     )
     if arm == "gdn":
         return f"python -u pretrain.py --label z_gdn --seed 0 {common} {GDN_FLAGS} --ff 4096"
+    if arm in EXTRA:
+        return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
+                f"{LAPA_FLAGS} {ARMS['dv256']} {EXTRA[arm]}")
     if arm not in ARMS:
-        raise SystemExit(f"unknown arm {arm!r}; known: {', '.join(ARMS)} , gdn")
+        raise SystemExit(f"unknown arm {arm!r}; known: "
+                         f"{', '.join(list(ARMS) + list(EXTRA))} , gdn")
     return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
             f"{LAPA_FLAGS} {ARMS[arm]}")
 
@@ -133,7 +143,11 @@ def main() -> None:
         # recording the subshell again, two below the PID that matters.
         f"echo $!; "
         f"for i in $(seq 1 30); do "
-        f"  p=$(pgrep -f '[p]retrain[.]py' | head -1); "
+        # Match the PROCESS NAME, not just the command line. `sh -c "exec python
+        # ... pretrain.py ..."` carries "pretrain.py" in its own cmdline until
+        # the exec lands, so a pgrep -f can return the wrapper -- it did, and
+        # the recorded PID was two below the real one while the job ran fine.
+        f"  p=$(ps -eo pid,comm,args | awk '$2==\"python\" && /pretrain[.]py/ {{print $1}}' | head -1); "
         f"  if [ -n \"$p\" ]; then echo JOBPID=$p; break; fi; sleep 2; "
         f"done"
     )

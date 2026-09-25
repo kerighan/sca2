@@ -341,6 +341,10 @@ def main(argv=None):
                    choices=["long", "both", "concat", "mix"],
                    help="where the gdn-gate applies: long (default), both (long+short), "
                         "concat (after cat before mix), mix (after mix before residual)")
+    p.add_argument("--decay-softplus", action="store_true", dest="decay_softplus",
+                   help="with --decay-input: modulate the rate by softplus(lz+b0) "
+                        "instead of exp(lz), which is GDN's actual form and does "
+                        "not saturate the clamp (see LongHead.lam_t)")
     p.add_argument("--decay-input", action="store_true", dest="decay_input",
                    help="data-dependent forgetting: lam = lam_max*sigmoid(a_m + Wd(z)_m), a "
                         "function of the token, instead of a constant per mode. GDN's decay "
@@ -433,7 +437,7 @@ def main(argv=None):
                    persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    short_groups=a.short_groups, long_groups=a.long_groups,
-                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input,
+                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus,
                    beta_write=a.beta_write,
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
