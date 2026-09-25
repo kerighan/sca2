@@ -106,7 +106,17 @@ def _merge_jsonl(fresh: Path, archive: Path) -> tuple[int, int]:
 def _validate_ckpt(path: Path) -> str:
     import torch
     ck = torch.load(path, map_location="cpu")
-    n = sum(v.numel() for v in ck["model"].values())
+    # Count STORAGES, not keys. A state_dict lists every name, and several name
+    # the same tensor: weight tying puts the embedding under `e.weight` and
+    # `o.weight`, and `self.layer = self.layers[0]` puts layer 0 under both.
+    # Summing numel over keys reported 163.6M for a 120.0M model, which reads
+    # like a corrupt or mismatched checkpoint and is only double counting.
+    seen, n = set(), 0
+    for v in ck["model"].values():
+        key = v.untyped_storage().data_ptr()
+        if key not in seen:
+            seen.add(key)
+            n += v.numel()
     return f"{n:,} params, label {ck['cfg'].get('label')}"
 
 
