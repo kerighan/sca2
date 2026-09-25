@@ -54,7 +54,7 @@ if HAVE_TRITON:
             rows = r0 + tl.arange(0, BLOCK_M)
             rmask = rows < M2
             s = tl.load(S + b * M2 * DV + rows[:, None] * DV + cols[None, :],
-                        mask=rmask[:, None] & cmask[None, :], other=0.0)
+                        mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
             d = tl.load(DAMP + rows, mask=rmask, other=0.0)
             k = tl.load(KT + b * M2 + rows, mask=rmask, other=0.0)
             vhat += tl.sum(s * d[:, None] * k[:, None], 0)
@@ -72,11 +72,11 @@ if HAVE_TRITON:
             rmask = rows < M2
             off = b * M2 * DV + rows[:, None] * DV + cols[None, :]
             full = rmask[:, None] & cmask[None, :]
-            s = tl.load(S + off, mask=full, other=0.0)
+            s = tl.load(S + off, mask=full, other=0.0).to(tl.float32)
             d = tl.load(DAMP + rows, mask=rmask, other=0.0)
             k = tl.load(KT + b * M2 + rows, mask=rmask, other=0.0)
             sn = s * d[:, None] + e[None, :] * k[:, None]
-            tl.store(SOUT + off, sn, mask=full)
+            tl.store(SOUT + off, sn.to(SOUT.dtype.element_ty), mask=full)
             q0 = tl.load(QT + b * 2 * M2 + rows, mask=rmask, other=0.0)
             q1 = tl.load(QT + b * 2 * M2 + M2 + rows, mask=rmask, other=0.0)
             u0 += tl.sum(sn * q0[:, None], 0)
@@ -103,7 +103,7 @@ def long_step(s, damp, kt, qt, v, beta, block_dv: int = 32, block_m: int = 64):
     """
     B, M2, DV = s.shape
     s = s.contiguous()
-    out = torch.empty_like(s)
+    out = torch.empty_like(s)   # same dtype as the incoming state
     u = torch.empty((B, 2, DV), device=s.device, dtype=torch.float32)
     grid = (B, triton.cdiv(DV, block_dv))
     _long_step[grid](
