@@ -48,7 +48,12 @@ def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
         # on the host: the arm then dies in its first second. --tie-embed is
         # worse, because it does NOT fail -- it quietly adds 33 M untied output
         # params to every arm and changes what the comparison measures.
-        f"--class-eval --bpe {bpe} --tie-embed --save-every 7200"
+        # --save-every is INERT without --save: pretrain.py sets its next-save
+        # deadline to infinity when no path is given, so neither the mid-run
+        # checkpoints nor the final one are written, and a 40 h arm ends with
+        # its curve and no weights.
+        f"--class-eval --bpe {bpe} --tie-embed "
+        f"--save runs/ck_{log} --save-every 7200"
     )
     if arm == "gdn":
         return f"python -u pretrain.py --label z_gdn --seed 0 {common} {GDN_FLAGS} --ff 4096"
