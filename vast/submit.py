@@ -70,6 +70,17 @@ EXTRA = {
     # the last occurrence; build_command asserts the parsed result rather than
     # trusting that.
     "mix8wide": "--read-mix 8 --post-norm --Mc 128 --dv 512",
+    # Same dv, a quarter of the modes: a dose-response on M alone against
+    # mix8wide. M is nearly free in parameters and expensive in everything else
+    # -- 16x fewer modes costs 5.4% of the mixer, while the state falls 68% and
+    # the throughput loss goes from -14.6% to -2.0% -- which is the profile of
+    # redundancy rather than capacity. mixanch's learned grid says the same from
+    # the other side: six layers of eight drive n_eff UP (68 -> 87-106) while
+    # collapsing the log-span (8.13 -> 4.8-7.3), i.e. they oversample a narrow
+    # band instead of spanning distinct timescales. Only L5 and L7 do the
+    # opposite. At M=32 this arm carries LESS state than the dv256 it descends
+    # from, for 12.4% more parameters.
+    "mix8m32":  "--read-mix 8 --post-norm --Mc 32 --dv 512",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"
