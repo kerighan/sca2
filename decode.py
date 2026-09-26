@@ -58,7 +58,17 @@ def load(path: str, device: str):
     m = SCA2(V, cfg, cfg_d["variant"], device, cfg_d["layers"],
              tie_embed=cfg_d.get("tie_embed", False)).to(device)
     missing, unexpected = m.load_state_dict(ck["model"], strict=False)
-    real_missing = [k for k in missing if not k.startswith("layer.")]
+    # `layer.*` is the single-layer back-compat alias of `layers.0.*`.
+    #
+    # lam_anchor_mask/raw are registered unconditionally but only read when
+    # cfg.lam_anchor > 0, and both are rebuilt exactly from the seeded init
+    # rather than learned -- so a checkpoint written before the flag existed is
+    # complete, and reconstructing them is identity, not a guess. With anchors
+    # ON they carry which modes are pinned, and missing is then a real error.
+    inert = () if cfg.lam_anchor else ("lam_anchor_mask", "lam_anchor_raw")
+    real_missing = [k for k in missing
+                    if not k.startswith("layer.")
+                    and not k.rsplit(".", 1)[-1] in inert]
     if real_missing:
         raise SystemExit(f"{path}: missing weights {real_missing[:6]}")
     m.eval()
