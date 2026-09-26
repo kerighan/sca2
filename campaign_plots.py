@@ -29,11 +29,11 @@ LOG = ROOT / "runs" / "zyda.jsonl"
 OUT = ROOT / "plot"          # where every figure in this repo has always gone
 
 # arm -> slot it ran on, so elapsed seconds can be put on one clock
-SLOT = {"z_dv256": 0, "z_gdn": 2, "z_mixanch": 3,
+SLOT = {"z_dv256": 0, "z_mix8wide": 0, "z_gdn": 2, "z_mixanch": 3,
         "z_mix4": 1, "z_mixsal": 1, "z_mix8": 1, "z_dv384": 1, "z_dsoft": 1}
-COL = {"z_gdn": "k", "z_dv256": "tab:purple", "z_mix4": "tab:orange",
+COL = {"z_gdn": "k", "z_dv256": "tab:purple", "z_mix4": "tab:orange", "z_mix8wide": "tab:brown",
        "z_mix8": "tab:blue", "z_mixanch": "tab:green", "z_mixsal": "tab:red"}
-R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mixanch": 4, "z_mixsal": 4, "z_dv256": 1}
+R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mix8wide": 8, "z_mixanch": 4, "z_mixsal": 4, "z_dv256": 1}
 
 
 def host_factors() -> dict[str, float]:
@@ -63,8 +63,12 @@ def fig_zoom(h, fac, arms, ref="z_mix4", hours=8.0, name="zyda_zoom.png"):
                                  gridspec_kw={"height_ratios": [2, 1]})
     # the step-1 eval is the untrained model: it compresses the y axis by two
     # nats and says nothing about any arm
+    # reshape(-1, 2): an arm whose only eval is the untrained step-1 one filters
+    # down to an EMPTY list, and np.array([]) is 1-D, so the column index below
+    # raises instead of drawing nothing.
     xy = {m: np.array([(r["train_s"] * fac[m] / 3600, r["val"])
-                       for r in h[m] if r["train_s"] > 300]) for m in arms}
+                       for r in h[m] if r["train_s"] > 300],
+                      dtype=float).reshape(-1, 2) for m in arms}
     rf = xy[ref]
     for m in arms:
         a = xy[m][xy[m][:, 0] <= hours]
@@ -92,7 +96,7 @@ def fig_zoom(h, fac, arms, ref="z_mix4", hours=8.0, name="zyda_zoom.png"):
     print(f"saved {OUT.name}/{name}")
 
 
-def fig_router(h, arms=("z_mix4", "z_mix8", "z_mixanch")):
+def fig_router(h, arms=("z_mix4", "z_mix8", "z_mix8wide", "z_mixanch")):
     """Effective kernels exp(aH): does a router given 8 keep more than one given 4?
 
     Plotted against tokens, not hours: the routers are compared at equal data
@@ -165,7 +169,7 @@ def fig_omega(h, m="z_mixanch"):
 def main() -> None:
     h, fac = load(), host_factors()
     print("arms: " + ", ".join(f"{m[2:]}({len(h[m])})" for m in h))
-    fig_zoom(h, fac, ["z_gdn", "z_mix4", "z_mix8", "z_mixanch", "z_mixsal", "z_dv256"],
+    fig_zoom(h, fac, ["z_gdn", "z_mix4", "z_mix8", "z_mix8wide", "z_mixanch", "z_mixsal", "z_dv256"],
              hours=8.0)
     fig_router(h)
     fig_omega(h)
