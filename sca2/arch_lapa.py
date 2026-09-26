@@ -45,6 +45,8 @@ def config_from(cfg) -> LaplaceConfig:
         decay_input=cfg.decay_input,
         decay_softplus=cfg.decay_softplus,
         read_mix=cfg.read_mix,
+        lam_anchor=cfg.lam_anchor,
+        learn_omega=cfg.learn_omega,
         post_norm=cfg.post_norm,
         layer_scale=cfg.layer_scale,
         ls_mix_init=cfg.ls_mix_init,

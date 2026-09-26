@@ -40,6 +40,11 @@ EXTRA = {
     "postnorm": "--post-norm",                      # RMSNorm on the mixer output
     "mix4":     "--read-mix 4 --post-norm",         # mixture of Laplace kernels
     "mix4only": "--read-mix 4",
+    # mix4 plus the two things the trained checkpoints say are missing: the
+    # decays collapse from a 5000x span of timescales to 12-52x on half the
+    # layers, and the frequency grid they would otherwise have to compensate
+    # for is a frozen buffer.
+    "mixanch":  "--read-mix 4 --post-norm --lam-anchor 0.5 --learn-omega",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"

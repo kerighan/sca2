@@ -325,6 +325,11 @@ class LayerCfg:
     gdn_gate_scope: str = 'long'  # long | both | concat | mix: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
+    lam_anchor: float = 0.0      # fraction of decays pinned at their geometric init (no
+    #   gradient). Trained checkpoints collapse from a 5000x span of timescales to 12-52x on
+    #   half the layers, which is why 32 mixture kernels span a rank of only 4.12.
+    learn_omega: bool = False    # the rope grid becomes a parameter; the Triton kernel already
+    #   computes its gradient and was discarding it.
     read_mix: int = 1            # R read weights combined per token by softmax(A z): the
     #   kernel becomes sum_r alpha_r(z_t) kappa_r(t,s), same state, same write, same modes.
     #   See chead_numpy.py and LongHead.w_eff.

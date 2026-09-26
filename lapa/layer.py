@@ -161,6 +161,20 @@ class LaplaceConfig:
     ls_mix_init: float = 1.0   # init value for gs_mix. Two trained checkpoints (lsfree, g2)
     #   converge to a median of ~0.26; starting at 0.25 saves 2h of convergence.
     ls_ff_init: float = 1.0    # init value for gs_ff. Converges to ~0.6 in both runs.
+    lam_anchor: float = 0.0    # fraction of modes whose decay is PINNED at its
+    # geometric init and receives no gradient. Trained checkpoints show the
+    # timescales collapsing: initialised log-uniform over [4, 20000] tokens, a
+    # span of 5000x, layers 0, 1, 2 and 6 end with a span of 12x to 52x and a
+    # median memory of 7 to 14 tokens. Half the stack forgets everything past a
+    # handful of tokens, which leaves ~200 modes redundant with each other and
+    # is why 32 mixture kernels span an effective rank of only 4.12. Anchoring
+    # guarantees the coverage the initialisation intended, at zero parameters
+    # and zero compute -- it is a gradient mask.
+    learn_omega: bool = False  # make the rope frequency grid a parameter. It is
+    # a buffer today, so when the decays collapse the only remaining source of
+    # temporal diversity is a grid nobody optimises. The Triton kernel already
+    # computes omega's gradient and returns it (grad[2] in _Codes.backward); it
+    # was simply being discarded.
     read_mix: int = 1          # R read weight vectors instead of one, combined per
     # token by alpha(z) = softmax(A z). The read is LINEAR in w, so this equals
     # reading once with w_eff(z_t) = sum_r alpha_r(z_t) w^(r): the kernel becomes
@@ -425,6 +439,8 @@ def _damp_params(cfg: "LaplaceConfig"):
 
 
 class LongHead(nn.Module):
+    _has_anchor = False          # class default: the other lam branches never anchor
+
     def __init__(self, cfg: LaplaceConfig):
         super().__init__()
         if cfg.beta_write and cfg.beta_groups != 1:
@@ -488,8 +504,12 @@ class LongHead(nn.Module):
             nn.init.zeros_(self.alpha_proj.weight)
         self.wr = nn.Parameter(wr_init)  # spectral read weights, w = wr + i wi
         self.wi = nn.Parameter(wi_init)
-        self.register_buffer("omega", rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
-                                                cfg.rope_min_period))
+        _om = rope_grid(M, cfg.rope_base, cfg.slow_frac, cfg.max_len,
+                        cfg.rope_min_period)
+        if cfg.learn_omega:
+            self.omega = nn.Parameter(_om)
+        else:
+            self.register_buffer("omega", _om)
         if cfg.decay_input:
             self.lam_proj = nn.Linear(d, M, False)
             nn.init.zeros_(self.lam_proj.weight)   # at init: identical to learn_persist
@@ -510,6 +530,16 @@ class LongHead(nn.Module):
                 f"lam_ceil*chunk = {self.lam_ceil*cfg.chunk:.1f} overflows fp32 in e^(lam*chunk)"
             self.lam_raw = nn.Parameter(torch.log(1.0 / mem))     # exp^{-1}
             self.register_buffer("lam_mask", torch.ones(M))
+            # Anchors are spread over the SORTED memories, so the pinned set
+            # covers the whole range rather than a random clump of it.
+            n_anch = int(round(max(0.0, min(1.0, cfg.lam_anchor)) * M))
+            am = torch.zeros(M, dtype=torch.bool)
+            if n_anch:
+                order = mem.argsort()
+                am[order[torch.linspace(0, M - 1, n_anch).round().long()]] = True
+            self.register_buffer("lam_anchor_mask", am)
+            self.register_buffer("lam_anchor_raw", torch.log(1.0 / mem))
+            self._has_anchor = bool(n_anch)
         elif cfg.learn_persist:
             # lambda_m = lam_max * sigmoid(a_m): reaches ~0 (a=-8 -> memory > 20k tokens) or the
             # cap within a few hundred steps either way; nothing pinned, the task decides the split.
@@ -517,6 +547,7 @@ class LongHead(nn.Module):
             a[low] = -8.0
             self.lam_raw = nn.Parameter(a)
             self.register_buffer("lam_mask", torch.ones(M))
+            self._has_anchor = False
         else:
             self.lam_raw = nn.Parameter(
                 torch.log(torch.expm1(1.0 / mem))
@@ -551,6 +582,15 @@ class LongHead(nn.Module):
     # decay_softplus run is identical to a static-decay run at step 0.
     _SP_B0 = math.log(math.e - 1.0)
 
+    def _lam_raw(self):
+        """lam_raw with the anchored modes held at their initial value."""
+        # The branch is on a PYTHON bool decided at __init__, never on a tensor.
+        # `bool(mask.any())` here is data-dependent control flow and torch.compile
+        # cannot trace it: it broke 3 of test_triton_state's 9 cases.
+        if not self._has_anchor:
+            return self.lam_raw
+        return torch.where(self.lam_anchor_mask, self.lam_anchor_raw, self.lam_raw)
+
     def lam_t(self, lz):
         """(...,M) per-token decay from the ALREADY-PROJECTED lam_proj(z)."""
         if self.cfg.lam_free:
@@ -565,10 +605,10 @@ class LongHead(nn.Module):
                 # are exactly the ones an input-dependent forget gate is for.
                 # softplus grows linearly, so the clamp is reached far later and
                 # the gradient survives up to it.
-                return (torch.exp(self.lam_raw.to(self.wd))
+                return (torch.exp(self._lam_raw().to(self.wd))
                         * F.softplus(lz.to(self.wd) + self._SP_B0)).clamp(max=self.lam_ceil)
-            return torch.exp(self.lam_raw.to(self.wd) + lz.to(self.wd)).clamp(max=self.lam_ceil)
-        return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd) + lz.to(self.wd))
+            return torch.exp(self._lam_raw().to(self.wd) + lz.to(self.wd)).clamp(max=self.lam_ceil)
+        return self.lam_max * torch.sigmoid(self._lam_raw().to(self.wd) + lz.to(self.wd))
 
     def w_eff(self, z):
         """(wr, wi) for this token: a point in the span of the R learned weights.
@@ -592,11 +632,11 @@ class LongHead(nn.Module):
 
     def lam(self) -> torch.Tensor:
         if self.cfg.lam_free:
-            return torch.exp(self.lam_raw.to(self.wd)).clamp(max=self.lam_ceil)
+            return torch.exp(self._lam_raw().to(self.wd)).clamp(max=self.lam_ceil)
         if self.cfg.learn_persist:
-            return self.lam_max * torch.sigmoid(self.lam_raw.to(self.wd))
+            return self.lam_max * torch.sigmoid(self._lam_raw().to(self.wd))
         return (
-            F.softplus(self.lam_raw.to(self.wd)).clamp(max=self.lam_max)
+            F.softplus(self._lam_raw().to(self.wd)).clamp(max=self.lam_max)
             * self.lam_mask
         )
 

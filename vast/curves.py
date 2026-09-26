@@ -71,6 +71,12 @@ def main() -> None:
     p.add_argument("--ref", default=None, help="baseline arm; default the one named *gdn*")
     p.add_argument("--map", default="", help="arm=slot,arm=slot when arms ran on "
                                              "different hosts")
+    p.add_argument("--only", default="",
+                   help="comma list of arms for the TABLE. The comparable "
+                        "horizon is the shortest arm's, so one stopped early "
+                        "truncates every column -- dv384 and dsoft, stopped at "
+                        "3 h, capped a 26 h campaign at 3 h. The plot still "
+                        "draws everything.")
     p.add_argument("--plot", default=None)
     a = p.parse_args()
 
@@ -85,6 +91,12 @@ def main() -> None:
         arm_host.setdefault(arm, 0)
     factors = host_factors(arm_host)
 
+    keep = [x for x in a.only.split(",") if x]
+    table = {k: v for k, v in series.items() if not keep or k in keep}
+    if keep:
+        missing = [k for k in keep if k not in series]
+        if missing:
+            raise SystemExit(f"no such arm: {missing}; have {sorted(series)}")
     ref = a.ref or next((k for k in series if "gdn" in k), sorted(series)[0])
     if ref not in series:
         raise SystemExit(f"reference {ref!r} not among {sorted(series)}")
@@ -95,18 +107,18 @@ def main() -> None:
               f"{factors[arm]:7.4f}")
 
     # Comparable horizon: the largest normalised time every arm reached.
-    horizon = min(s[-1][0] * factors[k] for k, s in series.items())
+    horizon = min(s[-1][0] * factors[k] for k, s in table.items())
     grid = [horizon * f for f in (0.25, 0.5, 0.75, 1.0)]
     print(f"\nval at equal host-normalised training time (to {horizon/3600:.1f} h):")
     head = " ".join(f"{g/3600:>10.1f}h" for g in grid)
     print(f"{'arm':>18} {head}")
-    for arm, s in sorted(series.items()):
+    for arm, s in sorted(table.items()):
         row = [at(s, g / factors[arm]) for g in grid]
         print(f"{arm:>18} " + " ".join(
             f"{v:11.4f}" if v is not None else f"{'—':>11}" for v in row))
 
     print(f"\ngap to {ref}:")
-    for arm, s in sorted(series.items()):
+    for arm, s in sorted(table.items()):
         if arm == ref:
             continue
         d = [at(s, g / factors[arm]) - at(series[ref], g / factors[ref])

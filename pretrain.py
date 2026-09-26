@@ -353,6 +353,11 @@ def main(argv=None):
                    help="RMSNorm on the mixer output before the residual: the inputs "
                         "of mix are normalised and its output is not, and trained "
                         "checkpoints show gs_mix damping it to 0.048")
+    p.add_argument("--lam-anchor", type=float, default=0.0, dest="lam_anchor",
+                   help="fraction of decays pinned at their geometric init: the "
+                        "trained timescales collapse from a 5000x span to 12-52x")
+    p.add_argument("--learn-omega", action="store_true", dest="learn_omega",
+                   help="make the rope frequency grid learnable")
     p.add_argument("--read-mix", type=int, default=1, dest="read_mix",
                    help="R read weight vectors mixed per token (mixture of Laplace "
                         "kernels): same state, same write, kernel shape becomes "
@@ -453,7 +458,7 @@ def main(argv=None):
                    persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    short_groups=a.short_groups, long_groups=a.long_groups,
-                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus, read_mix=a.read_mix, post_norm=a.post_norm,
+                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus, read_mix=a.read_mix, lam_anchor=a.lam_anchor, learn_omega=a.learn_omega, post_norm=a.post_norm,
                    beta_write=a.beta_write,
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,
