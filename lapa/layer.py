@@ -508,6 +508,7 @@ class LongHead(nn.Module):
                         cfg.rope_min_period)
         if cfg.learn_omega:
             self.omega = nn.Parameter(_om)
+            self.register_buffer("_omega_init", _om.clone())
         else:
             self.register_buffer("omega", _om)
         if cfg.decay_input:
@@ -609,6 +610,33 @@ class LongHead(nn.Module):
                         * F.softplus(lz.to(self.wd) + self._SP_B0)).clamp(max=self.lam_ceil)
             return torch.exp(self._lam_raw().to(self.wd) + lz.to(self.wd)).clamp(max=self.lam_ceil)
         return self.lam_max * torch.sigmoid(self._lam_raw().to(self.wd) + lz.to(self.wd))
+
+    def omega_stats(self):
+        """(drift, log-span, effective count) of the frequency grid, or None.
+
+        Logged with every eval when --learn-omega is on, because the CHECKPOINT
+        only ever holds the endpoint and what teaches us how to initialise is
+        the trajectory: whether the frequencies spread, collapse, or converge on
+        a few values the grid should have started at.
+
+        drift      rms |omega - omega_init| / rms omega_init
+        log-span   ln(p95 / p5) of |omega|, the range of periods actually kept
+        n_eff      exp(entropy of |omega| / sum |omega|): how many frequencies
+                   carry weight, against M if the grid stayed spread
+        """
+        if not isinstance(self.omega, nn.Parameter):
+            return None
+        with torch.no_grad():
+            om = self.omega.float()
+            a = om.abs()
+            init = self._omega_init
+            drift = ((om - init).pow(2).mean().sqrt()
+                     / init.pow(2).mean().sqrt().clamp(min=1e-9))
+            q = torch.quantile(a, torch.tensor([0.05, 0.95], device=a.device))
+            span = torch.log(q[1].clamp(min=1e-9) / q[0].clamp(min=1e-9))
+            pr = a / a.sum().clamp(min=1e-9)
+            neff = torch.exp(-(pr * (pr + 1e-12).log()).sum())
+        return [round(drift.item(), 4), round(span.item(), 3), round(neff.item(), 1)]
 
     def w_eff(self, z):
         """(wr, wi) for this token: a point in the span of the R learned weights.

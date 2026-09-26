@@ -233,6 +233,14 @@ def run(name, m, tr, va, a, device, log, V=None):
                    if hasattr(m_, "alpha_entropy")]
             if ent:
                 rec["alpha_H"] = [round(e, 4) for e in ent]
+            # --learn-omega: [drift, log-span, n_eff] per layer. The endpoint is
+            # in the checkpoint; this is the trajectory, which is what would
+            # tell us how the grid should have been initialised.
+            om = [m_.omega_stats() for m_ in m.modules()
+                  if hasattr(m_, "omega_stats")]
+            om = [o for o in om if o is not None]
+            if om:
+                rec["omega"] = om
             if prof:
                 rec["pos"] = [round(v, 5) for v in prof]
             if cls:
