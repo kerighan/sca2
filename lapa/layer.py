@@ -161,6 +161,14 @@ class LaplaceConfig:
     ls_mix_init: float = 1.0   # init value for gs_mix. Two trained checkpoints (lsfree, g2)
     #   converge to a median of ~0.26; starting at 0.25 saves 2h of convergence.
     ls_ff_init: float = 1.0    # init value for gs_ff. Converges to ~0.6 in both runs.
+    beta_softplus: bool = False  # with beta_write: the WRITE weight becomes
+    # softplus(wproj(z) + b0), unbounded, instead of reusing the sigmoid erase
+    # gate. sigmoid can only ATTENUATE a write -- a salient token cannot weigh
+    # more than a dull one, only less -- where seqcond (nautile-370m) weights
+    # each token by softplus(score(x)) and lets one dominate. The ERASE gate
+    # stays sigmoid: `e = v - beta*vhat` is a convex combination and an
+    # unbounded beta there is unstable. b0 = log(e-1) makes softplus(b0) exactly
+    # 1, so step 0 is identical to the ungated layer.
     lam_anchor: float = 0.0    # fraction of modes whose decay is PINNED at its
     # geometric init and receives no gradient. Trained checkpoints show the
     # timescales collapsing: initialised log-uniform over [4, 20000] tokens, a
@@ -516,6 +524,10 @@ class LongHead(nn.Module):
             nn.init.zeros_(self.lam_proj.weight)   # at init: identical to learn_persist
         self.bg = max(1, cfg.beta_groups)
         self.bproj = nn.Linear(d, self.bg, True)  # erase gate beta = sigmoid(bproj(z))
+        if cfg.beta_softplus:
+            self.wproj = nn.Linear(d, 1, True)    # write weight, softplus, unbounded
+            nn.init.zeros_(self.wproj.weight)
+            nn.init.constant_(self.wproj.bias, math.log(math.e - 1.0))
         nn.init.zeros_(self.bproj.weight)
         nn.init.constant_(self.bproj.bias, cfg.beta_init)
         lo, hi, self.lam_max = _damp_params(cfg)
@@ -689,6 +701,12 @@ class LongHead(nn.Module):
         b = torch.sigmoid(bz.to(self.wd))
         return b if self.bg == 1 else b[..., self.bgroup]
 
+    def _wgate(self, z, beta):
+        """How much of the new value to write. Unbounded when beta_softplus."""
+        if not self.cfg.beta_softplus:
+            return beta
+        return F.softplus(self.wproj(z).to(self.wd))
+
     def _out(self, u, z, gate=None):
         """(..., 2*dvi) -> (..., 2*dv)."""
         dv, dvi = self.dv, self.dvi
@@ -715,7 +733,7 @@ class LongHead(nn.Module):
         return torch.exp(-lam * n)[:, None].repeat(2, 1)
 
     # ---- prefill: one chunk against an incoming state ---------------------- #
-    def _chunk(self, kz, kh, vz, bz, lz, mw, st: State):
+    def _chunk(self, kz, kh, vz, bz, lz, mw, wz, st: State):
         B, T, _ = kz.shape
         M = self.M
         dev = kz.device
@@ -761,7 +779,7 @@ class LongHead(nn.Module):
             r = (Qk @ s0).to(self.wd) / M
             v = vz.to(self.wd)
             if self.cfg.beta_write:
-                v = beta * v
+                v = (F.softplus(wz.to(self.wd)) if wz is not None else beta) * v
             e = torch.linalg.solve_triangular(
                 A, v - (r if self.bg > 1 else beta * r),
                 upper=False, unitriangular=True
@@ -788,7 +806,7 @@ class LongHead(nn.Module):
         return o, {"s": sn, "pos": st["pos"] + T}
 
     # ---- prefill: all full chunks batched, state loop only ----------------- #
-    def _batched(self, kz, kh, vz, bz, lz, mw, st: State, K: int):
+    def _batched(self, kz, kh, vz, bz, lz, mw, wz, st: State, K: int):
         B, T, _ = kz.shape
         M, dv, C = self.M, self.dvi, self.cfg.chunk
         dev = kz.device
@@ -817,7 +835,7 @@ class LongHead(nn.Module):
             if self.cfg.beta_write:
                 # All backends consume gated values. Autograd adds the write
                 # contribution to d beta alongside the existing erase/solve terms.
-                v = beta * v
+                v = (F.softplus(ch(wz).to(self.wd)) if wz is not None else beta) * v
             # `di` no longer disqualifies the kernel: it takes the per-token
             # ramp as Ct. Leaving it out cost the whole code path, not just the
             # ramp -- decay_input reverted to PyTorch and ran at 0.79x.
@@ -973,6 +991,7 @@ class LongHead(nn.Module):
         # Per-token read weights, threaded exactly like lz: one (.., R) x (R, M)
         # product for the whole sequence, then sliced per chunk.
         mw = self.w_eff(z) if self.R > 1 else None
+        wz = self.wproj(z) if self.cfg.beta_softplus else None
         kh = torch.cat([self.K(z_prev)[:, None], kz[:, :-1]], 1)
         if self.dk:
             # the stored key is Kv(h_s) = Kv of the PREVIOUS token; Kv is linear, so the
@@ -983,7 +1002,8 @@ class LongHead(nn.Module):
         K = T // C
         cut = lambda a, b: (kz[:, a:b], kh[:, a:b], vz[:, a:b], bz[:, a:b],
                             lz[:, a:b] if lz is not None else None,
-                            None if mw is None else (mw[0][:, a:b], mw[1][:, a:b]))
+                            None if mw is None else (mw[0][:, a:b], mw[1][:, a:b]),
+                            wz[:, a:b] if wz is not None else None)
         if K >= 2 and self.cfg.long_path in ("batched", "triton", "triton_fused",
                                             "triton_codes", "triton_scan"):
             o, st = self._batched(*cut(0, K * C), st, K)
@@ -1065,7 +1085,7 @@ class LongHead(nn.Module):
             vhat = torch.einsum("bm,bmj->bj", ktb, s0) / M
             v = vz.to(self.wd)
             if self.cfg.beta_write:
-                v = beta * v
+                v = self._wgate(z_t, beta) * v
             e = v - (vhat if self.bg > 1 else beta * vhat)
             s = torch.addcmul(s0, e[:, None, :], kt[:, :, None])
             cq, sq = pq.cos(), pq.sin()

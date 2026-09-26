@@ -325,6 +325,9 @@ class LayerCfg:
     gdn_gate_scope: str = 'long'  # long | both | concat | mix: LayerNorm * silu(Linear(x)), per channel
     decay_input: bool = False    # data-dependent forgetting on the lapa path: lam becomes a
     #   function of the token instead of a constant per mode. See lapa.layer.
+    beta_softplus: bool = False  # with beta_write: the write weight is softplus(wproj(z)+b0),
+    #   unbounded, instead of reusing the sigmoid erase gate. A salient token can then weigh MORE
+    #   than a dull one, which sigmoid forbids. seqcond/nautile does this with softplus(score(x)).
     lam_anchor: float = 0.0      # fraction of decays pinned at their geometric init (no
     #   gradient). Trained checkpoints collapse from a 5000x span of timescales to 12-52x on
     #   half the layers, which is why 32 mixture kernels span a rank of only 4.12.

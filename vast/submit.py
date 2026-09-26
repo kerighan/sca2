@@ -45,6 +45,9 @@ EXTRA = {
     # layers, and the frequency grid they would otherwise have to compensate
     # for is a frozen buffer.
     "mixanch":  "--read-mix 4 --post-norm --lam-anchor 0.5 --learn-omega",
+    # mix4 plus an unbounded per-token write weight, the seqcond/nautile idea:
+    # sigmoid can only attenuate a write, softplus lets a salient token dominate.
+    "mixsal":   "--read-mix 4 --post-norm --beta-write --beta-softplus",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"
