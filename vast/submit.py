@@ -48,6 +48,12 @@ EXTRA = {
     # mix4 plus an unbounded per-token write weight, the seqcond/nautile idea:
     # sigmoid can only attenuate a write, softplus lets a salient token dominate.
     "mixsal":   "--read-mix 4 --post-norm --beta-write --beta-softplus",
+    # Dose-response on R alone, post-norm held constant, so unlike mix4-vs-dv256
+    # this pair has no confound. mix4's router at 9.8B uses 3.44 and 3.45 of its
+    # 4 kernels on layers 5 and 6 and is STILL spreading, while layer 0 has
+    # settled at 2.27 -- the ceiling binds where the depth needs it and not
+    # elsewhere. Costs +49,152 params (+0.041%) and <=1% throughput, measured.
+    "mix8":     "--read-mix 8 --post-norm",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"
