@@ -54,6 +54,22 @@ EXTRA = {
     # settled at 2.27 -- the ceiling binds where the depth needs it and not
     # elsewhere. Costs +49,152 params (+0.041%) and <=1% throughput, measured.
     "mix8":     "--read-mix 8 --post-norm",
+    # Reallocation at constant long state: 2*M*dv is 2*128*512 = 2*256*256, so
+    # the recurrent state the decoder carries is unchanged and only the split
+    # between spectral modes and value width moves. Measured against mix8:
+    # +13.1% params, +16% state (the short head's (B,127,dv) buffer follows dv
+    # whatever M does), -7.7% throughput -- against +82% and -14.7% for dv512
+    # at M=256, for the same parameter count.
+    #
+    # The two things we have measured disagree about whether M=128 is enough:
+    # the read's effective rank is ~4, which says 256 modes are mostly wasted,
+    # but 165-217 of them still carry weight. This arm decides it. Its control
+    # is mix8 -- same R, same post-norm, only (Mc, dv) differs.
+    #
+    # The Mc/dv here come AFTER ARMS['dv256'] in the command, and argparse takes
+    # the last occurrence; build_command asserts the parsed result rather than
+    # trusting that.
+    "mix8wide": "--read-mix 8 --post-norm --Mc 128 --dv 512",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"
@@ -82,12 +98,39 @@ def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
         return f"python -u pretrain.py --label z_gdn --seed 0 {common} {GDN_FLAGS} --ff 4096"
     if arm in EXTRA:
         return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
-                f"{LAPA_FLAGS} {ARMS['dv256']} {EXTRA[arm]}")
+                f"{LAPA_FLAGS} {_without(ARMS['dv256'], EXTRA[arm])} {EXTRA[arm]}")
     if arm not in ARMS:
         raise SystemExit(f"unknown arm {arm!r}; known: "
                          f"{', '.join(list(ARMS) + list(EXTRA))} , gdn")
     return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
             f"{LAPA_FLAGS} {ARMS[arm]}")
+
+
+def _without(base: str, extra: str) -> str:
+    """Drop from `base` every valued flag `extra` sets, so it appears once.
+
+    An EXTRA arm is ARMS['dv256'] plus its own flags, so an arm that moves --Mc
+    or --dv would otherwise state it twice and rely on argparse keeping the LAST
+    occurrence. It does -- but "it happens to work" is exactly how --save-every
+    ended up inert for a 40 h run. One occurrence cannot be won by the wrong
+    one, and a reader of the logged command sees the value that ran.
+    """
+    over = {w for w in extra.split() if w.startswith("--")}
+    out, toks = [], base.split()
+    i = 0
+    while i < len(toks):
+        w = toks[i]
+        has_value = i + 1 < len(toks) and not toks[i + 1].startswith("--")
+        if w in over:
+            i += 2 if has_value else 1
+            continue
+        out.append(w)
+        if has_value:
+            out.append(toks[i + 1])
+            i += 2
+        else:
+            i += 1
+    return " ".join(out)
 
 
 def unknown_flags(command: str, src: str | None = None) -> list[str]:
