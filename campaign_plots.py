@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent
 LOG = ROOT / "runs" / "zyda.jsonl"
-OUT = ROOT / "runs"
+OUT = ROOT / "plot"          # where every figure in this repo has always gone
 
 # arm -> slot it ran on, so elapsed seconds can be put on one clock
 SLOT = {"z_dv256": 0, "z_gdn": 2, "z_mixanch": 3,
@@ -89,7 +89,7 @@ def fig_zoom(h, fac, arms, ref="z_mix4", hours=8.0, name="zyda_zoom.png"):
         ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(OUT / name, dpi=110)
-    print(f"saved runs/{name}")
+    print(f"saved {OUT.name}/{name}")
 
 
 def fig_router(h, arms=("z_mix4", "z_mix8", "z_mixanch")):
@@ -119,7 +119,7 @@ def fig_router(h, arms=("z_mix4", "z_mix8", "z_mixanch")):
     for ax in (a1, a2):
         ax.grid(alpha=.3); ax.legend(fontsize=9)
     fig.tight_layout(); fig.savefig(OUT / "zyda_router.png", dpi=110)
-    print("saved runs/zyda_router.png")
+    print(f"saved {OUT.name}/zyda_router.png")
 
 
 def fig_omega(h, m="z_mixanch"):
@@ -153,7 +153,7 @@ def fig_omega(h, m="z_mixanch"):
     ax[0].legend(fontsize=7, ncol=3)
     fig.suptitle(f"{m[2:]} — ce que la grille de frequences apprise reclame, couche par couche")
     fig.tight_layout(); fig.savefig(OUT / "zyda_omega.png", dpi=110)
-    print("saved runs/zyda_omega.png")
+    print(f"saved {OUT.name}/zyda_omega.png")
 
     o = O[-1]
     print(f"\n{m[2:]} a {t[-1]:.2f}B, par couche")
