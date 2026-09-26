@@ -84,16 +84,18 @@ def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
             f"{LAPA_FLAGS} {ARMS[arm]}")
 
 
-def unknown_flags(command: str) -> list[str]:
+def unknown_flags(command: str, src: str | None = None) -> list[str]:
     """Flags in `command` that pretrain.py does not declare.
 
-    Twice now an arm has been launched with a flag that existed in the config
-    dataclass and not in the CLI -- once for --tie-embed's siblings, once for
-    --post-norm -- and each time the job died seconds after being detached,
-    which reads exactly like a flaky host. argparse is the authority, so ask it
-    rather than the config.
+    `src` is the REMOTE pretrain.py when the caller can read it, and that is the
+    point: checking the local copy passed --beta-softplus on a host whose
+    pretrain.py predated the flag, and the arm died seconds after being
+    detached. The file that runs is the file to ask. argparse is the authority,
+    not the config dataclass -- flags have twice existed in one and not the
+    other.
     """
-    src = (ROOT / "pretrain.py").read_text()
+    if src is None:
+        src = (ROOT / "pretrain.py").read_text()
     declared = set(re.findall(r'add_argument\(\s*"(--[A-Za-z0-9-]+)"', src))
     used = {w for w in command.split() if w.startswith("--")}
     return sorted(used - declared)
@@ -120,11 +122,15 @@ def main() -> None:
         args.arm, args.hours, args.corpus, args.block, args.batch, args.log,
         args.bpe)
 
-    bad = unknown_flags(command)
-    if bad:
-        raise SystemExit("pretrain.py does not declare: " + ", ".join(bad))
-
     info = live(args.slot)
+    # Read the pretrain.py that will actually run, not the one on this machine.
+    remote_src = run_remote(info, f"cat {REMOTE}/pretrain.py", timeout=120,
+                            check=False).stdout
+    bad = unknown_flags(command, remote_src or None)
+    if bad:
+        raise SystemExit(
+            f"the pretrain.py ON SLOT {args.slot} does not declare: "
+            + ", ".join(bad) + "\n(ship the code first: it is probably stale)")
     if args.arm:
         # Every input the command names must exist BEFORE the job is detached:
         # once it is, a missing file shows up only as an empty log, and the
