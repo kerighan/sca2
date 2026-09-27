@@ -66,7 +66,7 @@ def vast(*args: str) -> object:
 REF_RATE = 139362.0              # instance 52437648, the original slot 0
 HOST_RATE = {
     52437648: 139362.0,          # dv256, mix8wide, dirichlet, dirichletg  (destroyed)
-    52437820: 138643.0,          # mix4, mixsal, mix8, dv384, dsoft
+    52437820: 138643.0,          # mix4, mixsal, mix8, dv384, dsoft, gdnsmall
     52441798: 139957.0,          # gdn, mix8m32, lambdaonly
     52717411: 131610.0,          # mixanch, dirichlet4                     (destroyed)
 }
@@ -74,6 +74,7 @@ ARM_HOST = {
     "z_dv256": 52437648, "z_mix8wide": 52437648,
     "z_dirichlet": 52437648, "z_dirichletg": 52437648,
     "z_mix4": 52437820, "z_mixsal": 52437820, "z_mix8": 52437820,
+    "z_gdnsmall": 52437820,
     "z_dv384": 52437820, "z_dsoft": 52437820,
     "z_gdn": 52441798, "z_mix8m32": 52441798, "z_lambdaonly": 52441798,
     "z_mixanch": 52717411, "z_dirichlet4": 52717411,
@@ -81,8 +82,19 @@ ARM_HOST = {
 
 
 def arm_factors(arms) -> dict[str, float]:
-    """arm -> multiply its elapsed seconds by this to get reference-host seconds."""
-    return {a: HOST_RATE[ARM_HOST[a]] / REF_RATE if a in ARM_HOST else 1.0 for a in arms}
+    """arm -> multiply its elapsed seconds by this to get reference-host seconds.
+
+    An arm missing from ARM_HOST is a bug, not a default: it silently gets 1.0
+    while the arm it is being compared against gets its real factor, which tilts
+    the very comparison the normalisation exists to protect. gdnsmall shipped
+    that way for two hours.
+    """
+    out = {}
+    for a in arms:
+        if a not in ARM_HOST:
+            raise KeyError(f"{a} has no recorded host; add it to ARM_HOST in vast/common.py")
+        out[a] = HOST_RATE[ARM_HOST[a]] / REF_RATE
+    return out
 
 
 def account() -> dict:
