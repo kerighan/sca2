@@ -131,6 +131,10 @@ class LaplaceConfig:
     rope_min_period: Optional[float] = None  # shortest period in the fast rope grid. None = 2
     #   (historical). Set to 2*L to start the long head where the short head's exact window ends
     #   instead of overlapping it -- see rope_grid(). Free: no parameters, no state.
+    short_heads: int = 1       # H TRUE heads on the short head: its own K and its own
+    #   theta each, so its own similarity geometry, reading dv/H value channels.
+    #   short_groups shares the phase and only splits the filter; this does not.
+    #   State goes H x on c and s.
     long_only: bool = False    # drop the SHORT head: only the decaying Laplace modes and the
     #   delta rule, no exact window. The other half of the same ablation as short_only.
     short_only: bool = False   # drop the LONG head entirely and keep only the short head's
@@ -1134,14 +1138,25 @@ class ShortHead(nn.Module):
         super().__init__()
         d, L, dv = cfg.d, cfg.L, cfg.dv
         self.d, self.L, self.dv, self.cfg = d, L, dv, cfg
-        self.K = nn.Linear(d, L, False)
-        self.V = nn.Linear(d, dv, False)
-        self.theta = nn.Parameter((cfg.theta_scale or 0.02) * torch.randn(L))
-        # (L,) when shared -- the shape sca2's mirror uses, so the float64 gate still loads --
-        # and (L, G) when grouped. w = 1: delta at lag 0 at init (o_t = V(z_t)).
+        # H TRUE heads: each gets its own key projection AND its own theta, so each
+        # gets its own notion of which tokens resemble which -- unlike short_groups,
+        # where G filters share one phase code. Head h reads dv/H value channels.
+        # State cost is H x on c and s, which is the point: it is the only axis that
+        # buys context capacity rather than filter richness.
+        self.H = max(1, cfg.short_heads)
         self.G = max(1, cfg.short_groups)
         assert dv % self.G == 0, f"dv={dv} must divide by short_groups={self.G}"
+        assert dv % self.H == 0, f"dv={dv} must divide by short_heads={self.H}"
+        assert self.H == 1 or self.G == 1, "short_heads and short_groups both split dv"
+        self.K = nn.Linear(d, self.H * L, False)
+        self.V = nn.Linear(d, dv, False)
+        th = (L,) if self.H == 1 else (self.H, L)
+        self.theta = nn.Parameter((cfg.theta_scale or 0.02) * torch.randn(th))
+        # (L,) when shared -- the shape sca2's mirror uses, so the float64 gate still loads --
+        # (L, G) when grouped, (H, L) with true heads. w = 1: delta at lag 0 at init.
         sh = (L,) if self.G == 1 else (L, self.G)
+        if self.H > 1:
+            sh = (self.H, L)
         self.wr = nn.Parameter(torch.ones(sh))
         self.wi = nn.Parameter(torch.zeros(sh))
         # built in float64: 2*pi/L rounded in float32 breaks the comb's exact cancellation
@@ -1176,22 +1191,44 @@ class ShortHead(nn.Module):
 
     def init_state(self, B: int, device) -> State:
         n, L, wd = self.L - 1, self.L, self.wd
+        ph = (B, n, L) if self.H == 1 else (B, n, self.H, L)
         return {
-            "c": torch.ones(B, n, L, device=device, dtype=wd),
-            "s": torch.zeros(B, n, L, device=device, dtype=wd),
+            "c": torch.ones(*ph, device=device, dtype=wd),
+            "s": torch.zeros(*ph, device=device, dtype=wd),
             "e": torch.zeros(B, n, self.dv, device=device, dtype=wd),
             "pos": torch.zeros((), device=device, dtype=torch.long),
         }
 
     def _phase(self, k, p):
-        """k (...,L) = K(x), already projected (see LongHead._phase for why)."""
+        """k (...,L) = K(x), already projected (see LongHead._phase for why).
+
+        With H heads k is (..., H*L) and the result is (..., H, L): omega is the
+        shared DFT grid 2.pi.l/L -- it defines the comb and cannot be per head --
+        while theta and the keys are the head's own.
+        """
+        k = k.to(self.wd)
+        if self.H > 1:
+            k = k.view(*k.shape[:-1], self.H, self.L)
+            return k * self.theta.to(self.wd) + (p % self.L).to(self.wd)[..., None, None] * self.omega
         return (
-            k.to(self.wd) * self.theta.to(self.wd)
+            k * self.theta.to(self.wd)
             + (p % self.L).to(self.wd)[..., None] * self.omega
         )
 
     def _read(self, cq, sq, cw, sw, e):
         """Re/Im kappa(t,s) over the window via two folded read vectors, then contract with e."""
+        if self.H > 1:
+            H, dv = self.H, self.dv
+            c1 = self.wr * cq + self.wi * sq                                        # (B,T,H,L)
+            c2 = self.wr * sq - self.wi * cq
+            k_re = (torch.einsum("btwhl,bthl->btwh", cw, c1)
+                    + torch.einsum("btwhl,bthl->btwh", sw, c2)) / self.L
+            k_im = (torch.einsum("btwhl,bthl->btwh", sw, c1)
+                    - torch.einsum("btwhl,bthl->btwh", cw, c2)) / self.L
+            eh = e.view(*e.shape[:-1], H, dv // H)                                  # (B,T,W,H,dv/H)
+            re = torch.einsum("btwh,btwhj->bthj", k_re, eh).reshape(*e.shape[:2], dv)
+            im = torch.einsum("btwh,btwhj->bthj", k_im, eh).reshape(*e.shape[:2], dv)
+            return torch.cat([re, im], -1)
         if self.G == 1:
             c1, c2 = self.wr * cq + self.wi * sq, self.wr * sq - self.wi * cq
             k_re = (torch.einsum("btwl,btl->btw", cw, c1)
@@ -1229,7 +1266,11 @@ class ShortHead(nn.Module):
             psi = self._phase(kz, p[None].expand(B, T))
             u = self._banded(psi.cos(), psi.sin(), cw, sw, e, T, gd)
         new = {"c": cw[:, -n:], "s": sw[:, -n:], "e": e[:, -n:], "pos": st["pos"] + T}
-        return _rms(u).to(z.dtype), new
+        # _out, not _rms: with gdn_gate_scope="both" the gate lives here, and it
+        # was never applied -- both return sites called _rms directly, so o_norm
+        # and gp were built, carried and trained as dead weight while the head ran
+        # ungated. Identical to _rms for every other scope.
+        return self._out(u, z).to(z.dtype), new
 
     def _banded(self, cq, sq, cw, sw, e, T, gd=None):
         """The window read as BANDED GEMMs, all chunks at once (no sequential dependency).
@@ -1254,18 +1295,40 @@ class ShortHead(nn.Module):
         K = -(-T // C)
         pad = K * C - T
         if pad:                                                   # ragged tail: pad queries and keys
-            cq, sq = F.pad(cq, (0, 0, 0, pad)), F.pad(sq, (0, 0, 0, pad))
-            cw, sw, e = F.pad(cw, (0, 0, 0, pad)), F.pad(sw, (0, 0, 0, pad)), F.pad(e, (0, 0, 0, pad))
+            # F.pad counts from the LAST dim, so the phase tensors -- which gain a
+            # head axis when H > 1 -- need one more pair of zeros to keep padding
+            # the TIME axis rather than H.
+            tp = (0, 0, 0, 0, 0, pad) if self.H > 1 else (0, 0, 0, pad)
+            cq, sq = F.pad(cq, tp), F.pad(sq, tp)
+            cw, sw = F.pad(cw, tp), F.pad(sw, tp)
+            e = F.pad(e, (0, 0, 0, pad))
         N = C + L - 1
-        Fk = torch.cat([cw, sw], -1).to(gd)                                         # (B,KC+L-1,2L)
-        Fk = Fk.unfold(1, N, C).movedim(-1, 2)                                      # (B,K,N,2L)
+        if self.H == 1:
+            Fk = torch.cat([cw, sw], -1).to(gd)                                     # (B,KC+L-1,2L)
+            Fk = Fk.unfold(1, N, C).movedim(-1, 2)                                  # (B,K,N,2L)
         ek = e.to(gd).unfold(1, N, C).movedim(-1, 2)                                # (B,K,N,dv)
         i = torch.arange(C, device=cq.device)[:, None]
         j = torch.arange(N, device=cq.device)[None]
         band = ((j - i) >= 0) & ((j - i) <= L - 1)                                  # (C,N)
         band2 = ~torch.cat([band, band], 0)      # True OUTSIDE the band: what gets zeroed
-        G, dv = self.G, self.dv
-        if G == 1:
+        G, dv, H = self.G, self.dv, self.H
+        if H > 1:
+            # Same algebra as the G branch, but the PHASE carries the head axis too,
+            # so Fk is per head instead of shared. dh = dv/H channels per head.
+            dh = dv // H
+            c1 = (self.wr * cq + self.wi * sq).to(gd)                               # (B,KC,H,L)
+            c2 = (self.wr * sq - self.wi * cq).to(gd)
+            f1 = torch.cat([c1, c2], -1).view(B, K, C, H, 2 * L)
+            f2 = torch.cat([-c2, c1], -1).view(B, K, C, H, 2 * L)
+            Fq = torch.cat([f1, f2], 2).permute(0, 1, 3, 2, 4)                      # (B,K,H,2C,2L)
+            Fkh = torch.cat([cw, sw], -1).to(gd)                                    # (B,M,H,2L)
+            Fkh = Fkh.unfold(1, N, C).movedim(-1, -2)                               # (B,K,H,N,2L)
+            S = (Fq @ Fkh.transpose(-1, -2) / L).masked_fill(
+                band2[None, None, None], 0)                                         # (B,K,H,2C,N)
+            ekh = ek.view(B, K, N, H, dh).permute(0, 1, 3, 2, 4)                    # (B,K,H,N,dh)
+            o = (S @ ekh).to(self.wd)                                               # (B,K,H,2C,dh)
+            o = o.permute(0, 1, 3, 2, 4).reshape(B, K, 2 * C, dv)
+        elif G == 1:
             c1 = (self.wr * cq + self.wi * sq).to(gd)                               # (B,KC,L)
             c2 = (self.wr * sq - self.wi * cq).to(gd)
             Fq = torch.cat([torch.cat([c1, c2], -1).view(B, K, C, 2 * L),
@@ -1319,7 +1382,9 @@ class ShortHead(nn.Module):
             # write pointer applies exactly that permutation.
             L = self.L
             if state["c"].shape[1] != L:                      # from prefill/init
-                pad = (0, 0, 0, 1)
+                # counted from the last dim: with a head axis the ring needs one
+                # more pair, or the pad lands on H instead of the window
+                pad = (0, 0, 0, 0, 0, 1) if self.H > 1 else (0, 0, 0, 1)
                 # The ring may be held narrower than the arithmetic. c and s are
                 # cosines and sines and e is a unit-RMS projection, so all three
                 # are bounded and fp16's 10 mantissa bits beat bf16's 8 at the
@@ -1329,7 +1394,7 @@ class ShortHead(nn.Module):
                 rd = _ring_dtype()
                 cw = F.pad(state["c"], pad).to(rd)
                 sw = F.pad(state["s"], pad).to(rd)
-                ew = F.pad(state["e"], pad).to(rd)
+                ew = F.pad(state["e"], (0, 0, 0, 1)).to(rd)   # e has no head axis
                 ptr = torch.full((), L - 1, device=z_t.device, dtype=torch.long)
             else:
                 # In place: the ring is a buffer THIS layer allocated in the
@@ -1364,7 +1429,7 @@ class ShortHead(nn.Module):
                 sw[:, None].to(self.wd),
                 ew[:, None].to(self.wd),
             )[:, 0]
-        return _rms(u).to(z_t.dtype), {
+        return self._out(u, z_t).to(z_t.dtype), {
             "c": cw,
             "s": sw,
             "e": ew,

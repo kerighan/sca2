@@ -99,6 +99,16 @@ EXTRA = {
     # biggest win. read_mix is omitted because w_eff lives in the long head and
     # would be inert. Receptive field becomes ~8*(128-1) = 1016 of a 4096 block.
     "dirichlet":  "--short-only --gdn-gate-scope both --post-norm",
+    # z_dirichlet in the log is the UNGATED run: ShortHead._out was never
+    # called, so --gdn-gate-scope both built o_norm and gp and applied
+    # neither, and the arm ran with no gdn-gate at all -- the single change
+    # this layer gained the most from. Its two evals are kept because they
+    # are a real, if accidental, ablation of the gate on the short head.
+    "dirichletg": "--short-only --gdn-gate-scope both --post-norm",
+    # H=4: 5208 KiB of state, 19% above GDN's 4384 but 17% BELOW mix8, at
+    # 114.7M params and +23% throughput against mix8. dv=256 divides by 4;
+    # H=3 would match GDN at 4192 KiB but 256 does not divide by 3.
+    "dirichlet4": "--short-only --gdn-gate-scope both --post-norm --short-heads 4",
     "lambdaonly": "--long-only --read-mix 8 --post-norm",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"

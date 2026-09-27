@@ -198,7 +198,9 @@ if HAVE_TRITON:
 
 
 def short_supported(head) -> bool:
-    return (HAVE_TRITON and head.G == 1 and head.wd == torch.float32
+    # the kernel has no head axis: H > 1 falls back to the PyTorch ring
+    return (HAVE_TRITON and head.G == 1 and head.H == 1
+            and head.wd == torch.float32
             and not (head.cfg.gdn_gate and head.cfg.gdn_gate_scope == "both"))
 
 

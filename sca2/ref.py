@@ -340,6 +340,9 @@ class LayerCfg:
     #   is GDN's actual form. The exp(a + lz) it replaces runs into the clamp, and a clamped
     #   rate has no gradient -- 32% of the modes pinned at lz=+3. See LongHead.lam_t.
     post_norm: bool = False      # RMSNorm on the mixer output before the residual
+    short_heads: int = 1         # true multi-head on the short head: per-head K and
+    #   theta, dv/H channels each. Costs H x the c/s state; unlike short_groups it
+    #   gives each head its own phase, not just its own filter.
     short_only: bool = False     # keep ONLY the short head's exact L-tap window (a
     #   Dirichlet kernel) and drop the decaying long head. Receptive field becomes
     #   ~layers*(Ls-1). Needs --gdn-gate-scope both, since the default scope gates the
