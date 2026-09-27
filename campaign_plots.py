@@ -7,10 +7,10 @@ are a smudge in the first inch. The three figures here are the ones that scale
 does not show: the early hours against their own control, the router occupancy
 that motivated mix8, and the frequency grid mixanch is measuring for us.
 
-Host factors come from vast/runtime/instances.json (calib_tok_s per slot) via
-the same normalisation vast.curves applies: an arm on a 5.6% slower card gets
-5.6% fewer tokens per hour, which at the fitted slope is worth more than most
-of the effects being measured.
+Host factors come from vast.common's recorded table, not from the live pool:
+an arm on a 5.6% slower card gets 5.6% fewer tokens per hour, which at the
+fitted slope is worth more than most of the effects measured here, and the
+hosts two of these arms ran on no longer exist to be asked.
 """
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from vast.common import arm_factors
 
 ROOT = Path(__file__).resolve().parent
 LOG = ROOT / "runs" / "zyda.jsonl"
@@ -42,10 +44,13 @@ R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mix8wide": 8, "z_mix8m32": 8, "z_mixanch": 
 
 
 def host_factors() -> dict[str, float]:
-    pool = {p["slot"]: p for p in json.loads((ROOT / "vast/runtime/instances.json").read_text())}
-    rates = {s: p.get("calib_tok_s") for s, p in pool.items()}
-    ref = rates.get(0) or next(v for v in rates.values() if v)
-    return {a: (rates.get(s) or ref) / ref for a, s in SLOT.items()}
+    """arm -> multiply its elapsed seconds by this to get reference-host seconds.
+
+    The table lives in vast.common because vast.curves needs the same one:
+    slot numbers shift on teardown and destroyed hosts cannot be queried.
+    """
+    return arm_factors(SLOT)
+
 
 
 def load() -> dict[str, list[dict]]:

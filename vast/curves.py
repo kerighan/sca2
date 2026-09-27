@@ -56,13 +56,21 @@ def at(series, x):
 
 def host_factors(arm_host: dict[str, int]) -> dict[str, float]:
     """arm -> multiply its elapsed seconds by this to get reference-host seconds."""
+    # The recorded table first: slot numbers shift when instances are torn down
+    # and a destroyed host cannot be queried at all, so reading the live pool
+    # silently renormalises every historical arm.
+    from .common import ARM_HOST, HOST_RATE, REF_RATE
+    out = {}
     pool = {p["slot"]: p for p in instances()}
     rates = {s: p.get("calib_tok_s") for s, p in pool.items()}
     known = [r for r in rates.values() if r]
-    if not known:
-        return {a: 1.0 for a in arm_host}
-    ref = known[0]
-    return {a: (rates.get(s) or ref) / ref for a, s in arm_host.items()}
+    ref = known[0] if known else REF_RATE
+    for a, s in arm_host.items():
+        if a in ARM_HOST:
+            out[a] = HOST_RATE[ARM_HOST[a]] / REF_RATE
+        else:
+            out[a] = (rates.get(s) or ref) / ref
+    return out
 
 
 def main() -> None:

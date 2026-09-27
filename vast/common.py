@@ -57,6 +57,34 @@ def vast(*args: str) -> object:
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
+# Calibrated tok/s of the HOST each arm ran on, recorded rather than looked up.
+# Slot numbers are NOT stable: tearing down two instances renumbered the
+# survivors -- the old slot 1 became slot 0 -- and two of the four hosts no
+# longer exist to be queried at all. Keying on the instance id and freezing the
+# reference is what keeps a figure drawn today comparable with one drawn before
+# the teardown.
+REF_RATE = 139362.0              # instance 52437648, the original slot 0
+HOST_RATE = {
+    52437648: 139362.0,          # dv256, mix8wide, dirichlet, dirichletg  (destroyed)
+    52437820: 138643.0,          # mix4, mixsal, mix8, dv384, dsoft
+    52441798: 139957.0,          # gdn, mix8m32, lambdaonly
+    52717411: 131610.0,          # mixanch, dirichlet4                     (destroyed)
+}
+ARM_HOST = {
+    "z_dv256": 52437648, "z_mix8wide": 52437648,
+    "z_dirichlet": 52437648, "z_dirichletg": 52437648,
+    "z_mix4": 52437820, "z_mixsal": 52437820, "z_mix8": 52437820,
+    "z_dv384": 52437820, "z_dsoft": 52437820,
+    "z_gdn": 52441798, "z_mix8m32": 52441798, "z_lambdaonly": 52441798,
+    "z_mixanch": 52717411, "z_dirichlet4": 52717411,
+}
+
+
+def arm_factors(arms) -> dict[str, float]:
+    """arm -> multiply its elapsed seconds by this to get reference-host seconds."""
+    return {a: HOST_RATE[ARM_HOST[a]] / REF_RATE if a in ARM_HOST else 1.0 for a in arms}
+
+
 def account() -> dict:
     """Credit and balance are separate fields; a funded account can show 0 balance."""
     return vast("show", "user")
