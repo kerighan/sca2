@@ -49,6 +49,8 @@ def config_from(cfg) -> LaplaceConfig:
         beta_softplus=cfg.beta_softplus,
         learn_omega=cfg.learn_omega,
         post_norm=cfg.post_norm,
+        short_only=cfg.short_only,
+        long_only=cfg.long_only,
         layer_scale=cfg.layer_scale,
         ls_mix_init=cfg.ls_mix_init,
         ls_ff_init=cfg.ls_ff_init,

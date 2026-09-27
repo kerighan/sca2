@@ -131,6 +131,17 @@ class LaplaceConfig:
     rope_min_period: Optional[float] = None  # shortest period in the fast rope grid. None = 2
     #   (historical). Set to 2*L to start the long head where the short head's exact window ends
     #   instead of overlapping it -- see rope_grid(). Free: no parameters, no state.
+    long_only: bool = False    # drop the SHORT head: only the decaying Laplace modes and the
+    #   delta rule, no exact window. The other half of the same ablation as short_only.
+    short_only: bool = False   # drop the LONG head entirely and keep only the short head's
+    #   exact L-tap window, which is a Dirichlet kernel: a truncated sum of e^{i.omega.(t-u)} on
+    #   a uniform grid is a rectangular window, so the layer sees the last L tokens exactly and
+    #   nothing before. No decay, no delta rule, no infinite tail. Motivated by what the trained
+    #   checkpoints say: the long head's decays collapse to a 7-14 token median memory on half
+    #   the layers, which is a short window bought at the price of a recurrent one.
+    #   Receptive field is then ~layers*(L-1), so at Ls=128 and 8 layers ~1016 tokens of a 4096
+    #   block: the arm is ARCHITECTURALLY blind past that, and the point is to measure by how
+    #   much that costs.
     slow_frac: float = 0.0  # fraction of long-head modes reserved as SLOW integrators (periods
     #                          2T..20T at max_len T, i.e. rope base 10*max_len over that slice);
     #                          the rest is the geometric rope grid of `rope_base`. The LM keeps
@@ -322,31 +333,36 @@ def _apply_init_v2(layer: "LaplaceAttention"):
         layer.ff[0].bias.fill_(-0.1)         # converges to -0.10, init was 0.0
 
         # --- Long head ---
+        # Absent under short_only. The surviving head's draws then differ from
+        # the full model's, and that is unavoidable rather than sloppy: building
+        # one fewer module already shifts the generator, and `mix` has a
+        # different shape either way. The arms share a seed and an init
+        # DISTRIBUTION, not individual draws.
         long = layer.long
+        if long is not None:
+            # theta: N(0, 0.3) instead of N(0, 0.02)
+            long.theta.copy_(0.3 * torch.randn(M))
 
-        # theta: N(0, 0.3) instead of N(0, 0.02)
-        long.theta.copy_(0.3 * torch.randn(M))
+            # wr, wi: N(0.3, 0.5) and N(0, 0.5) instead of (ones, zeros)
+            long.wr.copy_(0.3 + 0.5 * torch.randn_like(long.wr))
+            long.wi.copy_(0.5 * torch.randn_like(long.wi))
 
-        # wr, wi: N(0.3, 0.5) and N(0, 0.5) instead of (ones, zeros)
-        long.wr.copy_(0.3 + 0.5 * torch.randn_like(long.wr))
-        long.wi.copy_(0.5 * torch.randn_like(long.wi))
+            # bproj bias: -1.0 instead of -2.0 (sigmoid(-1)=0.27 vs 0.12)
+            nn.init.constant_(long.bproj.bias, -1.0)
 
-        # bproj bias: -1.0 instead of -2.0 (sigmoid(-1)=0.27 vs 0.12)
-        nn.init.constant_(long.bproj.bias, -1.0)
+            # o_norm weight: 0.8 instead of 1.0
+            if hasattr(long, 'o_norm'):
+                long.o_norm.weight.fill_(0.8)
 
-        # o_norm weight: 0.8 instead of 1.0
-        if hasattr(long, 'o_norm'):
-            long.o_norm.weight.fill_(0.8)
-
-        # --- Short head ---
+        # --- Short head ---  (absent under long_only)
         short = layer.short
+        if short is not None:
+            # theta: N(0, 0.1) instead of N(0, 0.02)
+            short.theta.copy_(0.1 * torch.randn(L))
 
-        # theta: N(0, 0.1) instead of N(0, 0.02)
-        short.theta.copy_(0.1 * torch.randn(L))
-
-        # wr, wi: N(0.5, 0.3) and N(0, 0.3) instead of (ones, zeros)
-        short.wr.copy_(0.5 + 0.3 * torch.randn_like(short.wr))
-        short.wi.copy_(0.3 * torch.randn_like(short.wi))
+            # wr, wi: N(0.5, 0.3) and N(0, 0.3) instead of (ones, zeros)
+            short.wr.copy_(0.5 + 0.3 * torch.randn_like(short.wr))
+            short.wi.copy_(0.3 * torch.randn_like(short.wi))
 
 
 def _state_dtype(var: str, default: str) -> torch.dtype:
@@ -1373,14 +1389,19 @@ class LaplaceAttention(nn.Module):
         self.cfg = cfg
         d, dv = cfg.d, cfg.dv
         self.n = nn.LayerNorm(d)
-        self.long = LongHead(cfg)
-        self.short = ShortHead(cfg)
-        self.mix = nn.Linear(4 * dv, d)
+        # Each head emits 2*dv (Re ; Im), so `cat` is 4*dv with both and 2*dv with one.
+        self.short_only, self.long_only = bool(cfg.short_only), bool(cfg.long_only)
+        if self.short_only and self.long_only:
+            raise ValueError("short_only and long_only are mutually exclusive")
+        self.long = None if self.short_only else LongHead(cfg)
+        self.short = None if self.long_only else ShortHead(cfg)
+        cat_dim = (2 if (self.short_only or self.long_only) else 4) * dv
+        self.mix = nn.Linear(cat_dim, d)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
         if cfg.gdn_gate and cfg.gdn_gate_scope == "concat":
-            self.gate_norm = nn.LayerNorm(4 * dv)
-            self.gate_proj = nn.Linear(d, 4 * dv)
+            self.gate_norm = nn.LayerNorm(cat_dim)
+            self.gate_proj = nn.Linear(d, cat_dim)
         elif cfg.gdn_gate and cfg.gdn_gate_scope == "mix":
             self.gate_norm = nn.LayerNorm(d)
             self.gate_proj = nn.Linear(d, d)
@@ -1399,11 +1420,11 @@ class LaplaceAttention(nn.Module):
 
     def init_state(self, B: int, device) -> State:
         dt = self.n.weight.dtype
-        st = {
-            "long": self.long.init_state(B, device),
-            "short": self.short.init_state(B, device),
-            "z_prev": torch.zeros(B, self.cfg.d, device=device, dtype=dt),
-        }
+        st = {"z_prev": torch.zeros(B, self.cfg.d, device=device, dtype=dt)}
+        if not self.short_only:
+            st["long"] = self.long.init_state(B, device)
+        if not self.long_only:
+            st["short"] = self.short.init_state(B, device)
         if self.ck:
             st["cbuf"] = torch.zeros(B, self.ck - 1, self.cfg.d, device=device, dtype=dt)
         return st
@@ -1445,9 +1466,9 @@ class LaplaceAttention(nn.Module):
         if self.ck:
             z, new["cbuf"] = self._conv(z, st["cbuf"])
         zp = st["z_prev"].to(z.dtype)
-        ul, sl = self.long.prefill(z, zp, st["long"])
-        us, ss = self.short.prefill(z, zp, st["short"])
-        cat = torch.cat([ul, us], -1)
+        ul, sl = (None, None) if self.short_only else self.long.prefill(z, zp, st["long"])
+        us, ss = (None, None) if self.long_only else self.short.prefill(z, zp, st["short"])
+        cat = us if self.short_only else ul if self.long_only else torch.cat([ul, us], -1)
         scope = self.cfg.gdn_gate_scope if self.cfg.gdn_gate else ""
         if scope == "concat":
             cat = self.gate_norm(cat) * F.silu(self.gate_proj(z))
@@ -1462,7 +1483,12 @@ class LaplaceAttention(nn.Module):
         else:
             x = x + mixer_out
             x = x + self.ff(self.fn(x))
-        return x, {**new, "long": sl, "short": ss, "z_prev": z[:, -1]}
+        st_out = {**new, "z_prev": z[:, -1]}
+        if not self.short_only:
+            st_out["long"] = sl
+        if not self.long_only:
+            st_out["short"] = ss
+        return x, st_out
 
     def step(self, x_t, state: State):
         z = self.n(x_t)
@@ -1470,9 +1496,9 @@ class LaplaceAttention(nn.Module):
         if self.ck:
             z, new["cbuf"] = self._conv_step(z, state["cbuf"])
         h = state["z_prev"].to(z.dtype)
-        ul, sl = self.long.step(z, h, state["long"])
-        us, ss = self.short.step(z, h, state["short"])
-        cat = torch.cat([ul, us], -1)
+        ul, sl = (None, None) if self.short_only else self.long.step(z, h, state["long"])
+        us, ss = (None, None) if self.long_only else self.short.step(z, h, state["short"])
+        cat = us if self.short_only else ul if self.long_only else torch.cat([ul, us], -1)
         scope = self.cfg.gdn_gate_scope if self.cfg.gdn_gate else ""
         if scope == "concat":
             cat = self.gate_norm(cat) * F.silu(self.gate_proj(z))

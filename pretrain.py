@@ -357,6 +357,10 @@ def main(argv=None):
                    choices=["long", "both", "concat", "mix"],
                    help="where the gdn-gate applies: long (default), both (long+short), "
                         "concat (after cat before mix), mix (after mix before residual)")
+    p.add_argument("--short-only", action="store_true", dest="short_only",
+                   help="drop the long head: only the exact L-tap Dirichlet window")
+    p.add_argument("--long-only", action="store_true", dest="long_only",
+                   help="drop the short head: only the decaying Laplace modes")
     p.add_argument("--post-norm", action="store_true", dest="post_norm",
                    help="RMSNorm on the mixer output before the residual: the inputs "
                         "of mix are normalised and its output is not, and trained "
@@ -470,7 +474,7 @@ def main(argv=None):
                    persist=a.persist, learn_persist=a.learn_persist, kv_dk=a.kv_dk,
                    kv_gate_pc=a.kv_gate_pc, beta_groups=a.beta_groups,
                    short_groups=a.short_groups, long_groups=a.long_groups,
-                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus, read_mix=a.read_mix, lam_anchor=a.lam_anchor, beta_softplus=a.beta_softplus, learn_omega=a.learn_omega, post_norm=a.post_norm,
+                   conv_silu=a.conv_silu, beta_init=a.beta_init, decay_input=a.decay_input, decay_softplus=a.decay_softplus, read_mix=a.read_mix, lam_anchor=a.lam_anchor, beta_softplus=a.beta_softplus, learn_omega=a.learn_omega, post_norm=a.post_norm, short_only=a.short_only, long_only=a.long_only,
                    beta_write=a.beta_write,
                    layer_scale=a.layer_scale,
                    ls_mix_init=a.ls_mix_init, ls_ff_init=a.ls_ff_init,

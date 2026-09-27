@@ -340,6 +340,11 @@ class LayerCfg:
     #   is GDN's actual form. The exp(a + lz) it replaces runs into the clamp, and a clamped
     #   rate has no gradient -- 32% of the modes pinned at lz=+3. See LongHead.lam_t.
     post_norm: bool = False      # RMSNorm on the mixer output before the residual
+    short_only: bool = False     # keep ONLY the short head's exact L-tap window (a
+    #   Dirichlet kernel) and drop the decaying long head. Receptive field becomes
+    #   ~layers*(Ls-1). Needs --gdn-gate-scope both, since the default scope gates the
+    #   long head and there is none.
+    long_only: bool = False      # the complement: keep only the decaying modes.
     beta_init: float = -2.0      # erase-gate bias: sigmoid(-2) = 0.12 at init. GDN's b has
     #   NO bias, so its erase gate starts at sigmoid(0) = 0.5 -- 4x bolder than ours, and its
     #   delta rule ablates 3x heavier (+4.51 vs our +1.42).

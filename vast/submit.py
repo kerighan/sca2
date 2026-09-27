@@ -81,6 +81,25 @@ EXTRA = {
     # opposite. At M=32 this arm carries LESS state than the dv256 it descends
     # from, for 12.4% more parameters.
     "mix8m32":  "--read-mix 8 --post-norm --Mc 32 --dv 512",
+    # The two halves of the layer, alone. Every knob this campaign has turned --
+    # decay_input, decay_softplus, lam_anchor, learn_omega, beta_write,
+    # beta_softplus, Mc, read_mix, gdn_gate -- is a LONG-head knob, and their
+    # combined range over two days is about 0.02 nat, of which read_mix is
+    # 0.017. The gap to GDN is 0.098. So the question is not how to tune the
+    # long head but whether it earns its keep.
+    #
+    # Measured against mix8: dirichlet is 111,583,504 params, 2160 KiB of state
+    # (-65%) and +39.2% throughput; lambdaonly is 112,739,608, 4224 KiB, +10.6%.
+    # At +39.2% dirichlet sees 0.33 e-fold more tokens, worth ~0.010-0.017 nat
+    # on the current slope, so it can be that much worse per token and still win
+    # on the clock.
+    #
+    # dirichlet needs --gdn-gate-scope both: the default scope gates the long
+    # head, which it does not have, and the gate was this layer's single
+    # biggest win. read_mix is omitted because w_eff lives in the long head and
+    # would be inert. Receptive field becomes ~8*(128-1) = 1016 of a 4096 block.
+    "dirichlet":  "--short-only --gdn-gate-scope both --post-norm",
+    "lambdaonly": "--long-only --read-mix 8 --post-norm",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
 BPE = "zyda_bpe32k"
