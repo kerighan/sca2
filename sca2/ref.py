@@ -343,6 +343,8 @@ class LayerCfg:
     short_heads: int = 1         # true multi-head on the short head: per-head K and
     #   theta, dv/H channels each. Costs H x the c/s state; unlike short_groups it
     #   gives each head its own phase, not just its own filter.
+    compose: bool = False        # serial heads: Short then Long, instead of parallel
+    #   concatenation. Parameter-neutral. Needs both heads.
     short_only: bool = False     # keep ONLY the short head's exact L-tap window (a
     #   Dirichlet kernel) and drop the decaying long head. Receptive field becomes
     #   ~layers*(Ls-1). Needs --gdn-gate-scope both, since the default scope gates the

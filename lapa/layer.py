@@ -135,6 +135,10 @@ class LaplaceConfig:
     #   theta each, so its own similarity geometry, reading dv/H value channels.
     #   short_groups shares the phase and only splits the filter; this does not.
     #   State goes H x on c and s.
+    compose: bool = False      # SERIAL heads: z -> Short -> P -> Long -> mix, instead of
+    #   concatenating the two in parallel. The long head's keys and values are then built
+    #   from window-mixed features, so its delta rule writes phrases rather than tokens.
+    #   Parameter-neutral: P is 2dv*d and mix returns it by shrinking 4dv -> 2dv.
     long_only: bool = False    # drop the SHORT head: only the decaying Laplace modes and the
     #   delta rule, no exact window. The other half of the same ablation as short_only.
     short_only: bool = False   # drop the LONG head entirely and keep only the short head's
@@ -1460,7 +1464,20 @@ class LaplaceAttention(nn.Module):
             raise ValueError("short_only and long_only are mutually exclusive")
         self.long = None if self.short_only else LongHead(cfg)
         self.short = None if self.long_only else ShortHead(cfg)
-        cat_dim = (2 if (self.short_only or self.long_only) else 4) * dv
+        # SERIAL instead of parallel: z -> Short -> P -> Long -> mix. The long
+        # head then builds its keys and values from features already mixed over
+        # the window, so its delta rule writes phrase-level content instead of
+        # single tokens. Parameter-neutral: P costs 2dv*d and mix gives exactly
+        # that back by shrinking from 4dv to 2dv.
+        self.compose = bool(cfg.compose)
+        if self.compose and (self.short_only or self.long_only):
+            raise ValueError("compose needs both heads")
+        cat_dim = (2 if (self.short_only or self.long_only or self.compose) else 4) * dv
+        if self.compose:
+            self.compose_proj = nn.Linear(2 * dv, d)
+            # the long head's own path assumes a LayerNorm'd input (self.n), and
+            # the composed signal has to arrive on the same scale
+            self.compose_norm = nn.LayerNorm(d)
         self.mix = nn.Linear(cat_dim, d)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
@@ -1490,6 +1507,10 @@ class LaplaceAttention(nn.Module):
             st["long"] = self.long.init_state(B, device)
         if not self.long_only:
             st["short"] = self.short.init_state(B, device)
+        if self.compose:
+            # the long head's write at t uses the key of t-1, and under compose
+            # that is the COMPOSED signal at t-1, not the raw token
+            st["cz_prev"] = torch.zeros(B, self.cfg.d, device=device, dtype=dt)
         if self.ck:
             st["cbuf"] = torch.zeros(B, self.ck - 1, self.cfg.d, device=device, dtype=dt)
         return st
@@ -1531,9 +1552,16 @@ class LaplaceAttention(nn.Module):
         if self.ck:
             z, new["cbuf"] = self._conv(z, st["cbuf"])
         zp = st["z_prev"].to(z.dtype)
-        ul, sl = (None, None) if self.short_only else self.long.prefill(z, zp, st["long"])
-        us, ss = (None, None) if self.long_only else self.short.prefill(z, zp, st["short"])
-        cat = us if self.short_only else ul if self.long_only else torch.cat([ul, us], -1)
+        if self.compose:
+            us, ss = self.short.prefill(z, zp, st["short"])
+            zc = self.compose_norm(self.compose_proj(us))
+            ul, sl = self.long.prefill(zc, st["cz_prev"].to(zc.dtype), st["long"])
+            cat = ul
+            new["cz_prev"] = zc[:, -1]
+        else:
+            ul, sl = (None, None) if self.short_only else self.long.prefill(z, zp, st["long"])
+            us, ss = (None, None) if self.long_only else self.short.prefill(z, zp, st["short"])
+            cat = us if self.short_only else ul if self.long_only else torch.cat([ul, us], -1)
         scope = self.cfg.gdn_gate_scope if self.cfg.gdn_gate else ""
         if scope == "concat":
             cat = self.gate_norm(cat) * F.silu(self.gate_proj(z))
@@ -1561,9 +1589,16 @@ class LaplaceAttention(nn.Module):
         if self.ck:
             z, new["cbuf"] = self._conv_step(z, state["cbuf"])
         h = state["z_prev"].to(z.dtype)
-        ul, sl = (None, None) if self.short_only else self.long.step(z, h, state["long"])
-        us, ss = (None, None) if self.long_only else self.short.step(z, h, state["short"])
-        cat = us if self.short_only else ul if self.long_only else torch.cat([ul, us], -1)
+        if self.compose:
+            us, ss = self.short.step(z, h, state["short"])
+            zc = self.compose_norm(self.compose_proj(us))
+            ul, sl = self.long.step(zc, state["cz_prev"].to(zc.dtype), state["long"])
+            cat = ul
+            new["cz_prev"] = zc
+        else:
+            ul, sl = (None, None) if self.short_only else self.long.step(z, h, state["long"])
+            us, ss = (None, None) if self.long_only else self.short.step(z, h, state["short"])
+            cat = us if self.short_only else ul if self.long_only else torch.cat([ul, us], -1)
         scope = self.cfg.gdn_gate_scope if self.cfg.gdn_gate else ""
         if scope == "concat":
             cat = self.gate_norm(cat) * F.silu(self.gate_proj(z))
@@ -1578,7 +1613,12 @@ class LaplaceAttention(nn.Module):
         else:
             y = x_t + mixer_out
             y = y + self.ff(self.fn(y))
-        return y, {**new, "long": sl, "short": ss, "z_prev": z}
+        st_out = {**new, "z_prev": z}
+        if not self.short_only:
+            st_out["long"] = sl
+        if not self.long_only:
+            st_out["short"] = ss
+        return y, st_out
 
     def state_floats(self) -> int:
         cfg = self.cfg

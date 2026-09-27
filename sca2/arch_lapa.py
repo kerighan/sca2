@@ -50,6 +50,7 @@ def config_from(cfg) -> LaplaceConfig:
         learn_omega=cfg.learn_omega,
         post_norm=cfg.post_norm,
         short_heads=cfg.short_heads,
+        compose=cfg.compose,
         short_only=cfg.short_only,
         long_only=cfg.long_only,
         layer_scale=cfg.layer_scale,
