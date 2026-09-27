@@ -29,11 +29,16 @@ LOG = ROOT / "runs" / "zyda.jsonl"
 OUT = ROOT / "plot"          # where every figure in this repo has always gone
 
 # arm -> slot it ran on, so elapsed seconds can be put on one clock
-SLOT = {"z_dv256": 0, "z_mix8wide": 0, "z_gdn": 2, "z_mix8m32": 2, "z_mixanch": 3,
+SLOT = {"z_dv256": 0, "z_mix8wide": 0, "z_dirichlet": 0, "z_dirichletg": 0,
+        "z_gdn": 2, "z_mix8m32": 2, "z_lambdaonly": 2,
+        "z_mixanch": 3, "z_dirichlet4": 3,
         "z_mix4": 1, "z_mixsal": 1, "z_mix8": 1, "z_dv384": 1, "z_dsoft": 1}
 COL = {"z_gdn": "k", "z_dv256": "tab:purple", "z_mix4": "tab:orange", "z_mix8wide": "tab:brown", "z_mix8m32": "tab:cyan",
-       "z_mix8": "tab:blue", "z_mixanch": "tab:green", "z_mixsal": "tab:red"}
-R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mix8wide": 8, "z_mix8m32": 8, "z_mixanch": 4, "z_mixsal": 4, "z_dv256": 1}
+       "z_mix8": "tab:blue", "z_mixanch": "tab:green", "z_mixsal": "tab:red",
+       "z_lambdaonly": "tab:olive", "z_dirichletg": "tab:pink",
+       "z_dirichlet4": "tab:cyan", "z_dirichlet": "0.6"}
+R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mix8wide": 8, "z_mix8m32": 8, "z_mixanch": 4,
+        "z_mixsal": 4, "z_dv256": 1, "z_lambdaonly": 8}
 
 
 def host_factors() -> dict[str, float]:
@@ -214,6 +219,66 @@ def fig_mdose(h, fac, ref="z_mix8wide", arm="z_mix8m32", base="z_mix8"):
         print(f"  a {lab:11s} " + "  ".join(f"{x:.2f}:{y:+.4f}" for x, y in zip(g, d)))
 
 
+def fig_heads(h, fac, ref="z_mix8",
+              arms=("z_lambdaonly", "z_dirichletg", "z_dirichlet4", "z_dirichlet")):
+    """Which half of the layer carries the model.
+
+    Three panels because the loss alone does not explain itself. The third is
+    the one that does: b0 - b15 of the per-position loss is what the model gains
+    from 4000 tokens of history rather than 250, and the Dirichlet head's
+    receptive field is ~layers*(L-1) = 1016 of a 4096 block.
+    """
+    live = [m for m in arms if m in h and len(h[m]) > 1]
+    if ref not in h or not live:
+        print("head ablation: not enough data yet")
+        return
+    def xy(m, col):
+        v = [(r["tokens"] / 1e9 if col == 0 else r["train_s"] * fac[m] / 3600,
+              r["val"], r["pos"][0] - r["pos"][-1])
+             for r in h[m] if r["train_s"] > 300 and r.get("pos")]
+        return np.array(v, dtype=float).reshape(-1, 3)
+
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
+    for m in [ref] + live:
+        a = xy(m, 0)
+        if not len(a):
+            continue
+        lw = 2.4 if m == ref else 1.8
+        lab = m[2:] + (" (non gate)" if m == "z_dirichlet" else "")
+        ax[0].plot(a[:, 0], a[:, 1], label=lab, lw=lw, marker="o", ms=3, color=COL[m])
+        ax[2].plot(a[:, 0], a[:, 2], label=lab, lw=lw, marker="o", ms=3, color=COL[m])
+    r1 = xy(ref, 1)
+    for m in live:
+        b = xy(m, 1)
+        if not len(b):
+            continue
+        ax[1].plot(b[:, 0], b[:, 1] - np.interp(b[:, 0], r1[:, 0], r1[:, 1]),
+                   label=m[2:], lw=1.8, marker="o", ms=3, color=COL[m])
+    ax[1].axhline(0, color=COL[ref], lw=2, label=ref[2:])
+    ax[1].axhspan(-0.008, 0.008, color="0.85", zorder=0, label="bruit +/-0.008")
+    ax[0].set_xlabel("tokens vus (B)"); ax[0].set_ylabel("val loss (nats)")
+    ax[0].set_title("val a tokens appaires")
+    ax[1].set_xlabel("wall clock normalise hote (h)")
+    ax[1].set_ylabel(f"ecart a {ref[2:]} (nats)")
+    ax[1].set_title("a WALL CLOCK egal — negatif = mieux que les deux tetes")
+    ax[2].set_xlabel("tokens vus (B)"); ax[2].set_ylabel("gain de contexte b0 - b15")
+    ax[2].set_title("ce que le modele tire de 4000 tokens plutot que 250")
+    for a_ in ax:
+        a_.grid(alpha=.3); a_.legend(fontsize=8)
+    fig.suptitle("Zyda-2 — quelle moitie du layer porte le modele")
+    fig.tight_layout(); fig.savefig(OUT / "zyda_heads.png", dpi=110)
+    print(f"saved {OUT.name}/zyda_heads.png")
+
+    a0 = xy(ref, 0)
+    tmax = min(xy(m, 0)[-1, 0] for m in live if len(xy(m, 0)))
+    print(f"\n  a {tmax:.2f}B tokens, ecart a {ref[2:]} et gain de contexte")
+    print(f"    {ref[2:]:12s}  ---       {np.interp(tmax, a0[:,0], a0[:,2]):+.4f}")
+    for m in live:
+        b = xy(m, 0)
+        print(f"    {m[2:]:12s} {np.interp(tmax, b[:,0], b[:,1]) - np.interp(tmax, a0[:,0], a0[:,1]):+.4f}"
+              f"   {np.interp(tmax, b[:,0], b[:,2]):+.4f}")
+
+
 def main() -> None:
     h, fac = load(), host_factors()
     print("arms: " + ", ".join(f"{m[2:]}({len(h[m])})" for m in h))
@@ -222,6 +287,7 @@ def main() -> None:
     fig_router(h)
     fig_omega(h)
     fig_mdose(h, fac)
+    fig_heads(h, fac)
 
 
 if __name__ == "__main__":
