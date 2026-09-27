@@ -112,6 +112,17 @@ EXTRA = {
     "lambdaonly": "--long-only --read-mix 8 --post-norm",
 }
 GDN_FLAGS = "--variant gdn_cc --gdn-heads 8 --gdn-head-k 128 --gdn-expand-v 1.0"
+# The parameter control the whole campaign rests on. GDN's 22.2M advantage sits
+# ENTIRELY in its mixer -- 42.2M against LapA's 20.0M, with identical FFNs -- so
+# a LapA arm losing to it has never been distinguishable from a LapA arm losing
+# to 18% more parameters. The 22.2M comes out of the FFN rather than head_k
+# because the FFN is the one component both architectures share identically:
+# cutting it changes the budget without touching what is being compared, while
+# head_k 128 -> 64 would also cut GDN's state by 73%, to 1168 KiB against LapA's
+# 6256, which is cutting the treatment and not the budget.
+# Measured: 119,079,296 params against mix8's 120,091,928, state unchanged at
+# 4384 KiB, and +10.2% throughput against the current gdn.
+GDN_ARMS = {"gdn": "--ff 4096", "gdnsmall": "--ff 2688"}
 BPE = "zyda_bpe32k"
 
 
@@ -134,14 +145,15 @@ def build_command(arm: str, hours: float, corpus: str, block: int, batch: int,
         f"--class-eval --bpe {bpe} --tie-embed "
         f"--save runs/ck_{log} --save-every 7200"
     )
-    if arm == "gdn":
-        return f"python -u pretrain.py --label z_gdn --seed 0 {common} {GDN_FLAGS} --ff 4096"
+    if arm in GDN_ARMS:
+        return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
+                f"{GDN_FLAGS} {GDN_ARMS[arm]}")
     if arm in EXTRA:
         return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
                 f"{LAPA_FLAGS} {_without(ARMS['dv256'], EXTRA[arm])} {EXTRA[arm]}")
     if arm not in ARMS:
         raise SystemExit(f"unknown arm {arm!r}; known: "
-                         f"{', '.join(list(ARMS) + list(EXTRA))} , gdn")
+                         f"{', '.join(list(ARMS) + list(EXTRA) + list(GDN_ARMS))}")
     return (f"python -u pretrain.py --label z_{arm} --seed 0 {common} "
             f"{LAPA_FLAGS} {ARMS[arm]}")
 
