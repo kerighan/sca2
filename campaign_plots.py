@@ -29,11 +29,11 @@ LOG = ROOT / "runs" / "zyda.jsonl"
 OUT = ROOT / "plot"          # where every figure in this repo has always gone
 
 # arm -> slot it ran on, so elapsed seconds can be put on one clock
-SLOT = {"z_dv256": 0, "z_mix8wide": 0, "z_gdn": 2, "z_mixanch": 3,
+SLOT = {"z_dv256": 0, "z_mix8wide": 0, "z_gdn": 2, "z_mix8m32": 2, "z_mixanch": 3,
         "z_mix4": 1, "z_mixsal": 1, "z_mix8": 1, "z_dv384": 1, "z_dsoft": 1}
-COL = {"z_gdn": "k", "z_dv256": "tab:purple", "z_mix4": "tab:orange", "z_mix8wide": "tab:brown",
+COL = {"z_gdn": "k", "z_dv256": "tab:purple", "z_mix4": "tab:orange", "z_mix8wide": "tab:brown", "z_mix8m32": "tab:cyan",
        "z_mix8": "tab:blue", "z_mixanch": "tab:green", "z_mixsal": "tab:red"}
-R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mix8wide": 8, "z_mixanch": 4, "z_mixsal": 4, "z_dv256": 1}
+R_OF = {"z_mix4": 4, "z_mix8": 8, "z_mix8wide": 8, "z_mix8m32": 8, "z_mixanch": 4, "z_mixsal": 4, "z_dv256": 1}
 
 
 def host_factors() -> dict[str, float]:
@@ -166,13 +166,62 @@ def fig_omega(h, m="z_mixanch"):
     print(f"  corr(n_eff, span) = {np.corrcoef(o[:, 1], o[:, 2])[0, 1]:+.3f}")
 
 
+def fig_mdose(h, fac, ref="z_mix8wide", arm="z_mix8m32", base="z_mix8"):
+    """The M dose-response, which the mix4-controlled zoom cannot show.
+
+    mix8wide and mix8m32 differ in M alone: same R=8, same post-norm, same
+    dv=512. Drawn twice because the two readings disagree and only one of them
+    is the decision. At equal TOKENS a smaller M can only lose, since it is
+    strictly less machinery per token. At equal WALL CLOCK it also runs 5.7%
+    faster and sees more tokens, and wall clock is what a card costs.
+    """
+    if arm not in h or ref not in h:
+        print("M dose-response: both arms not present yet")
+        return
+    def xy(m, col):
+        v = [(r["tokens"] / 1e9 if col == 0 else r["train_s"] * fac[m] / 3600, r["val"])
+             for r in h[m] if r["train_s"] > 300]
+        return np.array(v, dtype=float).reshape(-1, 2)
+
+    fig, ax = plt.subplots(2, 2, figsize=(13, 8), gridspec_kw={"height_ratios": [2, 1]})
+    for col, xlab in ((0, "tokens vus (B)"), (1, "wall clock normalise hote (h)")):
+        a, b = xy(ref, col), xy(arm, col)
+        for m, d in ((base, xy(base, col)), (ref, a), (arm, b)):
+            if len(d):
+                ax[0][col].plot(d[:, 0], d[:, 1], label=m[2:], lw=2,
+                                marker="o", ms=3, color=COL[m])
+        lo, hi = max(a[0, 0], b[0, 0]), min(a[-1, 0], b[-1, 0])
+        g = np.linspace(lo, hi, 60)
+        ax[1][col].plot(g, np.interp(g, b[:, 0], b[:, 1]) - np.interp(g, a[:, 0], a[:, 1]),
+                        lw=2, color=COL[arm])
+        ax[1][col].axhline(0, color=COL[ref], lw=2)
+        ax[1][col].axhspan(-0.008, 0.008, color="0.85", zorder=0,
+                           label="plancher de bruit +/-0.008")
+        ax[0][col].set_ylabel("val loss (nats)")
+        ax[1][col].set_ylabel("M=32 moins M=128 (nats)")
+        ax[1][col].set_xlabel(xlab)
+        ax[0][col].set_title(f"a {'tokens appaires' if col == 0 else 'WALL CLOCK egal'}")
+        for a_ in (ax[0][col], ax[1][col]):
+            a_.grid(alpha=.3); a_.legend(fontsize=8)
+    fig.suptitle("dose-reponse sur M a dv=512 — negatif = moins de modes est MIEUX")
+    fig.tight_layout(); fig.savefig(OUT / "zyda_mdose.png", dpi=110)
+    print(f"saved {OUT.name}/zyda_mdose.png")
+
+    for col, lab in ((0, "tokens"), (1, "wall clock")):
+        a, b = xy(ref, col), xy(arm, col)
+        g = np.linspace(max(a[0, 0], b[0, 0]), min(a[-1, 0], b[-1, 0]), 6)
+        d = np.interp(g, b[:, 0], b[:, 1]) - np.interp(g, a[:, 0], a[:, 1])
+        print(f"  a {lab:11s} " + "  ".join(f"{x:.2f}:{y:+.4f}" for x, y in zip(g, d)))
+
+
 def main() -> None:
     h, fac = load(), host_factors()
     print("arms: " + ", ".join(f"{m[2:]}({len(h[m])})" for m in h))
-    fig_zoom(h, fac, ["z_gdn", "z_mix4", "z_mix8", "z_mix8wide", "z_mixanch", "z_mixsal", "z_dv256"],
-             hours=8.0)
+    fig_zoom(h, fac, ["z_gdn", "z_mix4", "z_mix8", "z_mix8wide", "z_mix8m32",
+                      "z_mixanch", "z_mixsal", "z_dv256"], hours=10.0)
     fig_router(h)
     fig_omega(h)
+    fig_mdose(h, fac)
 
 
 if __name__ == "__main__":
