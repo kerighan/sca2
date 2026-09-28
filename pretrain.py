@@ -241,6 +241,14 @@ def run(name, m, tr, va, a, device, log, V=None):
             om = [o for o in om if o is not None]
             if om:
                 rec["omega"] = om
+            # kda: [log-span, n_eff] of the per-key decay spectrum, per layer.
+            # At init every band shares a time constant, so span 0 and n_eff dk.
+            # Whether they SEPARATE is the measurement this arm exists for, and
+            # it is independent of the loss.
+            sp = [m_.decay_spread() for m_ in m.modules()
+                  if hasattr(m_, "decay_spread")]
+            if sp:
+                rec["decay"] = sp
             if prof:
                 rec["pos"] = [round(v, 5) for v in prof]
             if cls:
@@ -441,6 +449,8 @@ def main(argv=None):
     p.add_argument("--cosine", action="store_true", help="cosine lr decay to 10%% of the peak over ONE PASS of the corpus (progress = tokens seen / train tokens)")
     p.add_argument("--gdn-heads", type=int, default=3, dest="gdn_heads")
     p.add_argument("--gdn-head-k", type=int, default=60, dest="gdn_head_k")
+    p.add_argument("--kda-gate-full", action="store_true", dest="kda_gate_full",
+                   help="KDA's published gate (d -> H*K) instead of the factorised spectrum")
     p.add_argument("--gdn-expand-v", type=float, default=1.0, dest="gdn_expand_v")
     p.add_argument("--class-eval", action="store_true", dest="class_eval")
     p.add_argument("--bpe", default="pycode_bpe16k")
@@ -486,7 +496,7 @@ def main(argv=None):
                    mamba_expand=a.mamba_expand, init_v2=a.init_v2, k_silu=a.k_silu, v_silu=a.v_silu, gdn_gate=a.gdn_gate, gdn_gate_scope=a.gdn_gate_scope,
                    lam_max=a.lam_max, lam_free=a.lam_free, lam_ceil=a.lam_ceil, damp_mem=tuple(float(v) for v in a.damp_mem.split(",")) if a.damp_mem else None,
                    gdn_heads=a.gdn_heads, gdn_head_k=a.gdn_head_k,
-                   gdn_expand_v=a.gdn_expand_v)
+                   gdn_expand_v=a.gdn_expand_v, kda_gate_full=a.kda_gate_full)
     log = open(a.log, "a")
     models = {}
     if a.only != "transformer":

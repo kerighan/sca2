@@ -385,6 +385,10 @@ class LayerCfg:
     gdn_heads: int = 3
     gdn_head_k: int = 60
     gdn_expand_v: float = 1.0
+    kda_gate_full: bool = False  # KDA as published projects d -> H*K for the gate,
+    #   1.05M params a layer here. Default factorises it: a(x) stays d -> H and only
+    #   A_log is (H, K), so the spectrum is learned but the gate is shared -- 1024
+    #   params a layer, and A_log init'd uniform over K means the model STARTS at GDN.
 
     @classmethod
     def legacy(cls, **kw):
