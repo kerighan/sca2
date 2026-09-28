@@ -60,6 +60,7 @@ _VARIANT_MODULES = [
     ("arch_cumsum",   "original SeqCond temporal form"),
     ("arch_gdn",      "Gated DeltaNet baseline"),
     ("arch_kda",      "GDN + per-key-dimension decay spectrum"),
+    ("arch_rff",      "GDN + shift-invariant key kernel (RFF)"),
     ("arch_keyed",    "key-addressed delta rule"),
     ("arch_gatedc",   "gated multi-head C head"),
     ("arch_wgroup",   "per-value-group spectral weights"),

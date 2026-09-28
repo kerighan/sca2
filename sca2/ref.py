@@ -385,6 +385,10 @@ class LayerCfg:
     gdn_heads: int = 3
     gdn_head_k: int = 60
     gdn_expand_v: float = 1.0
+    rff_theta: float = 1.0       # scale of the RFF spectral measure, theta ~ N(0, s^2).
+    #   It sets the WIDTH of the key kernel -- large theta means the model only calls
+    #   near-identical keys similar, small theta means it calls everything similar.
+    #   The one real hyper-parameter of arch_rff.
     gdn_rope: float = 0.0        # RoPE base for the GDN mixer's q/k. 0 = off (plain
     #   GDN). > 0 gives each PAIR of key dimensions a carrier, turning the kernel's
     #   lowpass into a bandpass, with NO extra state and no new kernel -- the
