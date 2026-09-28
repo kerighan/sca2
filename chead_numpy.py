@@ -354,3 +354,153 @@ print(f"              at theta=0, centred rank of the lag-kernels: single w {r_o
       f"R={R} mixture {r_mix} (<= R-1 = {R-1})")
 print("  -> the state, the write and the transform are untouched; what the token now chooses is WHICH")
 print("     Laplace kernel to invert along. The shape over lag stops being a training-time constant.")
+
+
+# =============================================================================
+#  V0: GDN WITH AN EQUALIZER
+#
+#  Written after the Zyda campaign, which tuned LapA toward GDN and lost by
+#  0.086 nat, 74% of it architectural (gdnsmall, at equal parameters, still beat
+#  the best LapA by 0.064 and the gap WIDENED over 17 h). The lesson is not that
+#  the spectral idea is wrong but that it was tested from 0.09 nat behind, where
+#  every knob was worth 0.02. So invert: start from GDN and change ONE thing.
+#
+#  GDN's recurrence (fla's own reference), state h in R^{dk x dv} per head:
+#
+#      h   <- h * exp(g_t)              g_t <= 0, ONE scalar per head
+#      vh  <- v_t - h^T k_t             the delta rule's error correction
+#      h   <- h + k_t (x) (beta_t vh)
+#      o_t  = h^T q_t
+#
+#  With the correction off, that has a closed form:
+#
+#      o_t = sum_{u<=t} (q_t . k_u) exp(sum_{s=u+1..t} g_s) beta_u v_u
+#
+#  so  kappa_GDN(t,u) = (q_t . k_u) * e^{G_{u,t}}: content times ONE real decay.
+#  One band, one gain -- the waveform.
+#
+#  V0 keeps the content term and the delta rule EXACTLY, and only replaces the
+#  scalar gate by a per-key-dimension one, complex:
+#
+#      gamma_{t,j} = exp(r_j g_t + i omega_j),      j = 1..dk
+#      h <- diag(gamma_t) h
+#
+#      kappa_v0(t,u) = sum_j q_{t,j} k_{u,j} e^{r_j G_{u,t}} cos(omega_j (t-u))
+#
+#  Each coordinate of the inner product gets its own decay envelope and its own
+#  carrier. That is the equalizer. r = 1, omega = 0 gives back GDN exactly, so
+#  the baseline is a point in the hypothesis class and we can start there.
+#
+#  Q and K are KEPT. LapA replaced q.k by a function of (k_t - k_u), i.e. it
+#  assumed shift-invariance in KEY space on top of the spectral change; that is
+#  the part that never worked. One change at a time.
+# =============================================================================
+print("\n" + "=" * 70)
+print("V0: GDN + EQUALIZER -- one head, one sequence, no batch")
+print("=" * 70)
+
+rng = np.random.default_rng(7)
+T, dk, dv = 24, 6, 5
+Q = rng.normal(size=(T, dk)); Q /= np.linalg.norm(Q, axis=-1, keepdims=True)
+K = rng.normal(size=(T, dk)); K /= np.linalg.norm(K, axis=-1, keepdims=True)
+V = rng.normal(size=(T, dv))
+G = -np.abs(rng.normal(size=T)) * 0.3          # g_t <= 0, one scalar per step
+BETA = rng.uniform(0.2, 0.9, size=T)
+
+
+def gdn_forward(delta=True):
+    """fla's recurrence, transcribed. delta=False drops the error correction."""
+    h = np.zeros((dk, dv)); out = np.zeros((T, dv))
+    for t in range(T):
+        h = h * np.exp(G[t])
+        vh = V[t] - (h * K[t][:, None]).sum(0) if delta else V[t]
+        h = h + np.outer(K[t], BETA[t] * vh)
+        out[t] = h.T @ Q[t]
+    return out
+
+
+def gdn_closed():
+    """kappa(t,u) = (q_t . k_u) e^{G_{u,t}}, valid only without the correction."""
+    out = np.zeros((T, dv))
+    for t in range(T):
+        for u in range(t + 1):
+            decay = np.exp(G[u + 1:t + 1].sum())
+            out[t] += (Q[t] @ K[u]) * decay * BETA[u] * V[u]
+    return out
+
+
+assert np.allclose(gdn_forward(delta=False), gdn_closed(), atol=1e-10)
+
+R_J = np.exp(rng.normal(size=dk) * 0.5)        # per-band decay exponent, >0
+OM_J = rng.uniform(0, 1.2, size=dk)            # per-band carrier
+
+
+def v0_forward(r, om, delta=True):
+    """Same recurrence, complex state, gate per key dimension.
+
+    The WRITE stays real -- v is real and so is the correction -- exactly as in
+    the long head, where the phase is not written but accumulated by the
+    rotation. The read takes the real part, so at omega = 0 nothing is complex.
+    """
+    h = np.zeros((dk, dv), dtype=complex); out = np.zeros((T, dv))
+    gam = np.exp(r * 0.0 + 1j * om)            # shape only; rebuilt per step
+    for t in range(T):
+        h = h * (np.exp(r * G[t]) * np.exp(1j * om))[:, None]
+        vh = V[t] - (h.real * K[t][:, None]).sum(0) if delta else V[t]
+        h = h + np.outer(K[t], BETA[t] * vh).astype(complex)
+        out[t] = (h.real.T @ Q[t])
+    return out
+
+
+def v0_closed(r, om):
+    """kappa_v0(t,u) = sum_j q_{t,j} k_{u,j} e^{r_j G_{u,t}} cos(omega_j (t-u))."""
+    out = np.zeros((T, dv))
+    for t in range(T):
+        for u in range(t + 1):
+            Gut = G[u + 1:t + 1].sum()
+            band = Q[t] * K[u] * np.exp(r * Gut) * np.cos(om * (t - u))
+            out[t] += band.sum() * BETA[u] * V[u]
+    return out
+
+
+# check 1: at r = 1, omega = 0 the v0 IS gdn -- including the delta rule, since
+# that mechanism is untouched. The baseline is a point in the hypothesis class.
+one, zero = np.ones(dk), np.zeros(dk)
+d_gdn = np.abs(v0_forward(one, zero, delta=True) - gdn_forward(delta=True)).max()
+assert d_gdn < 1e-12, d_gdn
+
+# check 2: the closed form, so the kernel above is the one the scan computes
+d_closed = np.abs(v0_forward(R_J, OM_J, delta=False) - v0_closed(R_J, OM_J)).max()
+assert d_closed < 1e-10, d_closed
+
+# check 3: what it buys. GDN's kernel is a PRODUCT -- one decay shape over lag,
+# scaled by the content. v0's is a SUM of dk such products, each with its own
+# shape. Held at constant content (q = k = e_j sweeps the basis), the family of
+# lag-profiles GDN can produce spans one dimension; v0 spans dk.
+lags = np.arange(T)
+Gc = np.full(T, -0.15)                          # constant gate, isolate the shape
+
+
+def profiles(r, om):
+    cum = np.cumsum(Gc)                          # G_{u,t} = cum[t] - cum[u]
+    return np.stack([[np.exp(r[j] * (-0.15 * n)) * np.cos(om[j] * n) for n in lags]
+                     for j in range(dk)])
+
+
+rank_gdn = np.linalg.matrix_rank(profiles(one, zero), tol=1e-8)
+rank_v0 = np.linalg.matrix_rank(profiles(R_J, OM_J), tol=1e-8)
+assert rank_gdn == 1 and rank_v0 == dk, (rank_gdn, rank_v0)
+
+state_gdn = dk * dv
+state_v0 = 2 * dk * dv
+print(f"  recurrence == closed form, GDN              OK")
+print(f"  v0(r=1, omega=0) == GDN, delta rule included OK  (max |diff| {d_gdn:.1e})")
+print(f"  v0 recurrence == its closed form             OK  (max |diff| {d_closed:.1e})")
+print(f"  lag-profiles the head can span: GDN {rank_gdn}, v0 {rank_v0}  (= dk)")
+print(f"  state: GDN {state_gdn} floats -> v0 {state_v0} (complex), 2x")
+print(f"  params added: 2*dk per head (r and omega) = {2*dk}, against dk*dv = {dk*dv} of state")
+print("  -> GDN spends one decay on the whole inner product; v0 gives each of the dk")
+print("     bands its own envelope and its own carrier, and contains GDN at r=1, omega=0.")
+print("  NOTE the cheap rung: omega = 0 throughout keeps the state REAL and costs")
+print("     dk params a head with NO extra state and NO extra compute -- the decay")
+print("     spectrum alone, which is the part the equalizer analogy is really about.")
