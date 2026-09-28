@@ -249,6 +249,10 @@ def run(name, m, tr, va, a, device, log, V=None):
                   if hasattr(m_, "decay_spread")]
             if sp:
                 rec["decay"] = sp
+            th = [m_.theta_stats() for m_ in m.modules()
+                  if hasattr(m_, "theta_stats")]
+            if th:
+                rec["theta"] = th
             if prof:
                 rec["pos"] = [round(v, 5) for v in prof]
             if cls:

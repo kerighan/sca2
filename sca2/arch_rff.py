@@ -105,6 +105,17 @@ class RFFDeltaNet(nn.Module):
         a = p * self._theta()
         return torch.stack([a.cos(), a.sin()], -1).flatten(-2) / math.sqrt(self.M)
 
+    def theta_stats(self):
+        """[rms, p95] of |theta| per layer. theta sets the kernel's width, so if
+        the model is fighting the DC floor -- a shift-invariant kernel cannot go
+        below zero, and every past token contributes a constant -- it will push
+        theta UP. That is the measurement separating 'the floor sank it' from
+        'the difference kernel is worse than an inner product'."""
+        with torch.no_grad():
+            a = self._theta().float().abs()
+            return [round(a.pow(2).mean().sqrt().item(), 4),
+                    round(a.quantile(0.95).item(), 4)]
+
     def _gates(self, x):
         g = -torch.exp(self.A_log.float()) * F.softplus(self.a(x).float() + self.dt_bias)
         return g, self.b(x).float().sigmoid()
