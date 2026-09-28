@@ -137,7 +137,7 @@ class ShortConv(nn.Module):
 
 
 class GatedDeltaNet(nn.Module):
-    def __init__(self, d, heads=4, head_k=32, expand_v=2.0, conv_k=4):
+    def __init__(self, d, heads=4, head_k=32, expand_v=2.0, conv_k=4, rope_base=0.0):
         super().__init__()
         self.d, self.H = d, heads
         self.dk = head_k
@@ -160,6 +160,33 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
         self.o_norm = nn.LayerNorm(self.dv)
         self.conv_k = conv_k
+        # rope_base > 0: rotate q and k, which turns each PAIR of key dimensions
+        # into a bandpass. The kernel gains a carrier without gaining any state:
+        #
+        #     q~_t . k~_u = q_t . R(omega_j (u - t)) k_u
+        #
+        # checked to 6.7e-15 in chead_numpy. The complex-state formulation of the
+        # same thing would double the state for nothing -- the two real
+        # dimensions of a pair already carry the phase.
+        #
+        # Order does not matter against the L2 norm: a block-diagonal rotation is
+        # orthogonal on R^dk, so normalising before or after gives the same q, k.
+        self.rope_base = float(rope_base)
+        if self.rope_base > 0:
+            assert self.dk % 2 == 0, f"rope needs an even head_k, got {self.dk}"
+            j = torch.arange(0, self.dk, 2, dtype=torch.float32) / self.dk
+            self.register_buffer("inv_freq", self.rope_base ** (-j), persistent=False)
+
+    def _rope(self, x, pos):
+        """x (B,T,H,dk), pos (T,) or (B,T) absolute positions."""
+        if self.rope_base <= 0:
+            return x
+        ang = pos.reshape(-1, 1).float() * self.inv_freq                  # (T, dk/2)
+        c, s_ = ang.cos(), ang.sin()
+        c = c.view(*([1] * (x.dim() - 3)), -1, 1, self.dk // 2)
+        s_ = s_.view_as(c)
+        a, b = x[..., 0::2], x[..., 1::2]
+        return torch.stack([a * c - b * s_, a * s_ + b * c], -1).flatten(-2)
 
     # ---- pieces ----------------------------------------------------------- #
     def _gates(self, x):
@@ -172,8 +199,13 @@ class GatedDeltaNet(nn.Module):
 
     def init_state(self, B, device, dtype):
         z = lambda n: torch.zeros(B, self.conv_k - 1, n, device=device, dtype=dtype)
-        return {"h": torch.zeros(B, self.H, self.dk, self.dv, device=device, dtype=dtype),
-                "cq": z(self.key_dim), "ck": z(self.key_dim), "cv": z(self.value_dim)}
+        st = {"h": torch.zeros(B, self.H, self.dk, self.dv, device=device, dtype=dtype),
+              "cq": z(self.key_dim), "ck": z(self.key_dim), "cv": z(self.value_dim)}
+        if self.rope_base > 0:
+            # the carrier is a function of ABSOLUTE position, so decode has to
+            # know where it is; prefill from a state advances it by T
+            st["pos"] = torch.zeros((), device=device, dtype=torch.long)
+        return st
 
     # ---- prefill (fla chunked reference) ---------------------------------- #
     def forward(self, x, state=None):
@@ -186,6 +218,10 @@ class GatedDeltaNet(nn.Module):
         k = self.ck(self.k(x)).view(B, T, self.H, self.dk)
         v = self.cv(self.v(x)).view(B, T, self.H, self.dv)
         q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+        if self.rope_base > 0:
+            p0 = st["pos"] if state is not None else 0
+            pos = torch.arange(T, device=x.device) + p0
+            q, k = self._rope(q, pos), self._rope(k, pos)
         g, beta = self._gates(x)
         h0 = st["h"] if state is not None else None
         if _triton is not None and x.is_cuda:
@@ -202,8 +238,12 @@ class GatedDeltaNet(nn.Module):
         y = self._read(o.to(x.dtype), x, B, T)
         tail = lambda z_, n: z_[:, -(self.conv_k - 1):] if T >= self.conv_k - 1 else \
             F.pad(z_, (0, 0, self.conv_k - 1 - T, 0))
-        return y, {"h": h.to(x.dtype), "cq": tail(self.q(x), 0),
-                   "ck": tail(self.k(x), 0), "cv": tail(self.v(x), 0)}
+        out = {"h": h.to(x.dtype), "cq": tail(self.q(x), 0),
+               "ck": tail(self.k(x), 0), "cv": tail(self.v(x), 0)}
+        if self.rope_base > 0:
+            out["pos"] = (st["pos"] if state is not None else
+                          torch.zeros((), device=x.device, dtype=torch.long)) + T
+        return y, out
 
     # ---- decode (fla recurrent reference, one token) ----------------------- #
     def step(self, x_t, state):
@@ -214,8 +254,14 @@ class GatedDeltaNet(nn.Module):
         q = F.normalize(qr.view(B, 1, self.H, self.dk), dim=-1)
         k = F.normalize(kr.view(B, 1, self.H, self.dk), dim=-1)
         v = vr.view(B, 1, self.H, self.dv)
+        if self.rope_base > 0:
+            pos = state["pos"].reshape(1)
+            q, k = self._rope(q, pos), self._rope(k, pos)
         g, beta = self._gates(x_t[:, None])
-        if _triton_recurrent is not None:
+        # `and x_t.is_cuda`: prefill has always guarded this, step never did, so a
+        # CPU decode went straight into the Triton kernel and died on a pointer it
+        # could not read. Only reachable off-GPU, which is why it survived.
+        if _triton_recurrent is not None and x_t.is_cuda:
             o, h = _triton_recurrent(
                 q, k, v, g=g, beta=beta, initial_state=state["h"].float(),
                 output_final_state=True)
@@ -224,18 +270,21 @@ class GatedDeltaNet(nn.Module):
                 q, k, v, beta, g, initial_state=state["h"].float(),
                 output_final_state=True)
         y = self._read(o.to(x_t.dtype), x_t[:, None], B, 1)[:, 0]
-        return y, {"h": h.to(x_t.dtype), "cq": cq, "ck": ck, "cv": cv}
+        out = {"h": h.to(x_t.dtype), "cq": cq, "ck": ck, "cv": cv}
+        if self.rope_base > 0:
+            out["pos"] = state["pos"] + 1
+        return y, out
 
 
 class GDNLayer(nn.Module):
     """Same wrapper as SCA2Layer: norm -> mixer -> residual -> norm -> FFN."""
 
-    def __init__(self, cfg, heads=4, head_k=32, expand_v=2.0):
+    def __init__(self, cfg, heads=4, head_k=32, expand_v=2.0, rope_base=0.0):
         super().__init__()
         d = cfg.d
         self.cfg = cfg
         self.n = nn.LayerNorm(d)
-        self.mix = GatedDeltaNet(d, heads, head_k, expand_v)
+        self.mix = GatedDeltaNet(d, heads, head_k, expand_v, rope_base=rope_base)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, cfg.ff), nn.GELU(), nn.Linear(cfg.ff, d))
 
@@ -265,10 +314,27 @@ class GDNLayerMatched(GDNLayer):
 
     def __init__(self, cfg, c_cls=None, d_cls=None):
         super().__init__(cfg, heads=cfg.gdn_heads, head_k=cfg.gdn_head_k,
-                         expand_v=cfg.gdn_expand_v)
+                         expand_v=cfg.gdn_expand_v, rope_base=cfg.gdn_rope)
 
 
 register("gdn", CHeadQuad, None, arch=True, layer_cls=GDNLayerMatched,
          note="Gated DeltaNet on fla's own reference (ARCH: different function)")
 register("gdn_cc", CHeadQuad, None, arch=True, layer_cls=GDNLayerMatched, wrap=_cw,
          note="Gated DeltaNet + torch.compile")
+
+
+class GDNRopeLayerMatched(GDNLayerMatched):
+    """GDN with a carrier: RoPE on q and k, so each PAIR of key dimensions
+    becomes a bandpass instead of a lowpass. --gdn-rope sets the base; the
+    default of this variant is 2048, matching the campaign's rope_base."""
+
+    def __init__(self, cfg, c_cls=None, d_cls=None):
+        base = cfg.gdn_rope if cfg.gdn_rope > 0 else 2048.0
+        GDNLayer.__init__(self, cfg, heads=cfg.gdn_heads, head_k=cfg.gdn_head_k,
+                          expand_v=cfg.gdn_expand_v, rope_base=base)
+
+
+register("gdnrope", CHeadQuad, None, arch=True, layer_cls=GDNRopeLayerMatched,
+         note="Gated DeltaNet + RoPE on q/k: a carrier per key pair (ARCH)")
+register("gdnrope_cc", CHeadQuad, None, arch=True, layer_cls=GDNRopeLayerMatched,
+         wrap=_cw, note="Gated DeltaNet + RoPE on q/k + torch.compile")

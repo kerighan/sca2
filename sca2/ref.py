@@ -385,6 +385,10 @@ class LayerCfg:
     gdn_heads: int = 3
     gdn_head_k: int = 60
     gdn_expand_v: float = 1.0
+    gdn_rope: float = 0.0        # RoPE base for the GDN mixer's q/k. 0 = off (plain
+    #   GDN). > 0 gives each PAIR of key dimensions a carrier, turning the kernel's
+    #   lowpass into a bandpass, with NO extra state and no new kernel -- the
+    #   rotation factorises into q and k (chead_numpy checks it to 6.7e-15).
     kda_gate_full: bool = False  # KDA as published projects d -> H*K for the gate,
     #   1.05M params a layer here. Default factorises it: a(x) stays d -> H and only
     #   A_log is (H, K), so the spectrum is learned but the gate is shared -- 1024
